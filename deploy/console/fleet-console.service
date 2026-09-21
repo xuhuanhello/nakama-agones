@@ -1,0 +1,31 @@
+[Unit]
+Description=Nakama Agones Fleet management console (SSH access only)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=fleet-console
+Group=fleet-console
+UMask=0077
+ExecStart=/usr/local/bin/fleet-console serve --config /etc/fleet-console/config.json
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+CapabilityBoundingSet=
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+MemoryDenyWriteExecute=true
+MemoryMax=256M
+CPUQuota=50%
+TasksMax=128
+
+[Install]
+WantedBy=multi-user.target

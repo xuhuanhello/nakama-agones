@@ -1,5 +1,5 @@
 GO ?= go
-.PHONY: test test-race fmt-check vet build local-up local-down integration package
+.PHONY: test test-race fmt-check vet build local-up local-down integration package console
 
 test: fmt-check
 	$(GO) test -mod=readonly ./...
@@ -16,6 +16,9 @@ vet:
 
 build:
 	docker build --platform linux/amd64 -f deploy/Dockerfile --target runtime -t nakama-agones-local:dev .
+
+console:
+	CGO_ENABLED=0 $(GO) build -trimpath -mod=readonly -o dist/fleet-console ./cmd/fleet-console
 
 local-up:
 	python3 scripts/local_cluster.py up

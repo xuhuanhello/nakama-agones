@@ -19,6 +19,12 @@ jobs:
         with:
           go-version: '1.27.1'
       - run: make test test-race
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: node --check internal/console/web/app.js
+      - run: pip install PyYAML==6.0.2
+      - run: python3 deploy/observability/validate.py
       - run: python3 -m py_compile scripts/local_cluster.py scripts/k3s_node.py scripts/issue_nakama_token.py examples/room-worker/server.py
       - run: python3 -m unittest discover -s tests
   integration:

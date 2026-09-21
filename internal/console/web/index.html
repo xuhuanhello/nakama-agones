@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="referrer" content="same-origin">
+  <title>Fleet · 战斗服控制台</title>
+  <link rel="stylesheet" href="/fleet-admin/styles.css">
+  <script src="/fleet-admin/app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main-content">跳到主要内容</a>
+  <section id="login-view" class="login-view" aria-labelledby="login-title">
+    <div class="login-card">
+      <div class="brand"><span class="brand-mark" aria-hidden="true">F</span><span>FLEET<span class="brand-caption">AGONES CONTROL</span></span></div>
+      <p class="eyebrow">管理员入口</p>
+      <h1 id="login-title">战斗服控制台</h1>
+      <p class="login-description">查看对局、实例与节点状态，追踪运行日志。</p>
+      <form id="login-form">
+        <label for="username">管理员账号</label>
+        <input id="username" name="username" autocomplete="username" required maxlength="64" autofocus>
+        <label for="password">密码</label>
+        <input id="password" name="password" type="password" autocomplete="current-password" required maxlength="1024">
+        <p id="login-error" class="form-error" role="alert" hidden></p>
+        <button id="login-button" class="button primary full-width" type="submit">登录控制台 <span aria-hidden="true">→</span></button>
+      </form>
+      <p id="login-state" class="muted login-footnote" role="status">正在检查登录状态…</p>
+    </div>
+    <p class="login-copyright">Nakama + Agones · 独立游戏服务器集群</p>
+  </section>
+
+  <div id="app" class="app" hidden>
+    <aside class="sidebar" aria-label="主导航">
+      <a class="brand" href="#overview"><span class="brand-mark" aria-hidden="true">F</span><span>FLEET<span class="brand-caption">AGONES CONTROL</span></span></a>
+      <p class="nav-label">运行管理</p>
+      <nav class="navigation">
+        <button type="button" class="nav-item active" data-view="overview" aria-current="page"><span class="nav-icon" aria-hidden="true">◫</span>运行总览</button>
+        <button type="button" class="nav-item" data-view="rooms"><span class="nav-icon" aria-hidden="true">◇</span>对局与玩家</button>
+        <button type="button" class="nav-item" data-view="infrastructure"><span class="nav-icon" aria-hidden="true">▤</span>实例与节点</button>
+        <button type="button" class="nav-item" data-view="logs"><span class="nav-icon" aria-hidden="true">≡</span>运行日志</button>
+      </nav>
+      <div class="sidebar-footer"><span class="status-dot" aria-hidden="true"></span><span>SSH 隧道访问</span><span class="version">AGONES</span></div>
+    </aside>
+
+    <div class="workspace">
+      <header class="topbar">
+        <div class="breadcrumb"><span>控制台</span><span aria-hidden="true">/</span><strong id="page-name">运行总览</strong></div>
+        <div class="topbar-actions"><span id="session-user" class="session-user"></span><button id="refresh-button" type="button" class="button quiet">刷新数据</button><button id="logout-button" type="button" class="button quiet">退出</button></div>
+      </header>
+      <main id="main-content" tabindex="-1">
+        <div id="connection-banner" class="banner danger" role="status" hidden></div>
+        <div id="read-only-banner" class="banner" role="status">只读查看：当前控制台提供状态与日志观测，不提供排空实例或重试创建操作。</div>
+        <div class="page-heading"><div><p class="eyebrow">FLEET OPERATIONS</p><h1 id="page-title">战斗服运行总览</h1><p id="page-description" class="muted">从匹配入场到实例回收，查看集群当前状态。</p></div><div class="freshness"><span id="refresh-indicator" class="status-dot" aria-hidden="true"></span><span id="snapshot-time">等待首次数据</span><span class="muted">每 5 秒更新</span></div></div>
+
+        <section id="view-overview" class="view" aria-label="运行总览">
+          <div id="overview-metrics" class="metric-grid" aria-live="off"></div>
+          <div id="creation-banner" class="banner warning" hidden><div><strong>实例创建已暂停</strong><p id="creation-reason"></p></div><button id="retry-creation-button" class="button" type="button" hidden>重试创建</button></div>
+          <div class="overview-grid"><section class="panel"><div class="panel-heading"><div><h2>区域运行状态</h2><p>各区域当前的玩家、房间与实例</p></div><span class="small-label">LIVE</span></div><div id="region-overview" class="region-list"></div></section><section class="panel"><div class="panel-heading"><div><h2>运行提示</h2><p>数据来源与需要关注的状态</p></div></div><div id="health-notes" class="health-notes"></div></section></div>
+          <section class="panel"><div class="panel-heading"><div><h2>活跃实例</h2><p>点击实例查看详细指标和日志</p></div><button type="button" class="button quiet" data-view="infrastructure">全部实例 <span aria-hidden="true">↗</span></button></div><div id="active-workers" class="worker-cards"></div></section>
+        </section>
+
+        <section id="view-rooms" class="view" aria-label="对局与玩家" hidden>
+          <section class="panel"><div class="panel-heading"><div><h2>对局房间 <span id="room-count" class="count"></span></h2><p>玩家标识为 Nakama 用户 ID，尚未关联昵称；房间列表按 Fleet 状态保留窗口展示。</p></div></div><div class="filters"><label class="search-field"><span>搜索房间或玩家</span><input id="room-search" type="search" placeholder="房间 ID、玩家 ID、实例 ID" maxlength="256"></label><label><span>地区</span><select id="room-region"><option value="">全部地区</option></select></label><label><span>房间状态</span><select id="room-state"><option value="">全部状态</option></select></label></div><div id="rooms-table" class="table-wrap"></div></section>
+        </section>
+
+        <section id="view-infrastructure" class="view" aria-label="实例与节点" hidden>
+          <section class="panel"><div class="panel-heading"><div><h2>游戏服实例 <span id="worker-count" class="count"></span></h2><p id="worker-management-note">CPU 按实例统计，无法单独测量每个房间。当前控制台只读，可查看实例状态与日志。</p></div></div><div class="filters"><label class="search-field"><span>搜索实例</span><input id="worker-search" type="search" placeholder="实例 ID、Pod 或节点名" maxlength="256"></label><label><span>地区</span><select id="worker-region"><option value="">全部地区</option></select></label><label class="check-label"><input id="include-stopped" type="checkbox"><span>包括已退出实例</span></label></div><div id="workers-table" class="table-wrap"></div></section>
+          <section class="panel"><div class="panel-heading"><div><h2>VPS / 节点</h2><p>CPU、内存与 Pod 使用情况；未采集的指标显示为 —</p></div></div><div id="nodes-table" class="table-wrap"></div></section>
+        </section>
+
+        <section id="view-logs" class="view" aria-label="运行日志" hidden>
+          <section class="panel log-panel"><div class="panel-heading"><div><h2>实例日志</h2><p>最近 7 天的已采集日志，实例退出后仍可查询；采集启用前的记录不在归档内。</p></div><button id="copy-logs-button" class="button quiet" type="button" disabled>复制日志</button></div>
+            <form id="log-form" class="log-filters"><label><span>地区</span><select id="log-region" required><option value="us-west">us-west</option></select></label><label class="pod-field"><span>Pod 名称（支持手填）</span><input id="log-pod" list="pod-options" placeholder="nag-…" required maxlength="253" autocomplete="off"><datalist id="pod-options"></datalist></label><label><span>日志来源</span><select id="log-mode"><option value="live">实时容器</option><option value="history">历史归档</option></select></label><label><span>容器</span><select id="log-container"><option value="game">游戏服 · game</option><option value="agones-gameserver-sidecar">Agones sidecar</option></select></label><label><span>命名空间</span><input id="log-namespace" value="agones-games" required maxlength="63" autocomplete="off"></label><label><span>时间范围</span><select id="log-minutes"><option value="15">最近 15 分钟</option><option value="60" selected>最近 1 小时</option><option value="360">最近 6 小时</option><option value="1440">最近 24 小时</option><option value="10080">最近 7 天</option></select></label><label><span>最多行数（实时先截取再筛选）</span><select id="log-limit"><option value="100">100 行</option><option value="250">250 行</option><option value="500" selected>500 行</option></select></label><label class="log-search"><span>关键词筛选</span><input id="log-search" type="search" placeholder="输入关键词，例如 error、房间 ID" maxlength="200"></label><div class="log-filter-actions"><label class="check-label"><input id="log-auto" type="checkbox"><span>每 5 秒刷新</span></label><button id="fetch-logs-button" class="button primary" type="submit">查询日志</button></div></form>
+            <div class="log-toolbar"><span id="log-status" role="status">选择一个实例后查询日志</span><label class="check-label"><input id="log-follow" type="checkbox" checked><span>跟随最新</span></label></div><pre id="log-output" class="log-output" tabindex="0" aria-label="日志内容">尚未查询日志。</pre>
+          </section>
+        </section>
+        <footer class="page-footer"><span>Nakama · Agones Fleet</span><span>实时快照每 5 秒刷新 · 日志按需读取</span></footer>
+      </main>
+    </div>
+  </div>
+
+  <dialog id="detail-dialog" class="detail-dialog" aria-labelledby="detail-title"><div class="dialog-header"><div><p id="detail-eyebrow" class="eyebrow">详情</p><h2 id="detail-title">详情</h2></div><button class="icon-button" id="detail-close" type="button" aria-label="关闭详情">×</button></div><div id="detail-body" class="dialog-body"></div></dialog>
+  <dialog id="confirm-dialog" class="confirm-dialog" aria-labelledby="confirm-title"><form method="dialog"><p class="eyebrow">确认操作</p><h2 id="confirm-title">排空实例</h2><p id="confirm-description"></p><p id="confirm-target" class="identifier"></p><div class="dialog-actions"><button type="submit" value="cancel" class="button">取消</button><button id="confirm-submit" type="submit" value="confirm" class="button primary">确认排空</button></div></form></dialog>
+  <div id="toast" class="toast" role="status" hidden></div>
+</body>
+</html>

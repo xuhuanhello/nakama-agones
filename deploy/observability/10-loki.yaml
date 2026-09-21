@@ -1,0 +1,208 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fleet-loki
+  namespace: agones-observability
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: fleet-loki-data
+  namespace: agones-observability
+spec:
+  accessModes: [ReadWriteOnce]
+  # K3s local-path capacity is a request, not an enforced filesystem quota.
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fleet-loki-config
+  namespace: agones-observability
+data:
+  loki.yaml: |
+    auth_enabled: false
+    target: all
+    server:
+      http_listen_port: 3100
+      grpc_listen_address: 127.0.0.1
+      grpc_listen_port: 9095
+      log_level: warn
+    common:
+      instance_addr: 127.0.0.1
+      path_prefix: /var/loki
+      replication_factor: 1
+      ring:
+        kvstore:
+          store: inmemory
+      storage:
+        filesystem:
+          chunks_directory: /var/loki/chunks
+          rules_directory: /var/loki/rules
+    schema_config:
+      configs:
+        - from: "2024-01-01"
+          store: tsdb
+          object_store: filesystem
+          schema: v13
+          index:
+            prefix: index_
+            period: 24h
+    storage_config:
+      tsdb_shipper:
+        active_index_directory: /var/loki/tsdb-index
+        cache_location: /var/loki/tsdb-cache
+        cache_ttl: 24h
+    ingester:
+      chunk_idle_period: 5m
+      max_chunk_age: 1h
+      chunk_target_size: 524288
+      wal:
+        enabled: true
+        dir: /var/loki/wal
+        flush_on_shutdown: true
+        replay_memory_ceiling: 128MB
+    compactor:
+      # Keep deletion markers with chunks/index/WAL across Pod replacement.
+      working_directory: /var/loki/compactor
+      compaction_interval: 10m
+      retention_enabled: true
+      retention_delete_delay: 2h
+      retention_delete_worker_count: 2
+      delete_request_store: filesystem
+    limits_config:
+      retention_period: 168h
+      max_query_lookback: 168h
+      max_query_length: 168h
+      reject_old_samples: true
+      reject_old_samples_max_age: 168h
+      ingestion_rate_mb: 1
+      ingestion_burst_size_mb: 2
+      per_stream_rate_limit: 256KB
+      per_stream_rate_limit_burst: 512KB
+      max_global_streams_per_user: 256
+      max_line_size: 16384
+      max_line_size_truncate: false
+      max_entries_limit_per_query: 1000
+      query_timeout: 15s
+      max_query_parallelism: 2
+      tsdb_max_query_parallelism: 2
+      split_queries_by_interval: 30m
+      allow_structured_metadata: false
+      discover_log_levels: false
+      discover_service_name: []
+    query_range:
+      cache_results: false
+    querier:
+      max_concurrent: 2
+    frontend:
+      max_outstanding_per_tenant: 16
+    analytics:
+      reporting_enabled: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fleet-loki
+  namespace: agones-observability
+spec:
+  replicas: 1
+  revisionHistoryLimit: 2
+  # One filesystem writer and compactor, including during upgrades.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: fleet-loki
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: fleet-loki
+        app.kubernetes.io/part-of: nakama-agones
+    spec:
+      serviceAccountName: fleet-loki
+      automountServiceAccountToken: false
+      nodeSelector:
+        kubernetes.io/os: linux
+        nakama-agones.io/role: control
+      tolerations:
+        - key: CriticalAddonsOnly
+          operator: Equal
+          value: "true"
+          effect: NoExecute
+      terminationGracePeriodSeconds: 90
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: loki
+          image: grafana/loki:3.7.8@sha256:1107dd5274e0ada47e42472b7a7e71f3b2a2fe878878108f3e2f9e51528f0193
+          imagePullPolicy: IfNotPresent
+          args: ["-config.file=/etc/loki/loki.yaml"]
+          env:
+            - name: GOMEMLIMIT
+              value: 600MiB
+            - name: GOMAXPROCS
+              value: "1"
+          ports:
+            - name: http
+              containerPort: 3100
+          resources:
+            requests: {cpu: 100m, memory: 384Mi, ephemeral-storage: 64Mi}
+            limits: {cpu: 500m, memory: 768Mi, ephemeral-storage: 256Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          startupProbe:
+            httpGet: {path: /ready, port: http}
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 60
+          readinessProbe:
+            httpGet: {path: /ready, port: http}
+            periodSeconds: 10
+            timeoutSeconds: 2
+          livenessProbe:
+            tcpSocket: {port: http}
+            periodSeconds: 30
+            timeoutSeconds: 2
+            failureThreshold: 6
+          volumeMounts:
+            - {name: config, mountPath: /etc/loki, readOnly: true}
+            - {name: data, mountPath: /var/loki}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: config
+          configMap:
+            name: fleet-loki-config
+        - name: data
+          persistentVolumeClaim:
+            claimName: fleet-loki-data
+        - name: tmp
+          emptyDir:
+            sizeLimit: 32Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fleet-loki
+  namespace: agones-observability
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: fleet-loki
+  ports:
+    - name: http
+      port: 3100
+      targetPort: http

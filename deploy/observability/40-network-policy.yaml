@@ -1,0 +1,33 @@
+# No public listener. Only the collector and the control node's API-server
+# service proxy need Loki. Kubernetes permits traffic from a Pod's own node;
+# this pilot pins Loki to the single control node where the API server runs.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: fleet-loki-ingress
+  namespace: agones-observability
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: fleet-loki
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: fleet-alloy
+      ports:
+        - {protocol: TCP, port: 3100}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: fleet-alloy-ingress
+  namespace: agones-observability
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: fleet-alloy
+  policyTypes: [Ingress]
+  # Kubelet health probes from the local node remain permitted.
+  ingress: []

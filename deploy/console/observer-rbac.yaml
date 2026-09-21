@@ -1,0 +1,86 @@
+# The console never receives cluster-admin or the Nakama runtime credential.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fleet-console
+  namespace: agones-control
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: fleet-console-nodes
+rules:
+  - apiGroups: ['']
+    resources: [nodes]
+    verbs: [get, list]
+  - apiGroups: [metrics.k8s.io]
+    resources: [nodes]
+    verbs: [get, list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: fleet-console-nodes
+subjects:
+  - kind: ServiceAccount
+    name: fleet-console
+    namespace: agones-control
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: fleet-console-nodes
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: fleet-console
+  namespace: agones-games
+rules:
+  - apiGroups: ['']
+    resources: [pods, pods/log, events]
+    verbs: [get, list]
+  - apiGroups: [metrics.k8s.io]
+    resources: [pods]
+    verbs: [get, list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: fleet-console
+  namespace: agones-games
+subjects:
+  - kind: ServiceAccount
+    name: fleet-console
+    namespace: agones-control
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: fleet-console
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: fleet-console
+  namespace: agones-system
+rules:
+  - apiGroups: ['']
+    resources: [pods, pods/log, events]
+    verbs: [get, list]
+  - apiGroups: [metrics.k8s.io]
+    resources: [pods]
+    verbs: [get, list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: fleet-console
+  namespace: agones-system
+subjects:
+  - kind: ServiceAccount
+    name: fleet-console
+    namespace: agones-control
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: fleet-console

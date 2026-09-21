@@ -1,0 +1,24 @@
+{
+  "listen": "127.0.0.1:7365",
+  "public_url": "http://127.0.0.1:17365/fleet-admin/",
+  "username": "admin",
+  "password_hash": "REPLACE_WITH_HASH_FROM_FLEET_CONSOLE_HASH_PASSWORD",
+  "source": {
+    "max_processes": 4,
+    "rooms_per_process": 2,
+    "log_retention_days": 7,
+    "regions": [
+      {
+        "name": "us-west",
+        "api_url": "https://manager.example.internal:6443",
+        "ca_file": "/etc/fleet-console/kubernetes-ca.crt",
+        "token_file": "/var/lib/fleet-console/credentials/token",
+        "namespace": "agones-games",
+        "system_namespace": "agones-system",
+        "log_namespace": "agones-observability",
+        "log_service": "fleet-loki"
+      }
+    ],
+    "fleet_snapshot_file": "/var/lib/fleet-console/status/fleet.json"
+  }
+}

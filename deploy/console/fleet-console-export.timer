@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh the safe Fleet console snapshot every five seconds
+
+[Timer]
+OnBootSec=1s
+OnUnitActiveSec=5s
+AccuracySec=1s
+Unit=fleet-console-export.service
+
+[Install]
+WantedBy=timers.target

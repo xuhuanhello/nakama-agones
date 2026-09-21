@@ -1,0 +1,27 @@
+[Unit]
+Description=Export a credential-free local Fleet console status snapshot
+After=network.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0027
+# Pre-create status as root:fleet-console 0750. No token is passed in argv.
+ExecStart=/usr/bin/python3 /opt/nakama-agones/scripts/export_console_status.py --credentials /opt/nakama-agones/agones-secrets.json --url http://127.0.0.1:7350 --output /var/lib/fleet-console/status/fleet.json --group fleet-console
+TimeoutStartSec=8
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/fleet-console/status
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+MemoryDenyWriteExecute=true
+MemoryMax=192M
+CPUQuota=50%
+TasksMax=16

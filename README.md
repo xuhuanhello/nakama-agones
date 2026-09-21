@@ -8,6 +8,7 @@ Self-hosted, multi-room game server orchestration for **Nakama Community 3.41.0 
 - Persistent PostgreSQL state, reconciled Agones GameServer creation, ownership/UID checks and namespace-scoped RBAC.
 - Multiple rooms per process, bounded scaling, readiness/health gates and graceful drain before deletion.
 - Independent Unity lifecycle package; no changes to Nakama source or its official Unity SDK.
+- Optional [SSH-only Fleet console](docs/console.md): rooms, player IDs, node/instance metrics and seven-day [archived logs](docs/console-logs.md).
 
 Based on the official [Nakama FleetManager API](https://heroiclabs.com/docs/nakama/server-framework/fleet-manager/), [Agones GameServer](https://agones.dev/site/docs/reference/gameserver/) lifecycle and [K3s](https://docs.k3s.io/) deployment model. Code provenance is in [UPSTREAM.md](UPSTREAM.md).
 
@@ -30,7 +31,7 @@ For your game, install the companion Unity package, implement its room host, pub
 
 This release uses independently managed Agones GameServers; Nakama owns process scaling. Do not attach a FleetAutoscaler to the same processes. One configured pool has one game image, region and manual compatibility version. It does not purchase or remove VPS nodes. Capacity must be measured on your hardware; example room/CPU values are not performance guarantees.
 
-A Nakama runtime supports one registered FleetManager and one matched hook: do not install this standalone module beside another standalone fleet module. The libraries can be composed explicitly. The Go plugin must match the exact [runtime/compiler dependency set](docs/compatibility.md). Headlamp can manage Kubernetes resources; a game-specific operations dashboard is a separate phase.
+A Nakama runtime supports one registered FleetManager and one matched hook: do not install this standalone module beside another standalone fleet module. The libraries can be composed explicitly. The Go plugin must match the exact [runtime/compiler dependency set](docs/compatibility.md). The optional Fleet console runs separately from Nakama; its default read-only deployment needs no player-database access.
 
 ## License
 
