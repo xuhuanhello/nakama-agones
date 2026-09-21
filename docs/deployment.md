@@ -47,7 +47,7 @@ A pool binds deployment ID, image/settings, manual compatibility version and reg
 
 ## 5. Operations and scale
 
-`GET /agones/fleet/v1/admin/status` provides safe room/process state; `POST /agones/fleet/v1/admin/drain` requests safe process removal. Headlamp can provide a general Kubernetes UI, but game-specific room metrics/operations need an additional dashboard. Deploy Prometheus/Grafana with restricted access and short initial retention.
+Install the included [Fleet console](console.md) for rooms, player seats, instance/node metrics and logs. It uses [SSH-only access](console-access.md); its [versioned API](console-api.md) supports scripts and AI diagnostics. The optional local broker enables graceful instance drain. Headlamp is not required; add it only when general Kubernetes editing is needed. Prometheus/Grafana are a separate option for longer metric history and alerting, not prerequisites for this deployment.
 
 Record frame p99, input→authoritative-shot p95/p99, ball-stop→ready p95/p99, RTT, simulation queue age, rooms/players/reservations, result/audit backlog, CPU throttling/steal, RSS and actual NIC bytes. Compare 1/2/4/8 rooms per process before increasing process/node limits. Scaling a container does not purchase another VPS or lower an active VPS monthly bill.
 

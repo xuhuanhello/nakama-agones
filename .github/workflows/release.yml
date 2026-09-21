@@ -32,6 +32,10 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.1'
+      - run: ./scripts/package-console.sh
       - name: Build, package and push tested source
         shell: bash
         run: |

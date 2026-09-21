@@ -15,6 +15,10 @@ RUN ./scripts/check-compatibility.sh --plugin
 RUN --mount=type=cache,id=nakama-agones-go1.27.1-linux-amd64,target=/root/.cache/go-build mkdir -p /out && go build --trimpath --mod=readonly --buildmode=plugin -o /out/agones.so ./cmd/nakama-plugin
 RUN --mount=type=cache,id=nakama-agones-go1.27.1-linux-amd64,target=/root/.cache/go-build CGO_ENABLED=0 go build --trimpath --mod=readonly -o /out/fleet-migrate ./cmd/fleet-migrate
 
+# Console binaries are companion processes. They never run inside Nakama.
+RUN --mount=type=cache,id=nakama-agones-go1.27.1-linux-amd64,target=/root/.cache/go-build CGO_ENABLED=0 go build --trimpath --mod=readonly -o /out/fleet-console ./cmd/fleet-console
+RUN --mount=type=cache,id=nakama-agones-go1.27.1-linux-amd64,target=/root/.cache/go-build CGO_ENABLED=0 go build --trimpath --mod=readonly -o /out/fleet-console-control ./cmd/fleet-console-control
+
 # Tools run only as explicit migration/development services.
 FROM ${NAKAMA_IMAGE} AS tools
 ARG PLUGIN_VERSION=0.1.0-dev
@@ -28,10 +32,12 @@ HEALTHCHECK NONE
 COPY --from=builder /out/fleet-migrate /usr/local/bin/fleet-migrate
 ENTRYPOINT ["/usr/local/bin/fleet-migrate"]
 
-# Extract both the module and its independent database migration tool.
+# Extract the runtime module, migration tool and optional companion console.
 FROM scratch AS artifact
 COPY --from=builder /out/agones.so /agones.so
 COPY --from=builder /out/fleet-migrate /fleet-migrate
+COPY --from=builder /out/fleet-console /fleet-console
+COPY --from=builder /out/fleet-console-control /fleet-console-control
 
 FROM ${NAKAMA_IMAGE} AS runtime
 ARG PLUGIN_VERSION=0.1.0-dev

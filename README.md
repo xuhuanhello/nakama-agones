@@ -23,7 +23,7 @@ node scripts/smoke.mjs
 python3 scripts/local_cluster.py stop
 ```
 
-The local stack creates a separate `agones-nakama` k3d cluster, uses loopback ports 17443/17850/17851 and UDP 17770–17789, and never changes your default kubeconfig. It runs real Nakama, PostgreSQL, Kubernetes and Agones with a **protocol fixture**, not Unity gameplay. Configuration and credentials stay in ignored `.local/`. See the [executed validation](docs/validation-2026-09-21.md), [local testing](docs/local-testing.md), [deployment](docs/deployment.md) and the [implementation plan](docs/IMPLEMENTATION.md).
+The local stack creates a separate `agones-nakama` k3d cluster, uses loopback ports 17443/17850/17851 and UDP 17770–17789, and never changes your default kubeconfig. It runs real Nakama, PostgreSQL, Kubernetes and Agones with a **protocol fixture**, not Unity gameplay. Configuration and credentials stay in ignored `.local/`. Start with the [documentation index](docs/README.md). See the [executed validation](docs/validation-2026-09-21.md), [local testing](docs/local-testing.md), [deployment](docs/deployment.md) and the [implementation plan](docs/IMPLEMENTATION.md).
 
 For your game, install the companion Unity package, implement its room host, publish a Linux image, then configure the pool with its immutable image digest. Use the authenticated `agones_fleet_*` RPCs described in [protocol v1](docs/protocol-v1.md).
 
@@ -31,7 +31,7 @@ For your game, install the companion Unity package, implement its room host, pub
 
 This release uses independently managed Agones GameServers; Nakama owns process scaling. Do not attach a FleetAutoscaler to the same processes. One configured pool has one game image, region and manual compatibility version. It does not purchase or remove VPS nodes. Capacity must be measured on your hardware; example room/CPU values are not performance guarantees.
 
-A Nakama runtime supports one registered FleetManager and one matched hook: do not install this standalone module beside another standalone fleet module. The libraries can be composed explicitly. The Go plugin must match the exact [runtime/compiler dependency set](docs/compatibility.md). The optional Fleet console runs separately from Nakama; its default read-only deployment needs no player-database access.
+A Nakama runtime supports one registered FleetManager and one matched hook: do not install this standalone module beside another standalone fleet module. The libraries can be composed explicitly. The Go plugin must match the exact [runtime/compiler dependency set](docs/compatibility.md). The optional Fleet console runs separately from Nakama; its deployment needs no player-database access. The optional local action broker enables graceful instance drain without giving the web process the Fleet administrator secret.
 
 ## License
 

@@ -3,7 +3,10 @@
   "public_url": "http://127.0.0.1:17365/fleet-admin/",
   "username": "admin",
   "password_hash": "REPLACE_WITH_HASH_FROM_FLEET_CONSOLE_HASH_PASSWORD",
+  "read_api_token_hash": "",
   "source": {
+    "allow_management": false,
+    "control_socket": "",
     "max_processes": 4,
     "rooms_per_process": 2,
     "log_retention_days": 7,

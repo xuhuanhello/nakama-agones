@@ -26,6 +26,7 @@ import (
 )
 
 type SourceConfig struct {
+	ControlSocket     string         `json:"control_socket,omitempty"`
 	FleetSnapshotFile string         `json:"fleet_snapshot_file,omitempty"`
 	AllowManagement   bool           `json:"allow_management,omitempty"`
 	FleetURL          string         `json:"fleet_url"`
@@ -56,6 +57,7 @@ type regionSource struct {
 type DataSource struct {
 	cfg      SourceConfig
 	fleet    upstream
+	control  *controlClient
 	regions  []regionSource
 	mu       sync.Mutex
 	cached   any
@@ -83,8 +85,8 @@ func NewDataSource(cfg SourceConfig) (*DataSource, error) {
 	}
 	var f upstream
 	if cfg.FleetSnapshotFile != "" {
-		if !filepath.IsAbs(cfg.FleetSnapshotFile) || cfg.FleetURL != "" || cfg.FleetTokenFile != "" || cfg.AllowManagement {
-			return nil, errors.New("snapshot source must be read-only and exclusive")
+		if !filepath.IsAbs(cfg.FleetSnapshotFile) || cfg.FleetURL != "" || cfg.FleetTokenFile != "" {
+			return nil, errors.New("snapshot source must be exclusive")
 		}
 	} else {
 		var err error
@@ -93,7 +95,20 @@ func NewDataSource(cfg SourceConfig) (*DataSource, error) {
 			return nil, err
 		}
 	}
+	if cfg.AllowManagement && cfg.ControlSocket == "" {
+		return nil, errors.New("management requires the restricted control socket")
+	}
+	if cfg.ControlSocket != "" && cfg.FleetSnapshotFile == "" {
+		return nil, errors.New("control socket requires a credential-free snapshot source")
+	}
 	d := &DataSource{cfg: cfg, fleet: f}
+	if cfg.ControlSocket != "" {
+		var err error
+		d.control, err = newControlClient(cfg.ControlSocket)
+		if err != nil {
+			return nil, err
+		}
+	}
 	seen := map[string]bool{}
 	for _, r := range cfg.Regions {
 		if r.Namespace == "" {
@@ -224,6 +239,11 @@ func (d *DataSource) Snapshot(ctx context.Context) (any, error) {
 	regions := make([]any, len(d.regions))
 	var wg sync.WaitGroup
 	wg.Add(1 + len(d.regions))
+	var managementErr error
+	if d.cfg.AllowManagement && d.control != nil {
+		wg.Add(1)
+		go func() { defer wg.Done(); managementErr = d.control.capabilities(ctx) }()
+	}
 	go func() {
 		defer wg.Done()
 		if d.cfg.FleetSnapshotFile != "" {
@@ -245,12 +265,15 @@ func (d *DataSource) Snapshot(ctx context.Context) (any, error) {
 		}
 		s.Normalize()
 		projectFleet(fleet, s)
-		fleet["can_manage"] = d.cfg.AllowManagement
 	}()
 	for i, r := range d.regions {
 		go func(i int, r regionSource) { defer wg.Done(); regions[i] = r.snapshot(ctx) }(i, r)
 	}
 	wg.Wait()
+	fleet["can_manage"] = fleet["ok"] == true && d.cfg.AllowManagement && d.control != nil && managementErr == nil
+	if managementErr != nil {
+		fleet["management_error"] = sourceCode(managementErr)
+	}
 	out := map[string]any{"observed_at": time.Now().UTC().Format(time.RFC3339), "fleet": fleet, "regions": regions, "log_retention_days": d.cfg.LogRetentionDays}
 	d.cached = out
 	d.cachedAt = time.Now()
@@ -540,33 +563,29 @@ func (r regionSource) snapshot(ctx context.Context) any {
 }
 
 func (d *DataSource) Drain(ctx context.Context, worker string) error {
-	if !d.cfg.AllowManagement || d.cfg.FleetSnapshotFile != "" {
+	if !d.cfg.AllowManagement || d.control == nil {
 		return sourceError{403, "management_disabled"}
 	}
 	if !workerName.MatchString(worker) {
 		return badQuery()
 	}
-	body, _ := json.Marshal(map[string]string{"worker_id": worker})
-	_, err := d.fleet.request(ctx, http.MethodPost, "/agones/fleet/v1/admin/drain", body, 65536)
+	err := d.control.action(ctx, "drain", map[string]string{"worker_id": worker})
 	if err == nil {
-		d.mu.Lock()
-		d.cached = nil
-		d.mu.Unlock()
+		d.invalidateSnapshot()
 	}
 	return err
 }
 func (d *DataSource) RetryCreation(ctx context.Context) error {
-	if !d.cfg.AllowManagement || d.cfg.FleetSnapshotFile != "" {
+	if !d.cfg.AllowManagement || d.control == nil {
 		return sourceError{403, "management_disabled"}
 	}
-	_, err := d.fleet.request(ctx, http.MethodPost, "/agones/fleet/v1/admin/retry-creation", []byte("{}"), 65536)
+	err := d.control.action(ctx, "retry-creation", struct{}{})
 	if err == nil {
-		d.mu.Lock()
-		d.cached = nil
-		d.mu.Unlock()
+		d.invalidateSnapshot()
 	}
 	return err
 }
+func (d *DataSource) invalidateSnapshot() { d.mu.Lock(); d.cached = nil; d.mu.Unlock() }
 
 type logEntry struct {
 	Timestamp string `json:"timestamp"`
@@ -577,7 +596,7 @@ type logEntry struct {
 }
 
 func (d *DataSource) Logs(ctx context.Context, q url.Values) (any, error) {
-	allowed := map[string]bool{"region": true, "namespace": true, "pod": true, "container": true, "mode": true, "minutes": true, "limit": true, "search": true}
+	allowed := map[string]bool{"region": true, "namespace": true, "pod": true, "container": true, "mode": true, "minutes": true, "limit": true, "search": true, "before": true}
 	for k, v := range q {
 		if !allowed[k] || len(v) != 1 {
 			return nil, badQuery()
@@ -631,10 +650,11 @@ func (d *DataSource) Logs(ctx context.Context, q url.Values) (any, error) {
 	if minutes < 1 || minutes > d.cfg.LogRetentionDays*24*60 || limit < 1 || limit > 1000 || len(search) > 200 || strings.IndexByte(search, 0) >= 0 {
 		return nil, badQuery()
 	}
-	if mode == "live" && minutes > 1440 {
+	if mode == "live" && (minutes > 1440 || q.Get("before") != "") {
 		return nil, badQuery()
 	}
 	entries := []logEntry{}
+	nextBefore := ""
 	source := "kubernetes"
 	truncated := false
 	if mode == "live" {
@@ -684,7 +704,15 @@ func (d *DataSource) Logs(ctx context.Context, q url.Values) (any, error) {
 			selector += " |= " + strconv.Quote(search)
 		}
 		now := time.Now()
-		params := url.Values{"query": {selector}, "start": {strconv.FormatInt(now.Add(-time.Duration(minutes)*time.Minute).UnixNano(), 10)}, "end": {strconv.FormatInt(now.UnixNano(), 10)}, "limit": {strconv.Itoa(limit)}, "direction": {"backward"}}
+		start, end := now.Add(-time.Duration(minutes)*time.Minute), now
+		if q.Get("before") != "" {
+			before, err := time.Parse(time.RFC3339Nano, q.Get("before"))
+			if err != nil || !before.After(start) || before.After(now) {
+				return nil, badQuery()
+			}
+			end = before.Add(-time.Nanosecond)
+		}
+		params := url.Values{"query": {selector}, "start": {strconv.FormatInt(start.UnixNano(), 10)}, "end": {strconv.FormatInt(end.UnixNano(), 10)}, "limit": {strconv.Itoa(limit)}, "direction": {"backward"}}
 		var result struct {
 			Status string `json:"status"`
 			Data   struct {
@@ -721,8 +749,11 @@ func (d *DataSource) Logs(ctx context.Context, q url.Values) (any, error) {
 		if len(entries) > limit {
 			entries = entries[len(entries)-limit:]
 		}
+		if truncated && len(entries) > 0 {
+			nextBefore = entries[0].Timestamp
+		}
 	}
-	return map[string]any{"source": source, "observed_at": time.Now().UTC().Format(time.RFC3339), "retention_days": d.cfg.LogRetentionDays, "entries": entries, "truncated": truncated}, nil
+	return map[string]any{"next_before": nextBefore, "source": source, "observed_at": time.Now().UTC().Format(time.RFC3339), "retention_days": d.cfg.LogRetentionDays, "entries": entries, "truncated": truncated}, nil
 }
 
 // A root-owned exporter publishes a credential-free projection. An expired

@@ -1,0 +1,34 @@
+[Unit]
+Description=Restricted Fleet console instance drain and creation retry broker
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=fleet-console
+UMask=0077
+RuntimeDirectory=fleet-console-control
+RuntimeDirectoryMode=0750
+ExecStart=/usr/local/bin/fleet-console-control --config /etc/fleet-console/control.json
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+CapabilityBoundingSet=
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=/run/fleet-console-control
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+MemoryDenyWriteExecute=true
+MemoryMax=128M
+CPUQuota=25%
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target

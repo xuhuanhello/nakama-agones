@@ -54,7 +54,7 @@ When Kubernetes cannot schedule another process, surface waiting/capacity failur
 
 Use a private/VPN control network. Game UDP takes each worker's public address and a reserved hostPort range; test from a real external device. Do not put game UDP behind an HTTP proxy. Configure node external IPs deliberately and allow only the required game UDP range publicly. Restrict Kubernetes API, kubelet and overlay ports to trusted nodes/operators.
 
-Use TLS/CA validation and rotating service-account token files, scoped namespace RBAC, Secrets for all injected environment values, image digests for production and no client access to operator/provider credentials. Namespace RBAC cannot express ownership labels: dedicate a namespace/trust boundary to this controller. Encrypt Kubernetes Secrets at rest and secure etcd/snapshot backups. Headlamp must use scoped login and private access, not a public cluster-admin token.
+Use TLS/CA validation and rotating service-account token files, scoped namespace RBAC, Secrets for all injected environment values, image digests for production and no client access to operator/provider credentials. Namespace RBAC cannot express ownership labels: dedicate a namespace/trust boundary to this controller. Encrypt Kubernetes Secrets at rest and secure etcd/snapshot backups. The included Fleet console uses private SSH access and scoped observer permissions. Headlamp is optional; if installed later, it also needs scoped login and private access.
 
 ## Release and rollback
 

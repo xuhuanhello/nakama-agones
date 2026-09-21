@@ -127,6 +127,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, adminPrefix, http.StatusPermanentRedirect)
 		return
 	}
+	if strings.HasPrefix(r.URL.Path, apiPrefix+"v1/") {
+		s.versionedAPI(w, r)
+		return
+	}
 	if strings.HasPrefix(r.URL.Path, apiPrefix) {
 		s.api(w, r)
 		return
@@ -135,6 +139,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) api(w http.ResponseWriter, r *http.Request) {
+	if len(r.Header.Values("Authorization")) != 0 {
+		writeError(w, http.StatusForbidden, "api_token_scope")
+		return
+	}
+	if hasCredentialQuery(r.URL.Query()) {
+		writeError(w, 400, "credential_query_forbidden")
+		return
+	}
 	var wantMethod string
 	switch r.URL.Path {
 	case apiPrefix + "session", apiPrefix + "snapshot", apiPrefix + "logs":

@@ -14,11 +14,12 @@ import (
 
 // Config is private operator configuration, independent of Nakama's runtime.
 type Config struct {
-	Username     string       `json:"username"`
-	PasswordHash string       `json:"password_hash"`
-	PublicURL    string       `json:"public_url"`
-	Listen       string       `json:"listen"`
-	Source       SourceConfig `json:"source"`
+	Username         string       `json:"username"`
+	PasswordHash     string       `json:"password_hash"`
+	PublicURL        string       `json:"public_url"`
+	Listen           string       `json:"listen"`
+	Source           SourceConfig `json:"source"`
+	ReadAPITokenHash string       `json:"read_api_token_hash,omitempty"`
 }
 
 const configSizeLimit = 64 << 10
@@ -63,6 +64,9 @@ func privateFile(info os.FileInfo) bool {
 }
 
 func (cfg *Config) validate() error {
+	if cfg.ReadAPITokenHash != "" && !validReadAPITokenHash(cfg.ReadAPITokenHash) {
+		return errors.New("invalid read-only API token hash")
+	}
 	if !validUsername(cfg.Username) {
 		return errors.New("invalid administrator username")
 	}

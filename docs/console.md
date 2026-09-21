@@ -1,56 +1,85 @@
-# Fleet console
+# Install the Fleet console
 
-The optional `fleet-console` binary serves room, player, instance, node and log views. It runs independently of Nakama; adding or upgrading it does not require rebuilding the Go plugin or restarting Nakama. It adds no database. The default installation is **read-only and reachable through SSH**, with a separate administrator login.
+The console is an optional component of **this plugin repository and its releases**. `agones.so` runs inside Nakama; `fleet-console` runs as a separate loopback web/API service. This keeps UI and log tooling upgrades independent of live matchmaking. It requires no player database and no Nakama SDK changes.
 
-## What it shows
+Read [access and passwords](console-access.md), [daily operation](console-operations.md) and the [API reference](console-api.md) after installation. Historical log setup is a separate [Loki/Alloy step](console-logs.md).
 
-- Current and recently retained rooms, Nakama user IDs, seats, connection/reconnect state and assigned worker. Nicknames are not yet resolved; this is the Fleet state retention window, not a seven-day room archive.
-- Worker room occupancy, connected players, heartbeat time, game-process memory, frame p99, simulation/audit queues and pending results.
-- Kubernetes Pod CPU/memory, readiness/restarts, scheduling events and node capacity/usage. Measurements unavailable before the first heartbeat or from metrics-server appear as unknown. CPU and memory are measured per instance/node, not attributed to individual rooms.
-- Current game/Agones container logs and seven days of successfully collected historical logs using the optional [Loki/Alloy deployment](console-logs.md). A recycled Pod's archived logs remain searchable by Pod name. Live search filters the latest selected number of lines; history searches the selected time range before limiting results.
+## 1. Obtain the package
 
-No container shell, Secret browser, arbitrary Kubernetes proxy or player-database access is provided. The pilot uses K3s local SQLite for cluster state, a separate local PostgreSQL database for Fleet reservations, and local disk for Loki. These stores are independent of Nakama's player/account database. Fleet state still needs backups and reconciliation after loss; losing it is not equivalent to losing an operational log.
-
-## Install
-
-Build from a reviewed checkout using the module's Go toolchain:
+Use a verified release archive containing `fleet-console` / `fleet-console-control`, or build the console-only bundle with the pinned Go toolchain:
 
 ```sh
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -mod=readonly -o fleet-console ./cmd/fleet-console
+./scripts/package-console.sh
 ```
 
-On the Nakama host, create a dedicated unprivileged `fleet-console` system user. Install the binary to `/usr/local/bin/fleet-console`. Use `/etc/fleet-console` with owner `root:fleet-console` and mode `0750`; copy [config.example.json](../deploy/console/config.example.json) to `config.json` with mode `0600` and ownership allowing only the service user to read it. Generate the password hash with `fleet-console hash-password`, supplying the password through stdin, never process arguments. Use a unique password and keep the actual configuration out of Git.
+It produces a Linux amd64 archive in `dist/`, including binaries, public configuration/systemd templates, helpers, docs and SHA256SUMS. It does not rebuild or restart Nakama. From source, individual binaries can also be built with `CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -mod=readonly` and their `./cmd/...` paths.
 
-The default source is `/var/lib/fleet-console/status/fleet.json`. Create its parent directory as `root:fleet-console`, mode `0750`. Install `scripts/export_console_status.py` as `/opt/nakama-agones/scripts/export_console_status.py` and the [export service/timer](../deploy/console/fleet-console-export.service). The root-owned exporter reads the **existing** privileged credential file, calls only loopback `GET /agones/fleet/v1/admin/status`, and atomically publishes a whitelist projection every five seconds. The web service never receives that credential. Failed exports retain the previous file; snapshots older than 20 seconds are explicitly unavailable. No database connection or player SDK change is involved.
+## 2. Prepare the service account and observer
 
-Apply [observer-rbac.yaml](../deploy/console/observer-rbac.yaml) to the intended cluster. It gives `agones-control/fleet-console` read access to nodes, scoped Pod/event/metric data and logs, not Secrets, Pod exec or deletion. Configure its CA and a short-lived token file. Reuse the [token issue/sync workflow](token-sync.md) with **separate** export file, restricted SSH key, service account, receiver directory and service/timer names. The console reads the token per request, so rotation does not restart it. Keep the original Nakama runtime identity unchanged.
+On the Nakama host, create an unprivileged `fleet-console` system user/group. Install the binaries in `/usr/local/bin/`. Create `/etc/fleet-console` as `root:fleet-console` mode `0750` and the private service configuration as owner `fleet-console`, mode `0600`.
 
-Install and enable [fleet-console.service](../deploy/console/fleet-console.service) after configuration and the observer credential are ready. The listener is restricted to loopback. The unit runs without Linux capabilities, with a read-only filesystem, 256MiB memory ceiling and 0.5 CPU quota. The optional exporter and token sync have their own narrowly writable directories.
+On each observed cluster, apply [observer-rbac.yaml](../deploy/console/observer-rbac.yaml). The dedicated `agones-control/fleet-console` identity reads nodes, scoped Pod/event/metric data and logs. It cannot read Secrets, execute containers, delete Pods or administer the cluster.
 
-For `source.regions`, `name` must match Alloy's `FLEET_LOG_CLUSTER`. The current backend combines one Fleet status source with multiple observed Kubernetes regions; listing another region does not enable cross-region matchmaking by itself. `max_processes` and `rooms_per_process` are display configuration and must track the runtime's actual settings; the console does not change pool capacity.
+Install the trusted cluster CA and a **short-lived, separately rotated** observer token on the console host. Follow [token issuance](credentials.md) and [token delivery](token-sync.md), using separate export paths, SSH receiver key, ServiceAccount and timer/service names. Do not reuse or replace Nakama's runtime identity. The console reads its token file on every request, so normal rotation needs no restart.
 
-## Access
+## 3. Configure the web service and password
 
-On the administrator's computer:
+Copy [config.example.json](../deploy/console/config.example.json) to `/etc/fleet-console/config.json`. Set `public_url` to the administrator's **SSH-local browser URL**, normally `http://127.0.0.1:17365/fleet-admin/`; it does not mean the page is public. Set `listen` to VPS loopback `127.0.0.1:7365`.
+
+Configure region names, private Kubernetes API URLs and CA/token paths. Region names must match Alloy's `FLEET_LOG_CLUSTER`. `max_processes` / `rooms_per_process` are display settings and must match the actual runtime; editing them does not change capacity. Multiple observed regions do not automatically enable cross-region matchmaking.
+
+Set the initial password without writing it in shell history, then retain the password in an operator-owned password manager. This example reads it invisibly and stores only its hash:
 
 ```sh
-ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 \
-  -L 127.0.0.1:17365:127.0.0.1:7365 root@NAKAMA_HOST
+python3 - <<'PYINIT'
+import getpass, json, subprocess
+from pathlib import Path
+path = Path('/etc/fleet-console/config.json')
+config = json.loads(path.read_text())
+password = getpass.getpass('Initial Fleet password: ')
+if password != getpass.getpass('Confirm password: '):
+    raise SystemExit('Passwords differ; no change.')
+config['password_hash'] = subprocess.check_output(
+    ['/usr/local/bin/fleet-console', 'hash-password'],
+    input=(password+'\n').encode()).decode().strip()
+path.write_text(json.dumps(config, indent=2)+'\n')
+path.chmod(0o600)
+PYINIT
 ```
 
-Open `http://127.0.0.1:17365/fleet-admin/` and sign in. The URL must match `public_url`, including the local host and port; using `localhost` instead of `127.0.0.1` is rejected unless configured. A quiet SSH terminal is normal. Keep it running. Do not create a public reverse-proxy route or open ports 7350/7351/7365 in the cloud firewall.
+A local Git-ignored password copy is optional and is never read by the deployed service. If it is lost, reset the password on the VPS as described in [credential recovery](console-access.md#3-reset-a-forgotten-fleet-password).
 
-The Fleet console is separate from Nakama Console. If Nakama Console is also needed, expose its 7351 listener **only on the VPS loopback interface** and add `-L 127.0.0.1:17351:127.0.0.1:7351`. Open `http://127.0.0.1:17351/` with the existing Nakama Console account. Keep the public player API on HTTPS available; removing a Console domain route does not require blocking the shared 443 port.
+## 4. Publish a credential-free Fleet snapshot
 
-Authentication uses salted PBKDF2-SHA256 password hashes, bounded login attempts, eight-hour in-memory sessions, HttpOnly/SameSite cookies, exact Host/Origin validation and CSRF checks. Restarting the console invalidates its sessions. The default snapshot source always disables management actions. Direct API mode is an explicit alternative for operators who deliberately grant a service the existing Fleet administrator token; it never activates as a fallback from the read-only source.
+Create `/var/lib/fleet-console/status` as `root:fleet-console` mode `0750`. Install `scripts/export_console_status.py` under `/opt/nakama-agones/scripts/`. Install the [export service](../deploy/console/fleet-console-export.service) and [timer](../deploy/console/fleet-console-export.timer), adjusting only deployment-specific paths and the private Fleet loopback URL.
 
-## Verification
+The root exporter reads the **existing** runtime credential file, calls only `GET /agones/fleet/v1/admin/status`, and atomically publishes a whitelist snapshot every five seconds. The web service never receives that credential. Failed exports retain the previous file; a snapshot over 20 seconds old is explicitly unavailable.
+
+Enable the exporter and [web service](../deploy/console/fleet-console.service):
 
 ```sh
-go test -race -mod=readonly ./internal/console ./cmd/fleet-console
-python3 -m unittest tests/test_console_export.py
-node --check internal/console/web/app.js
-python3 deploy/observability/validate.py --images
+systemctl daemon-reload
+systemctl enable --now fleet-console-export.timer
+systemctl start fleet-console-export.service
+systemctl enable --now fleet-console
 ```
 
-After installation, verify login, current room/user data, Pod/node metrics and logs from a real game. Also verify archived logs after that test game's normal shutdown, observer permission denials and that neither management listener is publicly reachable. A local unit/mock test or a healthy Pod alone is not end-to-end deployment evidence.
+The web service runs without Linux capabilities, with a read-only filesystem, a 256 MiB memory ceiling and a 0.5 CPU quota. It is read-only unless the optional next step is configured.
+
+## 5. Optional restricted management
+
+Install the [control broker service](../deploy/console/fleet-console-control.service) and copy its private config example to `/etc/fleet-console/control.json`, owned by root with mode `0600`. It references the original root-only runtime credential file; do not copy the full Fleet token into the web account.
+
+The broker exposes only fixed instance-drain and creation-retry requests over `/run/fleet-console-control/control.sock`. The socket is `root:fleet-console` mode `0660`, inside a `0750` directory. There is no shell, arbitrary upstream URL, Kubernetes mutation proxy or public port.
+
+Set the web configuration's `source.control_socket` to that path and `source.allow_management` to `true`, then enable the broker and restart **only** the console. Management appears only when the snapshot and broker are usable. A failed broker does not erase room visibility; it reports a separate management error.
+
+Read-only API credentials are a separate option in [API setup](console-api.md); they cannot invoke these actions. Direct Fleet-token mode remains an explicit advanced configuration, never a fallback from a missing snapshot or failed broker.
+
+## 6. Logs, SSH access and acceptance
+
+Enable the [optional log collector/store](console-logs.md), establish a [Shell or PowerShell SSH tunnel](console-access.md), and log in. Do not add a public proxy route or firewall opening for 7350/7351/7365.
+
+Verify a real room and its player seats, metrics, live/history logs, then test a graceful drain on a test instance. Check filter/form/scroll stability across automatic updates. Verify observer permission denials, read-token mutation denial, token rotation and that public management routes remain unavailable. A mock alone is not deployment evidence.
+
+For upgrades, preserve private configuration and local log PVCs, install verified new binaries, then restart only the changed web/broker service. Browser sessions are in memory and must sign in again after a web-service restart. Replacing `agones.so` is a separate planned Nakama deployment.

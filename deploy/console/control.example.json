@@ -1,0 +1,5 @@
+{
+  "socket_path": "/run/fleet-console-control/control.sock",
+  "fleet_url": "http://127.0.0.1:7350",
+  "credentials_file": "/opt/nakama-agones/agones-secrets.json"
+}
