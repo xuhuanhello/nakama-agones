@@ -1,0 +1,17 @@
+[Unit]
+Description=Refresh scoped Nakama Kubernetes credential
+After=k3s.service
+Requires=k3s.service
+
+[Service]
+Type=oneshot
+User=root
+UMask=0077
+# Replace the endpoint and checkout location on the control node before installing.
+ExecStart=/usr/bin/python3 /opt/nakama-agones/scripts/issue_nakama_token.py --kubeconfig /etc/rancher/k3s/k3s.yaml --api-url https://10.0.0.2:6443 --output /var/lib/nakama-agones/token-export/nakama.json
+TimeoutStartSec=45
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/nakama-agones/token-export

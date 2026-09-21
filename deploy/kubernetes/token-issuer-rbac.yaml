@@ -1,0 +1,33 @@
+# Optional identity for a dedicated in-cluster token issuer.
+# Runtime Nakama gets only deploy/kubernetes/rbac.yaml, not this Role.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: nakama-agones-token-issuer
+  namespace: agones-control
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: nakama-agones-token-issuer
+  namespace: agones-control
+rules:
+  - apiGroups: ['']
+    resources: [serviceaccounts/token]
+    resourceNames: [nakama-agones]
+    verbs: [create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: nakama-agones-token-issuer
+  namespace: agones-control
+subjects:
+  - kind: ServiceAccount
+    name: nakama-agones-token-issuer
+    namespace: agones-control
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: nakama-agones-token-issuer

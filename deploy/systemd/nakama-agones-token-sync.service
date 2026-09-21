@@ -1,0 +1,19 @@
+[Unit]
+Description=Synchronize scoped Nakama Kubernetes credential over pinned SSH
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+UMask=0077
+# This file contains host names, paths and expected identity, never a token.
+EnvironmentFile=/opt/nakama-agones/credential-sync/config.env
+ExecStart=/usr/bin/python3 /opt/nakama-agones/scripts/sync_nakama_token.py --ssh-host ${SSH_HOST} --ssh-user ${SSH_USER} --ssh-port ${SSH_PORT} --ssh-key-file ${SSH_KEY_FILE} --known-hosts ${SSH_KNOWN_HOSTS} --expected-api-url ${EXPECTED_API_URL} --namespace ${EXPECTED_NAMESPACE} --service-account ${EXPECTED_SERVICE_ACCOUNT} --output-dir /opt/nakama-agones/credentials
+TimeoutStartSec=45
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/opt/nakama-agones/credentials
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

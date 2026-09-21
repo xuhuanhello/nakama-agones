@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh Nakama Kubernetes credential every 15 minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=15min
+RandomizedDelaySec=15s
+Unit=nakama-agones-token-issue.service
+
+[Install]
+WantedBy=timers.target

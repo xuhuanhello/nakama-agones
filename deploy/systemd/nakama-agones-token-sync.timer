@@ -1,0 +1,11 @@
+[Unit]
+Description=Synchronize Nakama Kubernetes credential every five minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+RandomizedDelaySec=10s
+Unit=nakama-agones-token-sync.service
+
+[Install]
+WantedBy=timers.target

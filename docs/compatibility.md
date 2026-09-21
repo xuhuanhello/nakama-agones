@@ -11,7 +11,7 @@ The plugin must match the host's Go compiler, shared dependencies and build sett
 | protobuf | v1.36.12 |
 | Runtime plugin | linux/amd64 |
 | Agones | 1.60.0 |
-| Local K3s | v1.35.8+k3s1 |
+| K3s (local and Linux node installer) | v1.35.8+k3s1 |
 | Local k3d / Helm | 5.9.0 / 3.22.0 |
 
 Exact image digests and shared Go modules are in `deploy/compatibility.env`, `go.mod` and `scripts/check-compatibility.sh`. The Docker build checks them before compiling `agones.so`. See the validation record for executed runtime tests. Changing only a tag is not an upgrade procedure.
