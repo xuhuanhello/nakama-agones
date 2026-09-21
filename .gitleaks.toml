@@ -1,0 +1,3 @@
+title = "Independent Agones source"
+[extend]
+useDefault = true

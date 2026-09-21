@@ -1,0 +1,17 @@
+name: Build plugin archive
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: ./scripts/package-release.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nakama-agones-plugin
+          path: dist/*.tar.gz

@@ -1,0 +1,51 @@
+name: Release Nakama Agones
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+jobs:
+  checks:
+    uses: ./.github/workflows/ci.yml
+  publish:
+    needs: checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate release version
+        shell: bash
+        run: |
+          set -euo pipefail
+          source deploy/compatibility.env
+          test "$GITHUB_REF_NAME" = "v$PLUGIN_VERSION"
+      - name: Scan source history before publishing
+        run: ./scripts/scan-secrets.sh
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build, package and push tested source
+        shell: bash
+        run: |
+          set -euo pipefail
+          source deploy/compatibility.env
+          ./scripts/package-release.sh
+          owner=$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
+          for target in runtime tools; do
+            image="ghcr.io/$owner/nakama-agones"
+            if [ "$target" = tools ]; then image="$image-tools"; fi
+            docker build --platform linux/amd64 -f deploy/Dockerfile --target "$target"               --build-arg "PLUGIN_VERSION=$PLUGIN_VERSION" --build-arg "VCS_REF=$GITHUB_SHA"               -t "$image:$GITHUB_REF_NAME" .
+            docker push "$image:$GITHUB_REF_NAME"
+          done
+      - name: Publish binary archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/*.tar.gz --verify-tag --generate-notes --prerelease

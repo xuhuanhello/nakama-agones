@@ -1,0 +1,23 @@
+# Review resource sizing and node labels before use on your own cluster.
+agones:
+  controller:
+    replicas: 2
+    persistentLogs: false
+    resources:
+      requests: {cpu: 100m, memory: 256Mi}
+      limits: {memory: 512Mi}
+  extensions:
+    replicas: 2
+    resources:
+      requests: {cpu: 100m, memory: 128Mi}
+      limits: {memory: 512Mi}
+  ping:
+    install: false
+  allocator:
+    install: false
+  crds:
+    cleanupOnDelete: false
+gameservers:
+  namespaces: [agones-games]
+  minPort: 20000
+  maxPort: 20999

@@ -1,0 +1,17 @@
+# Local validation only; one replica is not a highly available control plane.
+agones:
+  controller:
+    replicas: 1
+    persistentLogs: false
+  extensions:
+    replicas: 1
+  ping:
+    install: false
+  allocator:
+    install: false
+  crds:
+    cleanupOnDelete: false
+gameservers:
+  namespaces: [agones-games]
+  minPort: 17770
+  maxPort: 17789

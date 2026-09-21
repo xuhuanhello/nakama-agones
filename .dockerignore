@@ -1,0 +1,11 @@
+.git
+.local
+dist
+.env*
+*.env
+!deploy/compatibility.env
+*.pem
+*.key
+secrets
+private
+__pycache__

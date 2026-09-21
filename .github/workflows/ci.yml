@@ -1,0 +1,43 @@
+name: Validate Agones integration
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+permissions:
+  contents: read
+jobs:
+  source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.1'
+      - run: make test test-race
+      - run: python3 -m py_compile scripts/local_cluster.py examples/room-worker/server.py
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: ./scripts/bootstrap-tools.sh
+      - run: python3 scripts/local_cluster.py up
+      - run: node scripts/smoke.mjs
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: safe-integration-result
+          path: .local/smoke-result.json
+          if-no-files-found: ignore
+      - if: always()
+        run: python3 scripts/local_cluster.py reset
