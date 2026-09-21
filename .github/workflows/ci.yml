@@ -40,4 +40,5 @@ jobs:
           path: .local/smoke-result.json
           if-no-files-found: ignore
       - if: always()
-        run: python3 scripts/local_cluster.py reset
+        run: |
+          if [ -x .local/tools/k3d ]; then python3 scripts/local_cluster.py reset; fi

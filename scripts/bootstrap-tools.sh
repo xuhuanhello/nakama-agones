@@ -13,7 +13,7 @@ curl -fsSL "https://get.helm.sh/helm-v3.22.0-$os-$arch.tar.gz.sha256sum" -o helm
 python3 - "$os" "$arch" <<'CHECK'
 import hashlib,pathlib,sys
 os,arch=sys.argv[1:]; name=f'k3d-{os}-{arch}'
-checks={line.split()[1].lstrip('*'):line.split()[0] for line in pathlib.Path('k3d-checksums.txt').read_text().splitlines() if len(line.split())==2}
+checks={pathlib.PurePosixPath(line.split()[1].lstrip('*')).name:line.split()[0] for line in pathlib.Path('k3d-checksums.txt').read_text().splitlines() if len(line.split())==2}
 for filename,expected in [(name,checks[name]),('helm.tar.gz',pathlib.Path('helm.sha256sum').read_text().split()[0])]:
     if hashlib.sha256(pathlib.Path(filename).read_bytes()).hexdigest()!=expected:
         raise SystemExit('Tool checksum mismatch')
