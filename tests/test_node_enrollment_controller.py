@@ -262,6 +262,26 @@ class ControllerTests(unittest.TestCase):
             with self.assertRaises(c.Failure):self.controller.retire(obj)
         self.assertFalse(any(a[0]=='delete' for a in self.api.calls))
 
+    def test_lease_wire_renew_time_matches_kubernetes_microtime_even_at_whole_second(self):
+        lease=c.Lease(self.api,self.cfg['system_namespace'])
+        self.api.put(lease.path,{'metadata':{'name':c.LEASE_NAME,'resourceVersion':'1'},'spec':{}})
+        real_datetime=c.datetime
+        for fractional in (0,123456):
+            frozen=real_datetime(2026,9,22,4,2,36,fractional,tzinfo=c.timezone.utc)
+            with patch.object(c,'datetime',wraps=real_datetime) as clock:
+                clock.now.return_value=frozen
+                lease.renew()
+                # CR timestamps deliberately retain their existing second format.
+                self.assertEqual(c.stamp(),'2026-09-22T04:02:36Z')
+            request=[call for call in self.api.calls if call[0]=='PUT'][-1]
+            wire=json.loads(json.dumps(request[2]))['spec']['renewTime']
+            # Match the API's fixed MicroTime wire layout, not Python's lenient
+            # ISO parser; omitting a zero fractional part caused production 400.
+            self.assertRegex(wire,r'^2026-09-22T04:02:36\.[0-9]{6}Z$')
+            parsed=real_datetime.strptime(wire,'%Y-%m-%dT%H:%M:%S.%fZ')
+            self.assertEqual(parsed.microsecond,fractional)
+            self.assertEqual(request[2]['metadata']['resourceVersion'],str(1+(fractional!=0)))
+
     def test_one_controller_lease_rejects_second_unexpired_process(self):
         lease=c.Lease(self.api,self.cfg['system_namespace'])
         self.api.put(lease.path,{'metadata':{'name':c.LEASE_NAME,'resourceVersion':'1'},'spec':{}})

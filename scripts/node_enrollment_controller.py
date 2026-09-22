@@ -44,6 +44,12 @@ def stamp():
     return datetime.now(timezone.utc).isoformat(timespec='seconds').replace('+00:00', 'Z')
 
 
+def micro_stamp():
+    # coordination.k8s.io Lease uses metav1.MicroTime. Its JSON decoder requires
+    # six fractional digits, including .000000 when the clock is on a second.
+    return datetime.now(timezone.utc).isoformat(timespec='microseconds').replace('+00:00', 'Z')
+
+
 def seconds(value):
     try:
         return datetime.fromisoformat(value.replace('Z', '+00:00')).timestamp()
@@ -249,7 +255,7 @@ class Lease:
         if holder and holder != self.identity and renewed + 30 > time.time():
             raise Failure('another_controller_is_running', 409)
         obj['spec'] = {'holderIdentity': self.identity, 'leaseDurationSeconds': 30,
-                       'renewTime': stamp(), 'leaseTransitions': spec.get('leaseTransitions', 0) + (holder != self.identity)}
+                       'renewTime': micro_stamp(), 'leaseTransitions': spec.get('leaseTransitions', 0) + (holder != self.identity)}
         self.api.request('PUT', self.path, obj)
         self.alive.set()
 
