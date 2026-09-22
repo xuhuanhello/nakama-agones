@@ -39,6 +39,27 @@ Expose the Nakama client API and game-agent routes over trusted HTTPS. Restrict 
 
 The companion Unity lifecycle bridge requires HTTPS for remote control. Ensure the game image trusts its CA. Configuring readiness requires successful transport binding, business initialization and external result persistence, not merely a running Pod.
 
+### Matchmaking latency and warm capacity
+
+Pairing is performed by Nakama's built-in matchmaker. The Go runtime plugin validates region/version on queue admission, then handles the matched callback and reserves a room. Changing the runtime language does not change the native matchmaking interval.
+
+For a two-player game, start with this explicit Nakama configuration and measure queue time separately from process startup and UDP connection time:
+
+```yaml
+matchmaker:
+  interval_sec: 1
+  rev_precision: true
+  rev_threshold: 0
+```
+
+Nakama 3.41 defaults to a 15-second matchmaker interval. A 1-second interval reduces the polling wait when a compatible opponent is already queued; it does not guarantee an opponent or immediate room readiness. Retain bidirectional query checks to keep private load-test groups separate from ordinary players. The example client submits equal minimum/maximum counts (2/2), so `max_intervals` is not a delay for expanding player count. See [Nakama configuration](https://heroiclabs.com/docs/nakama/getting-started/configuration/).
+
+On monthly or otherwise always-on VPSs, use `AGONES_FLEET_MIN_INSTANCES=1` to retain one ready Unity game process even with no players. Extra empty processes may still retire after `AGONES_FLEET_IDLE_SECONDS`. This minimum counts ready processes, including occupied ones; it is not a guarantee of an additional empty process or room at peak load. The controller recreates the minimum after failure when healthy node capacity is available; one host is not HA.
+
+These values load at Nakama startup. Back up the configuration, confirm no active allocations, preserve player database/session settings, and recreate only the Nakama service to apply environment changes. Verify the effective matchmaker configuration, then observe the warm process beyond the idle timeout. Joining a new worker node still does not require a Nakama restart.
+
+Process scale-in only removes game Pods. It does not shut down, release, buy or reduce the bill of a VPS. Future pay-as-you-go worker scaling requires a separate node provisioning controller with minimum-node policy and drain-before-release checks; it is not implemented by this plugin.
+
 ## 4. Game image and rollout
 
 Build the Unity Linux amd64 Dedicated Server with the companion package and a completed room host adapter. Its entrypoint starts the game; it should read `AGONES_FLEET_GAME_PORT`, capacity and identity from environment. Upload it to your registry. Set `AGONES_GAME_IMAGE` to an immutable digest and use `AGONES_IMAGE_PULL_SECRET` if private.
