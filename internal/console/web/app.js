@@ -934,7 +934,11 @@
   function acceptEnrollmentJob(job) {
     const pending = state.pendingEnrollment;
     if (!pending || job.id !== pending.id) return;
-    if (enrollmentFailed(job)) { state.pendingEnrollment = null; state.nodeAction = ""; return; }
+    if (enrollmentFailed(job)) {
+      // A completed read-only preflight may fail with useful checks; it never authorizes join.
+      if (pending.kind === "preflight" && job.preflight?.can_join === false) acceptNodePreflight(job.preflight);
+      state.pendingEnrollment = null; state.nodeAction = ""; return;
+    }
     if (pending.kind === "scan" && job.scan) { acceptNodeScan(job.scan, pending.target); state.pendingEnrollment = null; state.nodeAction = ""; }
     else if (pending.kind === "preflight" && job.preflight) { acceptNodePreflight(job.preflight); state.pendingEnrollment = null; state.nodeAction = ""; }
   }
