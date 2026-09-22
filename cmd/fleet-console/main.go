@@ -74,6 +74,7 @@ func run(args []string) error {
 	if err != nil {
 		return errors.New("invalid backend source configuration")
 	}
+	defer backend.Close()
 	handler, err := console.NewServer(cfg, backend, console.WebFiles())
 	if err != nil {
 		return err
@@ -89,6 +90,7 @@ func run(args []string) error {
 		ErrorLog: log.New(io.Discard, "", 0)}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	backend.StartOperations(ctx)
 	done := make(chan error, 1)
 	go func() { done <- server.Serve(listener) }()
 	select {

@@ -27,6 +27,7 @@ STATUS_PATH = "/agones/fleet/v1/admin/status"
 TERMINAL = {"completed", "cancelled", "expired", "failed"}
 INTEGER_METRICS = ("simulation_pending", "simulation_active", "memory_bytes", "audit_pending", "audit_active", "pending_results")
 FLOAT_METRICS = ("simulation_oldest_seconds", "frame_p99_ms")
+TIMING_METRICS = ("client_presentation_to_ready_ms", "client_presentation_to_settlement_ms", "server_first_ack_to_ready_ms", "server_first_ack_to_settlement_ms", "server_last_ack_to_ready_ms", "server_last_ack_to_settlement_ms", "simulation_queue_ms", "simulation_work_ms")
 REDACTED = "[REDACTED: sensitive status text]"
 CREDENTIAL_LINE = re.compile(
     r'''(token|password|passwd|secret|credential|authorization|key|dsn|connection[_ -]?string|boot[_-]?id|reservation[_-]?id)[\s"'\\]*[:=]'''
@@ -217,6 +218,31 @@ def array(value):
     return value
 
 
+def timing_window(value):
+    if value is None:
+        return None
+    if not isinstance(value, dict) or integer(value.get("window_seconds")) != 60:
+        raise ExportError("invalid_timing_window")
+    count = integer(value.get("count"))
+    if not 0 <= count <= 100000:
+        raise ExportError("invalid_timing_window")
+    fields = ("p50", "p95", "p99", "max", "last_sample_age_seconds")
+    out = {"window_seconds": 60, "count": count}
+    for key in fields:
+        item = value.get(key)
+        if count == 0:
+            if item is not None:
+                raise ExportError("invalid_timing_window")
+            out[key] = None
+        else:
+            if item is None:
+                raise ExportError("invalid_timing_window")
+            out[key] = number(item)
+    if count and (not out["p50"] <= out["p95"] <= out["p99"] <= out["max"] or out["last_sample_age_seconds"] > 60):
+        raise ExportError("invalid_timing_window")
+    return out
+
+
 def project_status(state, secret_values=()):
     # A successful HTTP response containing an error object is not fresh state.
     if not isinstance(state, dict) or not {"revision", "workers", "allocations"}.issubset(state):
@@ -249,6 +275,15 @@ def project_status(state, secret_values=()):
                 raise ExportError("invalid_state_metrics")
             item["metrics"] = {key: integer(metrics.get(key)) for key in INTEGER_METRICS}
             item["metrics"].update({key: number(metrics.get(key)) for key in FLOAT_METRICS})
+            for key in TIMING_METRICS:
+                if key in metrics:
+                    item["metrics"][key] = timing_window(metrics[key])
+            for key in ("simulation_workers", "audit_workers"):
+                if metrics.get(key) is not None:
+                    value = integer(metrics[key])
+                    if not 1 <= value <= 8:
+                        raise ExportError("invalid_timing_workers")
+                    item["metrics"][key] = value
         result["workers"].append(item)
     ordered = [allocation for allocation in allocations.values() if allocation is not None]
     ordered.sort(key=lambda item: integer(item.get("created_at")), reverse=True)
@@ -278,6 +313,13 @@ def project_status(state, secret_values=()):
                 item["players"].append({"user_id": safe_id, "seat": seat, "connected": False,
                                         "ever_connected": False, "reconnect_until": 0})
         result["rooms"].append(item)
+    policy = state.get("capacity_policy")
+    if policy is not None:
+        if not isinstance(policy, dict):
+            raise ExportError("invalid_capacity_policy")
+        result["capacity_policy"] = {key: integer(policy.get(key)) for key in
+            ("revision", "rooms_per_instance", "cpu_request_millicores", "cpu_limit_millicores", "updated_at")}
+        result["capacity_policy"]["updated_by"] = string(policy.get("updated_by"), secret_values)
     return result
 
 

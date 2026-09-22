@@ -1,0 +1,59 @@
+{
+  "apiVersion": "admissionregistration.k8s.io/v1",
+  "kind": "ValidatingAdmissionPolicy",
+  "metadata": {
+    "name": "fleet-offline-game-node-delete"
+  },
+  "spec": {
+    "failurePolicy": "Fail",
+    "matchConstraints": {
+      "resourceRules": [
+        {
+          "apiGroups": [
+            ""
+          ],
+          "apiVersions": [
+            "v1"
+          ],
+          "operations": [
+            "DELETE"
+          ],
+          "resources": [
+            "nodes"
+          ]
+        }
+      ]
+    },
+    "matchConditions": [
+      {
+        "name": "enrollment-controller-only",
+        "expression": "request.userInfo.username == 'system:serviceaccount:fleet-enrollment-system:fleet-node-enrollment'"
+      }
+    ],
+    "validations": [
+      {
+        "expression": "has(oldObject.metadata.labels) && 'nakama-agones.io/game-node' in oldObject.metadata.labels && oldObject.metadata.labels['nakama-agones.io/game-node'] == 'true' && 'nakama-agones.io/role' in oldObject.metadata.labels && oldObject.metadata.labels['nakama-agones.io/role'] == 'game' && 'nakama-agones.io/cluster' in oldObject.metadata.labels && oldObject.metadata.labels['nakama-agones.io/cluster'] == 'example-us' && !('node-role.kubernetes.io/control-plane' in oldObject.metadata.labels) && !('node-role.kubernetes.io/master' in oldObject.metadata.labels)",
+        "message": "controller may only retire owned regional game workers"
+      },
+      {
+        "expression": "has(oldObject.status) && has(oldObject.status.conditions) && oldObject.status.conditions.filter(c, c.type == 'Ready').size() == 1 && oldObject.status.conditions.exists(c, c.type == 'Ready' && c.status in ['False', 'Unknown'])",
+        "message": "controller may only retire an explicitly offline node"
+      }
+    ]
+  }
+}
+
+---
+{
+  "apiVersion": "admissionregistration.k8s.io/v1",
+  "kind": "ValidatingAdmissionPolicyBinding",
+  "metadata": {
+    "name": "fleet-offline-game-node-delete"
+  },
+  "spec": {
+    "policyName": "fleet-offline-game-node-delete",
+    "validationActions": [
+      "Deny"
+    ]
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "region": {
+    "name": "example-us",
+    "cluster_id": "example-us",
+    "server": "https://10.0.0.2:6443",
+    "private_cidrs": ["10.0.0.0/24"],
+    "protected_hosts": ["10.0.0.1", "10.0.0.2", "192.0.2.10", "192.0.2.11"],
+    "game_port_min": 20000,
+    "game_port_max": 20999
+  },
+  "requests_namespace": "fleet-enrollment-requests",
+  "system_namespace": "fleet-enrollment-system",
+  "game_namespace": "agones-games",
+  "api_url": "https://kubernetes.default.svc",
+  "api_ca_file": "/var/run/secrets/enrollment-api/ca.crt",
+  "api_token_file": "/var/run/secrets/enrollment-api/token",
+  "runtime_dir": "/run/enrollment/private",
+  "bootstrap_dir": "/run/enrollment-bootstrap",
+  "node_script": "/opt/enrollment/k3s_node.py",
+  "secrets_encryption_verified": false,
+  "retirement_enabled": false,
+  "retirement_system_namespaces": ["kube-system", "agones-system", "agones-observability"]
+}

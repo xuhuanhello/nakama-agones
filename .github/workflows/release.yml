@@ -49,6 +49,16 @@ jobs:
             docker build --platform linux/amd64 -f deploy/Dockerfile --target "$target"               --build-arg "PLUGIN_VERSION=$PLUGIN_VERSION" --build-arg "VCS_REF=$GITHUB_SHA"               -t "$image:$GITHUB_REF_NAME" .
             docker push "$image:$GITHUB_REF_NAME"
           done
+      - name: Publish optional regional node controller
+        shell: bash
+        run: |
+          set -euo pipefail
+          owner=$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
+          image="ghcr.io/$owner/nakama-agones-node-controller:$GITHUB_REF_NAME"
+          docker build --platform linux/amd64 -f deploy/enrollment/Dockerfile \
+            --build-arg "PYTHON_IMAGE=$(cat deploy/enrollment/base-image.txt)" \
+            --build-arg "VCS_REF=$GITHUB_SHA" -t "$image" .
+          docker push "$image"
       - name: Publish binary archive
         env:
           GH_TOKEN: ${{ github.token }}

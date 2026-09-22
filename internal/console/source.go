@@ -26,6 +26,7 @@ import (
 )
 
 type SourceConfig struct {
+	OperationsFile    string         `json:"operations_file,omitempty"`
 	ControlSocket     string         `json:"control_socket,omitempty"`
 	FleetSnapshotFile string         `json:"fleet_snapshot_file,omitempty"`
 	AllowManagement   bool           `json:"allow_management,omitempty"`
@@ -55,13 +56,16 @@ type regionSource struct {
 	up  upstream
 }
 type DataSource struct {
-	cfg      SourceConfig
-	fleet    upstream
-	control  *controlClient
-	regions  []regionSource
-	mu       sync.Mutex
-	cached   any
-	cachedAt time.Time
+	operations       *operations
+	operationsCancel context.CancelFunc
+	operationsDone   chan struct{}
+	cfg              SourceConfig
+	fleet            upstream
+	control          *controlClient
+	regions          []regionSource
+	mu               sync.Mutex
+	cached           any
+	cachedAt         time.Time
 }
 type sourceError struct {
 	status int
@@ -137,6 +141,13 @@ func NewDataSource(cfg SourceConfig) (*DataSource, error) {
 			return nil, err
 		}
 		d.regions = append(d.regions, regionSource{r, u})
+	}
+	if cfg.OperationsFile != "" {
+		var err error
+		d.operations, err = openOperations(cfg.OperationsFile)
+		if err != nil {
+			return nil, err
+		}
 	}
 	return d, nil
 }
@@ -275,6 +286,10 @@ func (d *DataSource) Snapshot(ctx context.Context) (any, error) {
 		fleet["management_error"] = sourceCode(managementErr)
 	}
 	out := map[string]any{"observed_at": time.Now().UTC().Format(time.RFC3339), "fleet": fleet, "regions": regions, "log_retention_days": d.cfg.LogRetentionDays}
+	if d.operations != nil {
+		out["alerts"] = d.operations.view()
+	}
+	out["capacity"] = capacityProjection(fleet, regions)
 	d.cached = out
 	d.cachedAt = time.Now()
 	return out, nil
@@ -282,6 +297,7 @@ func (d *DataSource) Snapshot(ctx context.Context) (any, error) {
 func projectFleet(f map[string]any, s *state.State) {
 	f["ok"] = true
 	f["revision"] = s.Revision
+	f["capacity_policy"] = s.CapacityPolicy
 	f["creation_blocked_reason"] = safeText(s.CreationBlockedReason)
 	workers := []any{}
 	keys := make([]string, 0, len(s.Workers))
@@ -335,13 +351,17 @@ func projectFleet(f map[string]any, s *state.State) {
 }
 
 type meta struct {
-	Name      string            `json:"name"`
-	Namespace string            `json:"namespace"`
-	Labels    map[string]string `json:"labels"`
+	Name        string            `json:"name"`
+	Namespace   string            `json:"namespace"`
+	Labels      map[string]string `json:"labels"`
+	Annotations map[string]string `json:"annotations"`
 }
 type condition struct {
-	Type   string `json:"type"`
-	Status string `json:"status"`
+	Reason             string `json:"reason"`
+	Message            string `json:"message"`
+	Type               string `json:"type"`
+	Status             string `json:"status"`
+	LastTransitionTime string `json:"lastTransitionTime"`
 }
 type podObject struct {
 	Metadata meta `json:"metadata"`
@@ -374,6 +394,11 @@ type containerStatus struct {
 		} `json:"terminated"`
 	} `json:"state"`
 }
+type nodeAddress struct {
+	Type    string `json:"type"`
+	Address string `json:"address"`
+}
+
 type nodeObject struct {
 	Metadata meta `json:"metadata"`
 	Spec     struct {
@@ -382,6 +407,7 @@ type nodeObject struct {
 	Status struct {
 		Capacity    map[string]string `json:"capacity"`
 		Allocatable map[string]string `json:"allocatable"`
+		Addresses   []nodeAddress     `json:"addresses"`
 		Conditions  []condition       `json:"conditions"`
 	} `json:"status"`
 }
@@ -412,6 +438,36 @@ func isReady(cs []condition) bool {
 		}
 	}
 	return false
+}
+
+// Node addresses are reported by Kubernetes. Preserve their declared type;
+// neither DNS names nor a node-name convention are evidence of an IP address.
+func nodeIPs(addresses []nodeAddress, kind string) []string {
+	out := []string{}
+	seen := map[string]bool{}
+	for _, address := range addresses {
+		if address.Type != kind || net.ParseIP(address.Address) == nil || seen[address.Address] {
+			continue
+		}
+		seen[address.Address] = true
+		out = append(out, address.Address)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func nodeReadiness(conditions []condition) (string, string) {
+	for _, item := range conditions {
+		if item.Type != "Ready" {
+			continue
+		}
+		status := item.Status
+		if status != "True" && status != "False" {
+			status = "Unknown"
+		}
+		return status, item.LastTransitionTime
+	}
+	return "Unknown", ""
 }
 
 // Kubernetes resource.Quantity uses both binary and decimal SI suffixes.
@@ -503,11 +559,19 @@ func (r regionSource) snapshot(ctx context.Context) any {
 	}
 	nsOut := []any{}
 	for _, n := range nodes.Items {
-		m := map[string]any{"name": n.Metadata.Name, "ready": isReady(n.Status.Conditions), "unschedulable": n.Spec.Unschedulable, "role": n.Metadata.Labels["nakama-agones.io/role"], "cpu_capacity_millicores": quantity(n.Status.Capacity["cpu"]) * 1000, "memory_capacity_bytes": int64(quantity(n.Status.Capacity["memory"])), "cpu_allocatable_millicores": quantity(n.Status.Allocatable["cpu"]) * 1000, "memory_allocatable_bytes": int64(quantity(n.Status.Allocatable["memory"]))}
+		m := map[string]any{"name": n.Metadata.Name, "ready": isReady(n.Status.Conditions), "unschedulable": n.Spec.Unschedulable, "role": n.Metadata.Labels["nakama-agones.io/role"], "game_node": n.Metadata.Labels["nakama-agones.io/game-node"] == "true", "cpu_capacity_millicores": quantity(n.Status.Capacity["cpu"]) * 1000, "memory_capacity_bytes": int64(quantity(n.Status.Capacity["memory"])), "cpu_allocatable_millicores": quantity(n.Status.Allocatable["cpu"]) * 1000, "memory_allocatable_bytes": int64(quantity(n.Status.Allocatable["memory"]))}
+		m["internal_ips"] = nodeIPs(n.Status.Addresses, "InternalIP")
+		m["external_ips"] = nodeIPs(n.Status.Addresses, "ExternalIP")
+		if address := n.Metadata.Annotations["nakama-agones.io/operator-public-ip"]; net.ParseIP(address) != nil {
+			m["operator_public_ip"] = address
+		}
+		m["ready_status"], m["ready_last_transition_at"] = nodeReadiness(n.Status.Conditions)
 		addUsage(m, nodeMetrics[n.Metadata.Name])
 		nsOut = append(nsOut, m)
 	}
 	out["nodes"] = nsOut
+	out["observed_namespaces"] = namespaces
+	out["pod_count_scope"] = "configured_namespaces"
 	psOut := []any{}
 	esOut := []any{}
 	for i := range namespaces {
@@ -540,6 +604,12 @@ func (r regionSource) snapshot(ctx context.Context) any {
 				}
 			}
 			m := map[string]any{"name": p.Metadata.Name, "namespace": p.Metadata.Namespace, "node": p.Spec.NodeName, "phase": p.Status.Phase, "worker_id": p.Metadata.Labels["nakama-agones.io/worker"], "ready": isReady(p.Status.Conditions), "restarts": restarts, "reason": safeText(reason), "containers": containers}
+			for _, condition := range p.Status.Conditions {
+				if condition.Type == "PodScheduled" && condition.Status == "False" && condition.Reason == "Unschedulable" {
+					text := strings.ToLower(condition.Message)
+					m["scheduling_capacity_shortage"] = strings.Contains(text, "insufficient cpu") || strings.Contains(text, "insufficient memory")
+				}
+			}
 			addUsage(m, pm[p.Metadata.Name])
 			psOut = append(psOut, m)
 		}

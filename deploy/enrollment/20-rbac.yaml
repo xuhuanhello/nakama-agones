@@ -1,0 +1,456 @@
+{
+  "apiVersion": "v1",
+  "kind": "ServiceAccount",
+  "metadata": {
+    "name": "fleet-node-enrollment",
+    "namespace": "fleet-enrollment-system"
+  },
+  "automountServiceAccountToken": false
+}
+
+---
+{
+  "apiVersion": "v1",
+  "kind": "ServiceAccount",
+  "metadata": {
+    "name": "fleet-enrollment-submitter",
+    "namespace": "fleet-enrollment-system"
+  },
+  "automountServiceAccountToken": false
+}
+
+---
+{
+  "apiVersion": "rbac.authorization.k8s.io/v1",
+  "kind": "Role",
+  "metadata": {
+    "name": "enrollment-submit",
+    "namespace": "fleet-enrollment-requests"
+  },
+  "rules": [
+    {
+      "apiGroups": [
+        "infrastructure.nakama-agones.io"
+      ],
+      "resources": [
+        "nodeenrollments"
+      ],
+      "verbs": [
+        "get",
+        "list",
+        "watch",
+        "create",
+        "patch"
+      ]
+    },
+    {
+      "apiGroups": [
+        "infrastructure.nakama-agones.io"
+      ],
+      "resources": [
+        "noderetirements"
+      ],
+      "verbs": [
+        "get",
+        "list",
+        "watch",
+        "create"
+      ]
+    },
+    {
+      "apiGroups": [
+        ""
+      ],
+      "resources": [
+        "secrets"
+      ],
+      "verbs": [
+        "create",
+        "delete"
+      ]
+    }
+  ]
+}
+
+---
+{
+  "apiVersion": "rbac.authorization.k8s.io/v1",
+  "kind": "RoleBinding",
+  "metadata": {
+    "name": "enrollment-submit",
+    "namespace": "fleet-enrollment-requests"
+  },
+  "subjects": [
+    {
+      "kind": "ServiceAccount",
+      "name": "fleet-enrollment-submitter",
+      "namespace": "fleet-enrollment-system"
+    }
+  ],
+  "roleRef": {
+    "apiGroup": "rbac.authorization.k8s.io",
+    "kind": "Role",
+    "name": "enrollment-submit"
+  }
+}
+
+---
+{
+  "apiVersion": "rbac.authorization.k8s.io/v1",
+  "kind": "Role",
+  "metadata": {
+    "name": "enrollment-reconcile",
+    "namespace": "fleet-enrollment-requests"
+  },
+  "rules": [
+    {
+      "apiGroups": [
+        "infrastructure.nakama-agones.io"
+      ],
+      "resources": [
+        "nodeenrollments",
+        "noderetirements"
+      ],
+      "verbs": [
+        "get",
+        "list",
+        "watch",
+        "delete"
+      ]
+    },
+    {
+      "apiGroups": [
+        "infrastructure.nakama-agones.io"
+      ],
+      "resources": [
+        "nodeenrollments/status",
+        "noderetirements/status"
+      ],
+      "verbs": [
+        "get",
+        "update"
+      ]
+    },
+    {
+      "apiGroups": [
+        ""
+      ],
+      "resources": [
+        "secrets"
+      ],
+      "verbs": [
+        "get",
+        "list",
+        "delete"
+      ]
+    }
+  ]
+}
+
+---
+{
+  "apiVersion": "rbac.authorization.k8s.io/v1",
+  "kind": "RoleBinding",
+  "metadata": {
+    "name": "enrollment-reconcile",
+    "namespace": "fleet-enrollment-requests"
+  },
+  "subjects": [
+    {
+      "kind": "ServiceAccount",
+      "name": "fleet-node-enrollment",
+      "namespace": "fleet-enrollment-system"
+    }
+  ],
+  "roleRef": {
+    "apiGroup": "rbac.authorization.k8s.io",
+    "kind": "Role",
+    "name": "enrollment-reconcile"
+  }
+}
+
+---
+{
+  "apiVersion": "rbac.authorization.k8s.io/v1",
+  "kind": "ClusterRole",
+  "metadata": {
+    "name": "enrollment-observe-nodes"
+  },
+  "rules": [
+    {
+      "apiGroups": [
+        ""
+      ],
+      "resources": [
+        "nodes",
+        "pods"
+      ],
+      "verbs": [
+        "get",
+        "list"
+      ]
+    }
+  ]
+}
+
+---
+{
+  "apiVersion": "rbac.authorization.k8s.io/v1",
+  "kind": "ClusterRoleBinding",
+  "metadata": {
+    "name": "enrollment-observe-nodes"
+  },
+  "subjects": [
+    {
+      "kind": "ServiceAccount",
+      "name": "fleet-node-enrollment",
+      "namespace": "fleet-enrollment-system"
+    }
+  ],
+  "roleRef": {
+    "apiGroup": "rbac.authorization.k8s.io",
+    "kind": "ClusterRole",
+    "name": "enrollment-observe-nodes"
+  }
+}
+
+---
+{
+  "apiVersion": "rbac.authorization.k8s.io/v1",
+  "kind": "Role",
+  "metadata": {
+    "name": "enrollment-observe-games",
+    "namespace": "agones-games"
+  },
+  "rules": [
+    {
+      "apiGroups": [
+        "agones.dev"
+      ],
+      "resources": [
+        "gameservers"
+      ],
+      "verbs": [
+        "get",
+        "list"
+      ]
+    }
+  ]
+}
+
+---
+{
+  "apiVersion": "rbac.authorization.k8s.io/v1",
+  "kind": "RoleBinding",
+  "metadata": {
+    "name": "enrollment-observe-games",
+    "namespace": "agones-games"
+  },
+  "subjects": [
+    {
+      "kind": "ServiceAccount",
+      "name": "fleet-node-enrollment",
+      "namespace": "fleet-enrollment-system"
+    }
+  ],
+  "roleRef": {
+    "apiGroup": "rbac.authorization.k8s.io",
+    "kind": "Role",
+    "name": "enrollment-observe-games"
+  }
+}
+
+---
+{
+  "apiVersion": "rbac.authorization.k8s.io/v1",
+  "kind": "Role",
+  "metadata": {
+    "name": "enrollment-observe-daemonsets",
+    "namespace": "kube-system"
+  },
+  "rules": [
+    {
+      "apiGroups": [
+        "apps"
+      ],
+      "resources": [
+        "daemonsets"
+      ],
+      "verbs": [
+        "get"
+      ]
+    }
+  ]
+}
+
+---
+{
+  "apiVersion": "rbac.authorization.k8s.io/v1",
+  "kind": "RoleBinding",
+  "metadata": {
+    "name": "enrollment-observe-daemonsets",
+    "namespace": "kube-system"
+  },
+  "subjects": [
+    {
+      "kind": "ServiceAccount",
+      "name": "fleet-node-enrollment",
+      "namespace": "fleet-enrollment-system"
+    }
+  ],
+  "roleRef": {
+    "apiGroup": "rbac.authorization.k8s.io",
+    "kind": "Role",
+    "name": "enrollment-observe-daemonsets"
+  }
+}
+
+---
+{
+  "apiVersion": "rbac.authorization.k8s.io/v1",
+  "kind": "Role",
+  "metadata": {
+    "name": "enrollment-observe-daemonsets",
+    "namespace": "agones-system"
+  },
+  "rules": [
+    {
+      "apiGroups": [
+        "apps"
+      ],
+      "resources": [
+        "daemonsets"
+      ],
+      "verbs": [
+        "get"
+      ]
+    }
+  ]
+}
+
+---
+{
+  "apiVersion": "rbac.authorization.k8s.io/v1",
+  "kind": "RoleBinding",
+  "metadata": {
+    "name": "enrollment-observe-daemonsets",
+    "namespace": "agones-system"
+  },
+  "subjects": [
+    {
+      "kind": "ServiceAccount",
+      "name": "fleet-node-enrollment",
+      "namespace": "fleet-enrollment-system"
+    }
+  ],
+  "roleRef": {
+    "apiGroup": "rbac.authorization.k8s.io",
+    "kind": "Role",
+    "name": "enrollment-observe-daemonsets"
+  }
+}
+
+---
+{
+  "apiVersion": "rbac.authorization.k8s.io/v1",
+  "kind": "Role",
+  "metadata": {
+    "name": "enrollment-observe-daemonsets",
+    "namespace": "agones-observability"
+  },
+  "rules": [
+    {
+      "apiGroups": [
+        "apps"
+      ],
+      "resources": [
+        "daemonsets"
+      ],
+      "verbs": [
+        "get"
+      ]
+    }
+  ]
+}
+
+---
+{
+  "apiVersion": "rbac.authorization.k8s.io/v1",
+  "kind": "RoleBinding",
+  "metadata": {
+    "name": "enrollment-observe-daemonsets",
+    "namespace": "agones-observability"
+  },
+  "subjects": [
+    {
+      "kind": "ServiceAccount",
+      "name": "fleet-node-enrollment",
+      "namespace": "fleet-enrollment-system"
+    }
+  ],
+  "roleRef": {
+    "apiGroup": "rbac.authorization.k8s.io",
+    "kind": "Role",
+    "name": "enrollment-observe-daemonsets"
+  }
+}
+
+---
+{
+  "apiVersion": "coordination.k8s.io/v1",
+  "kind": "Lease",
+  "metadata": {
+    "name": "fleet-node-enrollment",
+    "namespace": "fleet-enrollment-system"
+  },
+  "spec": {}
+}
+
+---
+{
+  "apiVersion": "rbac.authorization.k8s.io/v1",
+  "kind": "Role",
+  "metadata": {
+    "name": "enrollment-controller-lease",
+    "namespace": "fleet-enrollment-system"
+  },
+  "rules": [
+    {
+      "apiGroups": [
+        "coordination.k8s.io"
+      ],
+      "resources": [
+        "leases"
+      ],
+      "verbs": [
+        "get",
+        "update"
+      ],
+      "resourceNames": [
+        "fleet-node-enrollment"
+      ]
+    }
+  ]
+}
+
+---
+{
+  "apiVersion": "rbac.authorization.k8s.io/v1",
+  "kind": "RoleBinding",
+  "metadata": {
+    "name": "enrollment-controller-lease",
+    "namespace": "fleet-enrollment-system"
+  },
+  "subjects": [
+    {
+      "kind": "ServiceAccount",
+      "name": "fleet-node-enrollment",
+      "namespace": "fleet-enrollment-system"
+    }
+  ],
+  "roleRef": {
+    "apiGroup": "rbac.authorization.k8s.io",
+    "kind": "Role",
+    "name": "enrollment-controller-lease"
+  }
+}

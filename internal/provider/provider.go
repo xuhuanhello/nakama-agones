@@ -17,7 +17,10 @@ type Provider interface {
 	Stop(context.Context, string) error
 }
 
+type CPUResources struct{ Request, Limit string }
+
 type StartRequest struct {
+	CPUResources         *CPUResources
 	Name                 string
 	Region               string
 	CustomData           map[string]any

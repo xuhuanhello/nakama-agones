@@ -146,6 +146,10 @@ func (s *ControlServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	want := http.MethodPost
 	switch r.URL.Path {
+	case controlPrefix + "policy":
+		if r.Method == http.MethodGet {
+			want = http.MethodGet
+		}
 	case controlPrefix + "capabilities":
 		want = http.MethodGet
 	case controlPrefix + "drain", controlPrefix + "retry-creation":
@@ -166,6 +170,10 @@ func (s *ControlServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), controlTimeout)
 	defer cancel()
+	if r.URL.Path == controlPrefix+"policy" {
+		s.policy(w, r.WithContext(ctx))
+		return
+	}
 	if want == http.MethodGet {
 		if r.ContentLength != 0 {
 			writeError(w, 400, "invalid_request")
@@ -185,7 +193,7 @@ func (s *ControlServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeError(w, 502, "control_invalid_response")
 			return
 		}
-		writeJSON(w, 200, ControlCapabilities{APIVersion: "v1", CanManage: true, Actions: []string{"drain", "retry-creation"}})
+		writeJSON(w, 200, ControlCapabilities{APIVersion: "v1", CanManage: true, Actions: []string{"drain", "retry-creation", "policy"}})
 		return
 	}
 	var payload []byte
@@ -208,7 +216,7 @@ func (s *ControlServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		payload = []byte("{}")
 	}
-	// These two literals are the complete write capability of the broker.
+	// These two lifecycle operations complement the typed policy route above.
 	upstreamPath := "/agones/fleet/v1/admin/retry-creation"
 	if r.URL.Path == controlPrefix+"drain" {
 		upstreamPath = "/agones/fleet/v1/admin/drain"
@@ -258,8 +266,18 @@ func (s *ControlServer) upstream(ctx context.Context, method, path string, body 
 			return nil, sourceError{409, "worker_not_drainable"}
 		}
 	}
+	if strings.HasSuffix(path, "/policy") {
+		switch response.StatusCode {
+		case 400:
+			return nil, sourceError{400, "policy_invalid"}
+		case 409:
+			return nil, sourceError{409, "policy_conflict"}
+		case 404:
+			return nil, sourceError{503, "policy_unavailable"}
+		}
+	}
 	expected := http.StatusOK
-	if method == http.MethodPost {
+	if method == http.MethodPost && !strings.HasSuffix(path, "/policy") {
 		expected = http.StatusAccepted
 	}
 	if response.StatusCode != expected {
@@ -314,18 +332,22 @@ func (c *controlClient) request(ctx context.Context, method, path string, value 
 		return nil, sourceError{502, "control_unavailable"}
 	}
 	defer res.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(res.Body, (16<<10)+1))
-	if err != nil || len(raw) > 16<<10 {
+	limit := int64(16 << 10)
+	if path == "policy" {
+		limit = 1 << 20
+	}
+	raw, err := io.ReadAll(io.LimitReader(res.Body, limit+1))
+	if err != nil || int64(len(raw)) > limit {
 		return nil, sourceError{502, "control_invalid_response"}
 	}
-	if (method == http.MethodGet && res.StatusCode == 200) || (method == http.MethodPost && res.StatusCode == 202) {
+	if (method == http.MethodGet && res.StatusCode == 200) || (method == http.MethodPost && (res.StatusCode == 202 || path == "policy" && res.StatusCode == 200)) {
 		return raw, nil
 	}
 	var failure struct {
 		Error string `json:"error"`
 	}
 	if json.Unmarshal(raw, &failure) == nil {
-		for _, allowed := range []string{"control_unavailable", "control_access_denied", "control_credential_unavailable", "control_invalid_response", "control_busy", "worker_not_found", "worker_not_drainable"} {
+		for _, allowed := range []string{"control_unavailable", "control_access_denied", "control_credential_unavailable", "control_invalid_response", "control_busy", "worker_not_found", "worker_not_drainable", "policy_invalid", "policy_conflict", "policy_unavailable"} {
 			if failure.Error == allowed && res.StatusCode >= 400 && res.StatusCode <= 599 {
 				return nil, sourceError{res.StatusCode, allowed}
 			}
@@ -340,7 +362,7 @@ func (c *controlClient) capabilities(ctx context.Context) error {
 		return err
 	}
 	var caps ControlCapabilities
-	if json.Unmarshal(raw, &caps) != nil || caps.APIVersion != "v1" || !caps.CanManage || len(caps.Actions) != 2 || caps.Actions[0] != "drain" || caps.Actions[1] != "retry-creation" {
+	if json.Unmarshal(raw, &caps) != nil || caps.APIVersion != "v1" || !caps.CanManage || (len(caps.Actions) != 2 && len(caps.Actions) != 3) || caps.Actions[0] != "drain" || caps.Actions[1] != "retry-creation" || len(caps.Actions) == 3 && caps.Actions[2] != "policy" {
 		return sourceError{502, "control_invalid_response"}
 	}
 	return nil

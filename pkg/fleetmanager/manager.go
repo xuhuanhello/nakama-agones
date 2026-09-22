@@ -70,6 +70,16 @@ func New(cfg Config, store state.Store, provider Provider) (*Manager, error) {
 				return fmt.Errorf("existing worker does not match fleet profile")
 			}
 		}
+		if s.CapacityPolicy == nil {
+			s.CapacityPolicy = &state.CapacityPolicy{Revision: 1, RoomsPerInstance: cfg.MaxRooms, CPURequestMillicores: cpuMilli(cfg.Kubernetes.CPURequest), CPULimitMillicores: cpuMilli(cfg.Kubernetes.CPULimit), UpdatedBy: "deployment"}
+		}
+		for _, w := range s.Workers {
+			if w.PolicyRevision == 0 {
+				w.PolicyRevision = 1
+				w.CPURequest = cfg.Kubernetes.CPURequest
+				w.CPULimit = cfg.Kubernetes.CPULimit
+			}
+		}
 		s.Profile = profile
 		return nil
 	}); err != nil {
@@ -229,7 +239,13 @@ func (m *Manager) cancel(s *state.State, a *state.Allocation, reason string, now
 	s.Commands[c.ID] = c
 }
 func (m *Manager) newWorker(s *state.State, now int64, maxRooms int) *state.Worker {
-	w := &state.Worker{ID: id(), State: "requested", Region: m.cfg.Region, BuildHash: m.cfg.BuildHash, MaxRooms: maxRooms, CreatedAt: now, UpdatedAt: now, NextCheckAt: now}
+	p := m.policy(s)
+	request, limit := m.cfg.Kubernetes.CPURequest, m.cfg.Kubernetes.CPULimit
+	if p.Revision > 1 {
+		request = fmt.Sprintf("%dm", p.CPURequestMillicores)
+		limit = fmt.Sprintf("%dm", p.CPULimitMillicores)
+	}
+	w := &state.Worker{PolicyRevision: p.Revision, CPURequest: request, CPULimit: limit, ID: id(), State: "requested", Region: m.cfg.Region, BuildHash: m.cfg.BuildHash, MaxRooms: maxRooms, CreatedAt: now, UpdatedAt: now, NextCheckAt: now}
 	s.Workers[w.ID] = w
 	return w
 }
@@ -244,7 +260,7 @@ func (m *Manager) liveCount(s *state.State) int {
 }
 
 func (m *Manager) Create(ctx context.Context, maxPlayers int, users []string, latencies []runtime.FleetUserLatencies, metadata map[string]any, callback runtime.FmCreateCallbackFn) (map[string]string, error) {
-	if maxPlayers < 2 || maxPlayers%2 != 0 || maxPlayers > m.cfg.MaxRooms*2 {
+	if maxPlayers < 2 || maxPlayers%2 != 0 || maxPlayers > 1024 {
 		return nil, fmt.Errorf("maxPlayers must be an even physical-instance capacity within this profile")
 	}
 	if len(users) > 0 && !validUsers(users) {
@@ -257,6 +273,9 @@ func (m *Manager) Create(ctx context.Context, maxPlayers int, users []string, la
 	}
 	var workerID string
 	err := m.store.Update(ctx, func(s *state.State) error {
+		if maxPlayers > m.policy(s).RoomsPerInstance*2 {
+			return ErrBusy
+		}
 		if m.liveCount(s) >= m.cfg.MaxInstances || s.CreationBlockedReason != "" {
 			return ErrBusy
 		}

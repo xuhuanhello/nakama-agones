@@ -36,6 +36,7 @@ const (
 
 type Server struct {
 	cfg           Config
+	enrollment    *enrollmentClient
 	backend       Backend
 	files         fs.FS
 	origin        string
@@ -66,12 +67,24 @@ func NewServer(cfg Config, backend Backend, files fs.FS) (*Server, error) {
 		origin: u.Scheme + "://" + u.Host, host: u.Host, secureCookies: u.Scheme == "https",
 		auth:       authState{sessions: make(map[[32]byte]session), peers: make(map[string]loginAttempts)},
 		loginSlots: make(chan struct{}, 2), stop: make(chan struct{}), done: make(chan struct{})}
+	if cfg.NodeOnboarding != nil {
+		var err error
+		s.enrollment, err = newEnrollmentClient(*cfg.NodeOnboarding)
+		if err != nil {
+			return nil, err
+		}
+	}
 	go s.expireSessions()
 	return s, nil
 }
 
 func (s *Server) Close() {
-	s.closeOnce.Do(func() { close(s.stop) })
+	s.closeOnce.Do(func() {
+		close(s.stop)
+		if s.enrollment != nil {
+			s.enrollment.http.CloseIdleConnections()
+		}
+	})
 	<-s.done
 }
 
@@ -127,6 +140,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, adminPrefix, http.StatusPermanentRedirect)
 		return
 	}
+	if strings.HasPrefix(r.URL.Path, apiPrefix+"node-retirement") {
+		s.nodeRetirementAPI(w, r)
+		return
+	}
+	if strings.HasPrefix(r.URL.Path, apiPrefix+"node-onboarding") {
+		s.nodeOnboardingAPI(w, r)
+		return
+	}
 	if strings.HasPrefix(r.URL.Path, apiPrefix+"v1/") {
 		s.versionedAPI(w, r)
 		return
@@ -151,7 +172,7 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
 	case apiPrefix + "session", apiPrefix + "snapshot", apiPrefix + "logs":
 		wantMethod = http.MethodGet
-	case apiPrefix + "login", apiPrefix + "logout", apiPrefix + "drain", apiPrefix + "retry-creation":
+	case apiPrefix + "login", apiPrefix + "logout", apiPrefix + "drain", apiPrefix + "retry-creation", apiPrefix + "policy", apiPrefix + "alerts":
 		wantMethod = http.MethodPost
 	default:
 		writeError(w, http.StatusNotFound, "not_found")
@@ -220,6 +241,30 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 		}
 		err := s.backend.Drain(ctx, input.WorkerID)
 		writeBackend(w, map[string]bool{"ok": true}, err)
+	case apiPrefix + "policy":
+		b, ok := s.backend.(policyBackend)
+		if !ok {
+			writeError(w, 503, "policy_unavailable")
+			return
+		}
+		var in PolicyInput
+		if !readJSON(w, r, &in) {
+			return
+		}
+		value, err := b.UpdatePolicy(ctx, in, s.cfg.Username)
+		writeBackend(w, value, err)
+	case apiPrefix + "alerts":
+		b, ok := s.backend.(alertsBackend)
+		if !ok {
+			writeError(w, 403, "alerts_disabled")
+			return
+		}
+		var in AlertUpdate
+		if !readJSON(w, r, &in) {
+			return
+		}
+		value, err := b.UpdateAlerts(ctx, in, s.cfg.Username)
+		writeBackend(w, value, err)
 	case apiPrefix + "retry-creation":
 		var input struct{}
 		if !readJSON(w, r, &input) {

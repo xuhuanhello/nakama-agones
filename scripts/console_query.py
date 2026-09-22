@@ -19,6 +19,8 @@ FILTERS = {
     "nodes": ("region", "name", "role", "ready", "offset", "limit"),
     "events": ("region", "namespace", "object_name", "type", "reason", "offset", "limit"),
     "logs": ("region", "namespace", "pod", "container", "mode", "minutes", "limit", "search", "before"),
+    "policy": (),
+    "alerts": (),
 }
 MAX_RESPONSE = 8 * 1024 * 1024
 

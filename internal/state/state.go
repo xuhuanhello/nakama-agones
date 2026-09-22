@@ -8,6 +8,8 @@ import (
 )
 
 type State struct {
+	CapacityPolicy        *CapacityPolicy        `json:"capacity_policy,omitempty"`
+	PolicyAudit           []PolicyAudit          `json:"policy_audit,omitempty"`
 	Profile               string                 `json:"profile"`
 	Revision              int64                  `json:"revision"`
 	Leader                string                 `json:"leader"`
@@ -20,6 +22,9 @@ type State struct {
 }
 
 type Worker struct {
+	PolicyRevision      int64   `json:"policy_revision,omitempty"`
+	CPURequest          string  `json:"cpu_request,omitempty"`
+	CPULimit            string  `json:"cpu_limit,omitempty"`
 	ID                  string  `json:"id"`
 	ProviderID          string  `json:"provider_id"`
 	ProviderReady       bool    `json:"provider_ready"`
@@ -47,6 +52,17 @@ type Worker struct {
 }
 
 type Metrics struct {
+	ServerLastACKToReadyMS           *LatencyWindow `json:"server_last_ack_to_ready_ms,omitempty"`
+	ServerLastACKToSettlementMS      *LatencyWindow `json:"server_last_ack_to_settlement_ms,omitempty"`
+	SimulationWorkers                *int           `json:"simulation_workers,omitempty"`
+	AuditWorkers                     *int           `json:"audit_workers,omitempty"`
+	ClientPresentationToReadyMS      *LatencyWindow `json:"client_presentation_to_ready_ms,omitempty"`
+	ClientPresentationToSettlementMS *LatencyWindow `json:"client_presentation_to_settlement_ms,omitempty"`
+	ServerFirstACKToReadyMS          *LatencyWindow `json:"server_first_ack_to_ready_ms,omitempty"`
+	ServerFirstACKToSettlementMS     *LatencyWindow `json:"server_first_ack_to_settlement_ms,omitempty"`
+	SimulationQueueMS                *LatencyWindow `json:"simulation_queue_ms,omitempty"`
+	SimulationWorkMS                 *LatencyWindow `json:"simulation_work_ms,omitempty"`
+
 	SimulationPending       int     `json:"simulation_pending"`
 	SimulationActive        int     `json:"simulation_active"`
 	SimulationOldestSeconds float64 `json:"simulation_oldest_seconds"`

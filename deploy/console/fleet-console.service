@@ -16,6 +16,7 @@ CapabilityBoundingSet=
 PrivateTmp=true
 PrivateDevices=true
 ProtectSystem=strict
+ReadWritePaths=-/var/lib/fleet-console/operations
 ProtectHome=true
 ProtectKernelTunables=true
 ProtectKernelModules=true

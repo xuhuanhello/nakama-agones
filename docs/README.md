@@ -9,6 +9,7 @@ Start with the workflow below. The README describes scope; this index separates 
 | `agones.so` | Nakama runtime | Matchmaking, allocation and durable multi-room lifecycle | Replacing the plugin requires a planned Nakama restart |
 | `fleet-console` | Nakama host, loopback systemd service | Web UI and documented read API | Restart only the console |
 | `fleet-console-control` (optional) | Nakama host, private Unix socket | Fixed, audited instance-drain and creation-recovery requests | Restart only the broker |
+| `fleet-node-controller` (optional) | Fixed non-root Pod on each regional control node | Preflight and installation of new workers; join credentials remain regional | Roll out only the regional controller |
 | K3s / Agones | Regional control and game nodes | Scheduling, health and game process lifecycle | Follow node draining procedures |
 | Alloy / Loki (optional) | Regional control node | Collect and retain operational logs | Independent from Nakama and player data |
 
@@ -28,7 +29,9 @@ The console is part of this repository and its releases; running it as a separat
 - [Console operation](console-operations.md): refresh controls, rooms, instances, nodes, logs and graceful drain.
 - [Read API and restricted actions](console-api.md): versioned routes, authentication, pagination and error codes for scripts/AI.
 - [Access and credentials](console-access.md): POSIX shell / PowerShell tunnels, password source, reset and machine read tokens.
+- [Capacity and alerts](console-capacity-alerts.md): future-instance CPU/room policy, timing windows and optional Feishu delivery.
 - [Node operations](nodes.md): join, capacity limits, draining and removal.
+- [Console node enrollment](console-node-onboarding.md): regional installation executor, SSH restrictions and preflight.
 - [Logs](console-logs.md): collection scope, retention, disk budget and failure handling.
 
 Headlamp is optional for general Kubernetes editing. It is not required for this console. Nakama Console manages Nakama data; it does not replace game-process log aggregation.

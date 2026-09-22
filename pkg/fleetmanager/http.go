@@ -85,6 +85,8 @@ func bearer(r *http.Request) string {
 // routes authenticate here; they do not inherit an assumption of Nakama auth.
 func (m *Manager) HTTPHandler() http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /agones/fleet/v1/admin/policy", m.admin(m.policyHTTP))
+	mux.HandleFunc("POST /agones/fleet/v1/admin/policy", m.admin(m.policyHTTP))
 	mux.HandleFunc("POST /agones/fleet/v1/agent/bootstrap", m.bootstrapHTTP)
 	mux.HandleFunc("POST /agones/fleet/v1/agent/heartbeat", m.heartbeatHTTP)
 	mux.HandleFunc("POST /agones/fleet/v1/admin/retry-creation", m.admin(func(w http.ResponseWriter, r *http.Request) {
@@ -179,12 +181,15 @@ func (m *Manager) bootstrapHTTP(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"agent_token": encoded(derive(m.cfg.SigningKey, "agent:"+input.WorkerID+":"+input.BootID)), "heartbeat_interval_seconds": 2})
 }
 func validMetrics(metrics state.Metrics) bool {
+	if !validTimingMetrics(metrics) {
+		return false
+	}
 	return metrics.SimulationPending >= 0 && metrics.SimulationActive >= 0 && metrics.AuditActive >= 0 && metrics.AuditPending >= 0 && metrics.PendingResults >= 0 && metrics.MemoryBytes >= 0 && metrics.SimulationOldestSeconds >= 0 && !math.IsNaN(metrics.SimulationOldestSeconds) && !math.IsInf(metrics.SimulationOldestSeconds, 0) && metrics.FrameP99MS >= 0 && !math.IsNaN(metrics.FrameP99MS) && !math.IsInf(metrics.FrameP99MS, 0)
 }
 
 func (m *Manager) heartbeatHTTP(w http.ResponseWriter, r *http.Request) {
 	var input HeartbeatRequest
-	if err := decodeBody(w, r, &input); err != nil || input.Sequence == 0 || len(input.Rooms) > m.cfg.MaxRooms || len(input.CommandResults) > 256 || !validMetrics(input.Metrics) {
+	if err := decodeBody(w, r, &input); err != nil || input.Sequence == 0 || len(input.Rooms) > 512 || len(input.CommandResults) > 256 || !validMetrics(input.Metrics) {
 		writeJSON(w, 400, map[string]string{"error": "invalid_request"})
 		return
 	}
@@ -197,6 +202,9 @@ func (m *Manager) heartbeatHTTP(w http.ResponseWriter, r *http.Request) {
 		worker := s.Workers[input.WorkerID]
 		if worker == nil {
 			return ErrNotFound
+		}
+		if len(input.Rooms) > worker.MaxRooms {
+			return ErrForbidden
 		}
 		if worker.BootID != input.BootID || worker.State == "stopped" || worker.State == "lost" || worker.State == "failed" {
 			return ErrForbidden

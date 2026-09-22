@@ -1,0 +1,754 @@
+{
+  "apiVersion": "apiextensions.k8s.io/v1",
+  "kind": "CustomResourceDefinition",
+  "metadata": {
+    "name": "nodeenrollments.infrastructure.nakama-agones.io"
+  },
+  "spec": {
+    "group": "infrastructure.nakama-agones.io",
+    "scope": "Namespaced",
+    "names": {
+      "plural": "nodeenrollments",
+      "singular": "nodeenrollment",
+      "kind": "NodeEnrollment"
+    },
+    "versions": [
+      {
+        "name": "v1alpha1",
+        "served": true,
+        "storage": true,
+        "subresources": {
+          "status": {}
+        },
+        "additionalPrinterColumns": [
+          {
+            "name": "Phase",
+            "type": "string",
+            "jsonPath": ".status.phase"
+          },
+          {
+            "name": "Region",
+            "type": "string",
+            "jsonPath": ".spec.region"
+          }
+        ],
+        "schema": {
+          "openAPIV3Schema": {
+            "type": "object",
+            "required": [
+              "spec"
+            ],
+            "properties": {
+              "spec": {
+                "type": "object",
+                "required": [
+                  "region",
+                  "host",
+                  "port",
+                  "action"
+                ],
+                "properties": {
+                  "region": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 63,
+                    "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+                  },
+                  "host": {
+                    "type": "string",
+                    "maxLength": 15,
+                    "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$"
+                  },
+                  "port": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 65535
+                  },
+                  "action": {
+                    "type": "string",
+                    "enum": [
+                      "Scan",
+                      "Preflight",
+                      "Join"
+                    ]
+                  },
+                  "hostFingerprint": {
+                    "type": "string",
+                    "pattern": "^SHA256:[A-Za-z0-9+/]{43}$",
+                    "maxLength": 50
+                  },
+                  "credentialSecretRef": {
+                    "type": "object",
+                    "required": [
+                      "name",
+                      "uid"
+                    ],
+                    "properties": {
+                      "name": {
+                        "type": "string",
+                        "pattern": "^ssh-[a-f0-9]{32}$",
+                        "maxLength": 36
+                      },
+                      "uid": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128
+                      }
+                    }
+                  },
+                  "approvedPreflightDigest": {
+                    "type": "string",
+                    "pattern": "^[a-f0-9]{64}$",
+                    "maxLength": 64
+                  }
+                },
+                "x-kubernetes-validations": [
+                  {
+                    "rule": "self.region == oldSelf.region && self.host == oldSelf.host && self.port == oldSelf.port",
+                    "message": "target and region are immutable"
+                  },
+                  {
+                    "rule": "self.action == oldSelf.action || (oldSelf.action == 'Scan' && self.action == 'Preflight') || (oldSelf.action == 'Preflight' && self.action == 'Join')",
+                    "message": "actions can only advance"
+                  },
+                  {
+                    "rule": "self.action == 'Scan' || (has(self.hostFingerprint) && has(self.credentialSecretRef))",
+                    "message": "verified host and credential reference are required"
+                  },
+                  {
+                    "rule": "self.action != 'Join' || has(self.approvedPreflightDigest)",
+                    "message": "join requires approval of the exact preflight"
+                  },
+                  {
+                    "rule": "!has(oldSelf.hostFingerprint) || (has(self.hostFingerprint) && self.hostFingerprint == oldSelf.hostFingerprint)",
+                    "message": "host fingerprint is immutable once approved"
+                  },
+                  {
+                    "rule": "!has(oldSelf.credentialSecretRef) || (has(self.credentialSecretRef) && self.credentialSecretRef == oldSelf.credentialSecretRef)",
+                    "message": "credential identity is immutable once provided"
+                  },
+                  {
+                    "rule": "!has(oldSelf.approvedPreflightDigest) || (has(self.approvedPreflightDigest) && self.approvedPreflightDigest == oldSelf.approvedPreflightDigest)",
+                    "message": "approval cannot be replaced"
+                  }
+                ]
+              },
+              "status": {
+                "type": "object",
+                "properties": {
+                  "phase": {
+                    "type": "string",
+                    "enum": [
+                      "Scanning",
+                      "AwaitingPreflight",
+                      "Preflighting",
+                      "AwaitingApproval",
+                      "Installing",
+                      "Verifying",
+                      "Ready",
+                      "Failed",
+                      "NeedsReview",
+                      "Expired"
+                    ]
+                  },
+                  "observedGeneration": {
+                    "type": "integer",
+                    "format": "int64",
+                    "minimum": 0
+                  },
+                  "updatedAt": {
+                    "type": "string",
+                    "format": "date-time"
+                  },
+                  "error": {
+                    "type": "string",
+                    "maxLength": 96,
+                    "pattern": "^[a-z0-9_]*$"
+                  },
+                  "job": {
+                    "type": "object",
+                    "properties": {
+                      "id": {
+                        "type": "string",
+                        "pattern": "^[a-f0-9]{32}$",
+                        "maxLength": 32
+                      },
+                      "host": {
+                        "type": "string",
+                        "minLength": 3,
+                        "maxLength": 45
+                      },
+                      "region": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 63,
+                        "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+                      },
+                      "node_name": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 63,
+                        "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+                      },
+                      "node_uid": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128
+                      },
+                      "state": {
+                        "type": "string",
+                        "maxLength": 32
+                      },
+                      "stage": {
+                        "type": "string",
+                        "maxLength": 96,
+                        "pattern": "^[a-z0-9_]*$"
+                      },
+                      "error": {
+                        "type": "string",
+                        "maxLength": 96,
+                        "pattern": "^[a-z0-9_]*$"
+                      },
+                      "created_at": {
+                        "type": "integer",
+                        "format": "int64",
+                        "minimum": 0
+                      },
+                      "updated_at": {
+                        "type": "integer",
+                        "format": "int64",
+                        "minimum": 0
+                      },
+                      "checks": {
+                        "type": "array",
+                        "maxItems": 32,
+                        "items": {
+                          "type": "object",
+                          "required": [
+                            "name",
+                            "ok",
+                            "detail"
+                          ],
+                          "properties": {
+                            "name": {
+                              "type": "string",
+                              "minLength": 1,
+                              "maxLength": 63,
+                              "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+                            },
+                            "ok": {
+                              "type": "boolean"
+                            },
+                            "detail": {
+                              "type": "string",
+                              "maxLength": 512
+                            }
+                          }
+                        }
+                      }
+                    }
+                  },
+                  "scan": {
+                    "type": "object",
+                    "required": [
+                      "scan_id",
+                      "host",
+                      "port",
+                      "region",
+                      "expires_at",
+                      "fingerprints"
+                    ],
+                    "properties": {
+                      "scan_id": {
+                        "type": "string",
+                        "pattern": "^[a-f0-9]{32}$",
+                        "maxLength": 32
+                      },
+                      "host": {
+                        "type": "string",
+                        "minLength": 3,
+                        "maxLength": 45
+                      },
+                      "port": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 65535
+                      },
+                      "region": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 63,
+                        "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+                      },
+                      "expires_at": {
+                        "type": "integer",
+                        "format": "int64",
+                        "minimum": 0
+                      },
+                      "fingerprints": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 1,
+                        "items": {
+                          "type": "object",
+                          "required": [
+                            "algorithm",
+                            "fingerprint"
+                          ],
+                          "properties": {
+                            "algorithm": {
+                              "type": "string",
+                              "enum": [
+                                "ssh-ed25519"
+                              ]
+                            },
+                            "fingerprint": {
+                              "type": "string",
+                              "pattern": "^SHA256:[A-Za-z0-9+/]{43}$",
+                              "maxLength": 50
+                            }
+                          }
+                        }
+                      }
+                    }
+                  },
+                  "preflight": {
+                    "type": "object",
+                    "properties": {
+                      "preflight_id": {
+                        "type": "string",
+                        "pattern": "^[a-f0-9]{32}$",
+                        "maxLength": 32
+                      },
+                      "expires_at": {
+                        "type": "integer",
+                        "format": "int64",
+                        "minimum": 0
+                      },
+                      "host": {
+                        "type": "string",
+                        "minLength": 3,
+                        "maxLength": 45
+                      },
+                      "region": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 63,
+                        "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+                      },
+                      "node_name": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 63,
+                        "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+                      },
+                      "private_ip": {
+                        "type": "string",
+                        "maxLength": 45
+                      },
+                      "external_ip": {
+                        "type": "string",
+                        "minLength": 3,
+                        "maxLength": 45
+                      },
+                      "interface": {
+                        "type": "string",
+                        "maxLength": 32
+                      },
+                      "cpu_cores": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 4096
+                      },
+                      "memory_mib": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 100000000
+                      },
+                      "disk_free_gib": {
+                        "type": "number",
+                        "minimum": 0
+                      },
+                      "existing_installation": {
+                        "type": "boolean"
+                      },
+                      "checks": {
+                        "type": "array",
+                        "maxItems": 32,
+                        "items": {
+                          "type": "object",
+                          "required": [
+                            "name",
+                            "ok",
+                            "detail"
+                          ],
+                          "properties": {
+                            "name": {
+                              "type": "string",
+                              "minLength": 1,
+                              "maxLength": 63,
+                              "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+                            },
+                            "ok": {
+                              "type": "boolean"
+                            },
+                            "detail": {
+                              "type": "string",
+                              "maxLength": 512
+                            }
+                          }
+                        }
+                      },
+                      "can_join": {
+                        "type": "boolean"
+                      },
+                      "plan": {
+                        "type": "array",
+                        "maxItems": 16,
+                        "items": {
+                          "type": "string",
+                          "maxLength": 512
+                        }
+                      }
+                    }
+                  },
+                  "preflightDigest": {
+                    "type": "string",
+                    "maxLength": 64,
+                    "pattern": "^[a-f0-9]{64}$"
+                  },
+                  "sshHostKey": {
+                    "type": "string",
+                    "maxLength": 512
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    ]
+  }
+}
+
+---
+{
+  "apiVersion": "apiextensions.k8s.io/v1",
+  "kind": "CustomResourceDefinition",
+  "metadata": {
+    "name": "noderetirements.infrastructure.nakama-agones.io"
+  },
+  "spec": {
+    "group": "infrastructure.nakama-agones.io",
+    "scope": "Namespaced",
+    "names": {
+      "plural": "noderetirements",
+      "singular": "noderetirement",
+      "kind": "NodeRetirement"
+    },
+    "versions": [
+      {
+        "name": "v1alpha1",
+        "served": true,
+        "storage": true,
+        "subresources": {
+          "status": {}
+        },
+        "additionalPrinterColumns": [
+          {
+            "name": "Phase",
+            "type": "string",
+            "jsonPath": ".status.phase"
+          },
+          {
+            "name": "Region",
+            "type": "string",
+            "jsonPath": ".spec.region"
+          }
+        ],
+        "schema": {
+          "openAPIV3Schema": {
+            "type": "object",
+            "required": [
+              "spec"
+            ],
+            "properties": {
+              "spec": {
+                "type": "object",
+                "required": [
+                  "region",
+                  "nodeName",
+                  "nodeUID",
+                  "internalIPs",
+                  "externalIPs",
+                  "confirmedNodeName",
+                  "confirmedIP",
+                  "permanentRetirement"
+                ],
+                "properties": {
+                  "region": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 63,
+                    "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+                  },
+                  "nodeName": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 63,
+                    "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+                  },
+                  "nodeUID": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128
+                  },
+                  "internalIPs": {
+                    "type": "array",
+                    "maxItems": 8,
+                    "x-kubernetes-list-type": "set",
+                    "items": {
+                      "type": "string",
+                      "minLength": 3,
+                      "maxLength": 45
+                    }
+                  },
+                  "externalIPs": {
+                    "type": "array",
+                    "maxItems": 8,
+                    "x-kubernetes-list-type": "set",
+                    "items": {
+                      "type": "string",
+                      "minLength": 3,
+                      "maxLength": 45
+                    }
+                  },
+                  "confirmedNodeName": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 63,
+                    "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+                  },
+                  "confirmedIP": {
+                    "type": "string",
+                    "minLength": 3,
+                    "maxLength": 45
+                  },
+                  "permanentRetirement": {
+                    "type": "boolean",
+                    "enum": [
+                      true
+                    ]
+                  }
+                },
+                "x-kubernetes-validations": [
+                  {
+                    "rule": "self == oldSelf",
+                    "message": "retirement request is immutable"
+                  },
+                  {
+                    "rule": "self.confirmedNodeName == self.nodeName",
+                    "message": "type the exact node name"
+                  },
+                  {
+                    "rule": "self.confirmedIP in self.internalIPs || self.confirmedIP in self.externalIPs",
+                    "message": "type a current node IP"
+                  }
+                ]
+              },
+              "status": {
+                "type": "object",
+                "properties": {
+                  "phase": {
+                    "type": "string",
+                    "enum": [
+                      "Pending",
+                      "Checking",
+                      "Deleted",
+                      "Blocked",
+                      "NeedsReview"
+                    ]
+                  },
+                  "observedGeneration": {
+                    "type": "integer",
+                    "format": "int64",
+                    "minimum": 0
+                  },
+                  "updatedAt": {
+                    "type": "string",
+                    "format": "date-time"
+                  },
+                  "error": {
+                    "type": "string",
+                    "maxLength": 96,
+                    "pattern": "^[a-z0-9_]*$"
+                  },
+                  "job": {
+                    "type": "object",
+                    "properties": {
+                      "id": {
+                        "type": "string",
+                        "pattern": "^[a-f0-9]{32}$",
+                        "maxLength": 32
+                      },
+                      "host": {
+                        "type": "string",
+                        "minLength": 3,
+                        "maxLength": 45
+                      },
+                      "region": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 63,
+                        "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+                      },
+                      "node_name": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 63,
+                        "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+                      },
+                      "node_uid": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128
+                      },
+                      "state": {
+                        "type": "string",
+                        "maxLength": 32
+                      },
+                      "stage": {
+                        "type": "string",
+                        "maxLength": 96,
+                        "pattern": "^[a-z0-9_]*$"
+                      },
+                      "error": {
+                        "type": "string",
+                        "maxLength": 96,
+                        "pattern": "^[a-z0-9_]*$"
+                      },
+                      "created_at": {
+                        "type": "integer",
+                        "format": "int64",
+                        "minimum": 0
+                      },
+                      "updated_at": {
+                        "type": "integer",
+                        "format": "int64",
+                        "minimum": 0
+                      },
+                      "checks": {
+                        "type": "array",
+                        "maxItems": 32,
+                        "items": {
+                          "type": "object",
+                          "required": [
+                            "name",
+                            "ok",
+                            "detail"
+                          ],
+                          "properties": {
+                            "name": {
+                              "type": "string",
+                              "minLength": 1,
+                              "maxLength": 63,
+                              "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+                            },
+                            "ok": {
+                              "type": "boolean"
+                            },
+                            "detail": {
+                              "type": "string",
+                              "maxLength": 512
+                            }
+                          }
+                        }
+                      }
+                    }
+                  },
+                  "blockers": {
+                    "type": "array",
+                    "maxItems": 200,
+                    "items": {
+                      "type": "object",
+                      "required": [
+                        "kind",
+                        "namespace",
+                        "name",
+                        "reason"
+                      ],
+                      "properties": {
+                        "kind": {
+                          "type": "string",
+                          "enum": [
+                            "Pod",
+                            "GameServer"
+                          ]
+                        },
+                        "namespace": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 63,
+                          "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+                        },
+                        "name": {
+                          "type": "string",
+                          "maxLength": 253
+                        },
+                        "reason": {
+                          "type": "string",
+                          "maxLength": 96,
+                          "pattern": "^[a-z0-9_]*$"
+                        }
+                      }
+                    }
+                  },
+                  "allowedSystemPods": {
+                    "type": "array",
+                    "maxItems": 200,
+                    "items": {
+                      "type": "object",
+                      "required": [
+                        "kind",
+                        "namespace",
+                        "name",
+                        "reason"
+                      ],
+                      "properties": {
+                        "kind": {
+                          "type": "string",
+                          "enum": [
+                            "Pod",
+                            "GameServer"
+                          ]
+                        },
+                        "namespace": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 63,
+                          "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+                        },
+                        "name": {
+                          "type": "string",
+                          "maxLength": 253
+                        },
+                        "reason": {
+                          "type": "string",
+                          "maxLength": 96,
+                          "pattern": "^[a-z0-9_]*$"
+                        }
+                      }
+                    }
+                  },
+                  "blockersTruncated": {
+                    "type": "boolean"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    ]
+  }
+}

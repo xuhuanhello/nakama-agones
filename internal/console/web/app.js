@@ -14,16 +14,18 @@
     connected: "已连接", disconnected: "已断开", Running: "运行中", Pending: "等待调度",
     waiting_capacity: "等待容量", preparing: "准备中", prepared: "已准备", cancelling: "取消中",
     bootstrapping: "初始化中", suspect: "状态待确认", unknown: "未知",
-    Succeeded: "已完成", Failed: "失败", Unknown: "未知"
+    Succeeded: "已完成", Failed: "失败", Unknown: "未知", queued: "等待执行", installing: "安装中", verifying: "验证中", firing: "告警中", recovering: "恢复确认中", recovered: "已恢复"
   };
   const viewInfo = {
     overview: ["集群概览", "集群概览", "查看玩家承载、区域健康与实例容量。"],
     rooms: ["房间与玩家", "房间与玩家", "追踪活动房间、原席位恢复与历史对局。"],
     workers: ["游戏服实例", "游戏服实例", "按实例查看负载、容量和日志，按需停止接纳新房间。"],
     nodes: ["节点资源", "节点资源", "查看各区域 VPS 的可调度状态与资源使用。"],
+    policy: ["容量与告警", "容量与告警", "区分目标策略与实例有效配置，观察等待时间并配置飞书通知。"],
+    onboarding: ["添加战斗节点", "添加战斗节点", "核验已有 VPS 身份、审阅安装计划，再加入指定的 K3s 集群。"],
     logs: ["日志检索", "日志检索", "查询实时容器或最近 7 天的已采集日志，退出实例仍可检索。"]
   };
-  const DEFAULT_INTERVALS = { overview: 15, rooms: 5, workers: 15, nodes: 30, logs: 0, details: 15 };
+  const DEFAULT_INTERVALS = { overview: 15, rooms: 5, workers: 15, nodes: 30, policy: 15, onboarding: 30, logs: 0, details: 15 };
   const ALLOWED_INTERVALS = new Set([0, 5, 15, 30, 60]);
   function loadIntervals() {
     const values = { ...DEFAULT_INTERVALS };
@@ -33,6 +35,7 @@
     } catch (_) { /* Refresh preferences are optional; sessions never use localStorage. */ }
     return values;
   }
+  function freshResources() { return Object.fromEntries(["policy", "alerts", "onboarding"].map((name) => [name, { data: null, error: null, promise: null, controller: null, observedAt: null }])); }
   const state = {
     session: null, snapshot: null, goodFleet: null, goodFleetAt: null, goodRegions: new Map(),
     view: "overview", snapshotPromise: null, snapshotTargets: new Set(),
@@ -40,7 +43,11 @@
     toastTimer: null, mutationBusy: false, sessionGeneration: 0,
     intervals: loadIntervals(), requestedAt: {}, renderedAt: {}, scroll: {},
     deferred: new Set(), pendingOptions: new Map(), renderArea: null,
-    logDraftDirty: false, pendingLogs: null, snapshotError: null, logObservedAt: null
+    logDraftDirty: false, pendingLogs: null, snapshotError: null, logObservedAt: null,
+    resources: freshResources(), policyDirty: false, policySaving: false, policyConflict: false,
+    alertDirty: false, alertSaving: false, alertConflict: false, confirmScope: null,
+    nodeScan: null, nodePreflight: null, nodeScanTarget: "", nodeBusy: false, nodeAction: "", nodeError: null,
+    currentJob: null, jobBusy: false, jobRequestedAt: 0, pendingEnrollment: null, retirement: freshRetirement()
   };
   const buttonActions = new WeakMap();
 
@@ -219,7 +226,56 @@
     logs_unavailable: "日志源暂时不可用，请稍后重试。", metrics_unavailable: "指标采集暂时不可用。",
     loki_unavailable: "历史日志服务暂时不可用。", region_unavailable: "该地区暂时不可用。",
     timeout: "请求超时，请确认 SSH 隧道保持连接。", request_timeout: "请求超时，请稍后重试。",
-    network_error: "连接失败，请确认 SSH 隧道保持连接。"
+    network_error: "连接失败，请确认 SSH 隧道保持连接。",
+    feature_unavailable: "当前服务版本尚未启用此功能接口；房间、实例和日志查询不受影响。",
+    policy_invalid: "容量策略不合法。房间为 1–512，CPU 为 0.1–64 核，request 与 limit 必须一致。",
+    policy_conflict: "策略已被其他操作更新。草稿已保留，请重新载入最新修订后核对。",
+    alerts_invalid: "告警参数或飞书地址不合法。请检查范围；Webhook 仅支持 open.feishu.cn 的机器人地址。",
+    alerts_conflict: "告警配置已变化。草稿已保留，请重新载入最新修订。",
+    alerts_disabled: "此部署未开放告警配置操作。", alerts_storage_unavailable: "告警配置存储暂不可用，请稍后重试。",
+    alerts_file_changed: "告警私有配置已由其他操作修改，请重新读取后核对。",
+    feishu_not_configured: "启用飞书通知前请配置机器人 Webhook。控制台告警监测无需机器人。",
+    feishu_delivery_failed: "最近一次飞书通知未投递成功，请检查机器人配置和服务端网络。",
+    node_onboarding_disabled: "此部署尚未启用节点接入服务。", onboarding_disabled: "此部署尚未启用节点接入服务。",
+    scan_expired: "主机指纹扫描已过期，请重新扫描并核对。", preflight_expired: "本次预检授权已过期，请重新扫描和认证。",
+    fingerprint_mismatch: "SSH 主机指纹与已核对记录不一致，未继续认证或安装。",
+    ssh_authentication_failed: "SSH 认证失败。密码已清空，请核对 root 登录方式。",
+    ssh_unavailable: "无法建立 SSH 连接，请检查地址、端口与防火墙。",
+    preflight_failed: "主机预检未通过，请核对检查结果。", onboarding_busy: "节点接入服务已有任务执行中，请稍后重试。",
+    node_onboarding_not_configured: "此部署尚未启用节点接入服务。",
+    node_onboarding_unavailable: "地域节点控制器或 Kubernetes API 暂不可用，请稍后重新读取状态。",
+    node_onboarding_access_denied: "地域节点任务被 Kubernetes 权限策略拒绝，请检查控制台受限任务授权。",
+    node_onboarding_request_failed: "地域节点任务请求未完成，请检查任务状态，不要重复提交安装或退役。",
+    onboarding_state_changed: "Kubernetes 任务状态已变化，请重新读取并核对后操作。",
+    invalid_retirement_confirmation: "永久退役确认不完整，请重新核对节点名与 Node 上报 IP。",
+    node_identity_changed: "节点 UID 或资源版本已变化，请重新检查退役条件。",
+    node_onboarding_invalid_response: "节点接入服务返回了无法读取的状态，请检查服务部署。",
+    node_onboarding_failed: "节点接入未完成，请检查服务端状态后再操作。",
+    onboarding_unavailable: "节点接入服务暂不可用，请稍后重试。",
+    literal_ipv4_required: "请输入目标 VPS 的公网 IPv4 地址，当前不支持主机名或 IPv6。",
+    invalid_target_address: "该地址不能用于接入，请填写目标 VPS 的公网 IPv4。",
+    protected_control_host: "该主机是受保护的管理节点，不能作为新战斗节点接入。",
+    unknown_region: "目标地区不存在，请刷新地区列表。",
+    ssh_scan_failed: "SSH 指纹扫描失败，请检查公网 IPv4、端口和防火墙。",
+    ssh_host_identity_unavailable: "未读取到受支持的 SSH 主机指纹，未发送密码。",
+    host_fingerprint_mismatch: "SSH 指纹与已核对记录不一致，未继续认证或安装。",
+    root_user_required: "当前节点接入仅支持 root 用户。",
+    invalid_ssh_password: "SSH 密码格式不正确：最多 1024 字节且不能包含换行。",
+    ssh_operation_failed: "SSH 认证或预检执行失败，请检查 root 登录方式；需重新扫描并认证。",
+    ssh_operation_timeout_check_node: "SSH 操作超时，请先核对主机状态；不要直接重复安装。",
+    ssh_invalid_response: "主机返回的预检结果无法读取，请检查系统环境。",
+    cluster_read_access_unavailable: "节点接入服务无法读取集群状态，请检查受限集群凭据。",
+    cluster_unreachable: "节点接入服务无法连接目标集群，请检查管理节点与私网连接。",
+    too_many_pending_requests: "待处理的节点扫描或预检过多，请稍后重试。",
+    another_node_join_in_progress: "已有节点安装任务执行中，请等待该任务结束。",
+    node_name_already_registered: "这个节点名已在集群中注册，未重复安装。",
+    host_changed_repeat_preflight: "主机状态在预检后发生变化，请重新扫描和预检。",
+    agent_only_join_token_required: "节点接入服务未配置仅限 worker 的入群凭据，请检查部署。",
+    unsafe_node_installer: "节点安装程序未通过完整性检查，未继续安装。",
+    installation_failed_check_host: "节点安装未完成，请检查该 VPS 的安装状态后再处理。",
+    node_ready_timeout_check_cluster: "等待节点 Ready 超时，请检查集群和目标 VPS，避免重复安装。",
+    invalid_job_id: "接入任务标识不正确，请从任务记录重新选择。",
+    job_not_found: "未找到该接入任务，请刷新任务列表。"
   };
   function errorText(error) {
     if (errorMessages[error.code]) return errorMessages[error.code];
@@ -228,9 +284,9 @@
     if (error.status === 429) return "请求过于频繁，请稍后重试。";
     return error.status ? "请求失败（HTTP " + error.status + "），请稍后重试。" : "连接失败，请确认 SSH 隧道保持连接。";
   }
-  async function api(path, { method = "GET", body, signal, allowUnauthorized = false } = {}) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 20000);
+  async function api(path, { method = "GET", body, signal, allowUnauthorized = false, timeoutMs = 20000 } = {}) {
+    const controller = new AbortController(), requestGeneration = state.sessionGeneration;
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
     const onAbort = () => controller.abort();
     if (signal) { if (signal.aborted) controller.abort(); else signal.addEventListener("abort", onAbort, { once: true }); }
     try {
@@ -244,7 +300,7 @@
         const error = new Error("request_failed");
         error.status = response.status;
         error.code = typeof data?.error === "string" ? data.error : typeof data?.error?.code === "string" ? data.error.code : data?.code;
-        if (response.status === 401 && !allowUnauthorized && state.session) showLogin("登录已过期，请重新登录。");
+        if (response.status === 401 && !allowUnauthorized && state.session && requestGeneration === state.sessionGeneration) showLogin("登录已过期，请重新登录。");
         throw error;
       }
       return data;
@@ -269,7 +325,13 @@
     state.snapshotError = null; state.pendingLogs = null; state.logDraftDirty = false;
     $("app").hidden = true; $("login-view").hidden = false; setText($("login-state"), message);
     setText($("log-output"), "尚未查询日志。"); $("password").value = "";
-    for (const id of ["detail-dialog", "confirm-dialog"]) if ($(id).open) $(id).close("cancel");
+    for (const id of ["detail-dialog", "confirm-dialog", "node-retire-dialog"]) if ($(id).open) $(id).close("cancel");
+    for (const entry of Object.values(state.resources)) entry.controller?.abort();
+    state.resources = freshResources(); state.policyDirty = false; state.alertDirty = false; state.policySaving = false; state.alertSaving = false;
+    state.policyConflict = false; state.alertConflict = false; state.policyBaseRevision = undefined; state.alertBaseRevision = undefined;
+    state.nodeBusy = false; state.nodeAction = ""; state.nodeError = null; state.currentJob = null; state.pendingEnrollment = null; state.jobBusy = false; state.retirement = freshRetirement();
+    for (const id of ["policy-form", "alert-form", "node-scan-form", "node-preflight-form"]) $(id).reset();
+    clearFeishuInputs(); clearNodeAuthorization();
     state.detail = null; renderManagementAccess();
   }
   function showSession(session) {
@@ -309,8 +371,9 @@
     renderCurrentView();
     if (changed) { const position = state.scroll[view] || [0, 0]; window.scrollTo(position[0], position[1]); }
     if (state.session) {
-      if (!state.snapshot) requestSnapshot([view]);
-      else if (view !== "logs" && !state.renderedAt[view]) requestSnapshot([view]);
+      if (view === "policy") refreshPolicy();
+      else if (view === "onboarding") refreshOnboarding();
+      else if (!state.snapshot || view !== "logs" && !state.renderedAt[view]) requestSnapshot([view]);
     }
   }
   const fleet = () => state.snapshot?.fleet;
@@ -325,6 +388,19 @@
     return list(region?.pods).find((item) => item.name === worker.pod || item.worker_id === worker.id);
   }
   const canDrainWorker = (worker) => canManage() && !!worker && !worker.draining && ["ready", "suspect"].includes(worker.state);
+  function nodeRole(role) { return role === "control" ? "管理节点" : role === "game" ? "战斗节点" : role ? String(role) : "未标注"; }
+  const nodeKey = (item) => item.region + "/" + item.name;
+  const allNodes = () => regions().flatMap((region) => list(region.nodes).map((item) => ({ ...item, region: region.name, stale: region.stale === true || region.ok !== true })));
+  const nodeIPs = (item, key) => list(item?.[key]).filter((value) => typeof value === "string" && value);
+  function nodeReadyStatus(item) { return ["True", "False", "Unknown"].includes(item?.ready_status) ? item.ready_status : item?.ready === true ? "True" : "Unknown"; }
+  function nodeReadyLabel(item) { return ({ True: "已就绪", False: "未就绪", Unknown: "状态未知" })[nodeReadyStatus(item)]; }
+  function nodePublicIP(item) {
+    const values = nodeIPs(item, "external_ips");
+    return values.length ? { label: "公网 IP · ExternalIP", value: values.join("、"), note: "Node.status.addresses" } : item.operator_public_ip ? { label: "公网 IP（管理备注）", value: item.operator_public_ip, note: "人工显示备注，不是节点网络配置" } : { label: "公网 IP · ExternalIP", value: "未上报", note: "不从节点名称推断" };
+  }
+  function nodePrivateIP(item) { return nodeIPs(item, "internal_ips").join("、") || "未上报"; }
+  function nodeMatches(item, query) { return !query || [item.name, item.role, nodeRole(item.role), ...nodeIPs(item, "external_ips"), ...nodeIPs(item, "internal_ips"), item.operator_public_ip].some((value) => String(value || "").toLowerCase().includes(query)); }
+
   function workerStatus(worker) { return worker.draining && !WORKER_TERMINAL.has(worker.state) ? "draining" : worker.state; }
   function identifierButton(value, callback) {
     const item = button(shortID(value), callback, "id-button identifier"); item.title = text(value); return item;
@@ -348,11 +424,13 @@
       if (view === "overview") renderOverview();
       else if (view === "rooms") renderRooms();
       else if (view === "workers") renderWorkers();
-      else if (view === "nodes") renderNodes();
+      else if (view === "nodes") { renderNodes(); renderRetirementJob(); }
+      else if (view === "policy") renderPolicy();
+      else if (view === "onboarding") renderOnboarding();
     });
     state.renderArea = null;
-    if (view !== "logs" && state.snapshot && !state.deferred.has(view)) state.renderedAt[view] = state.snapshot.observed_at;
-    renderStatus();
+    if (!["logs", "policy", "onboarding"].includes(view) && state.snapshot && !state.deferred.has(view)) state.renderedAt[view] = state.snapshot.observed_at;
+    renderStatus(); renderRetirementConfirmation();
   }
   async function requestSnapshot(targets = [state.view]) {
     if (!state.session) return;
@@ -384,16 +462,17 @@
   }
   function renderStatus() {
     const view = state.view;
-    $("connection-banner").hidden = !state.snapshotError;
-    if (state.snapshotError) setText($("connection-banner"), errorText(state.snapshotError) + (state.goodFleet || state.goodRegions.size ? " 已保留上次成功数据，请勿视为最新状态。" : " 尚未取得运行数据。"));
+    const usesSnapshot = view !== "onboarding";
+    $("connection-banner").hidden = !state.snapshotError || !usesSnapshot;
+    if (state.snapshotError && usesSnapshot) setText($("connection-banner"), errorText(state.snapshotError) + (state.goodFleet || state.goodRegions.size ? " 已保留上次成功数据，请勿视为最新状态。" : " 尚未取得运行数据。"));
     const problems = [];
-    if (["overview", "rooms", "workers"].includes(view) && fleet()?.ok === false) problems.push("Fleet 状态：" + errorText({ code: fleet().error }) + (state.goodFleet ? " 当前显示 " + time(state.goodFleetAt) + " 的成功记录。" : " 尚无可用记录，未将错误显示为零。"));
-    if (["overview", "workers", "nodes"].includes(view)) for (const region of regions()) {
+    if (["overview", "rooms", "workers", "policy"].includes(view) && fleet()?.ok === false) problems.push("Fleet 状态：" + errorText({ code: fleet().error }) + (state.goodFleet ? " 当前显示 " + time(state.goodFleetAt) + " 的成功记录。" : " 尚无可用记录，未将错误显示为零。"));
+    if (["overview", "workers", "nodes", "policy"].includes(view)) for (const region of regions()) {
       if (!region.ok) problems.push(text(region.name) + "：" + errorText({ code: region.error }) + (region.stale ? " 节点 / Pod 保留上次成功记录。" : ""));
       else if (!region.metrics_ok) problems.push(text(region.name) + "：资源指标暂不可用；状态数据仍可查看，缺失数值显示为 —。");
     }
     $("source-banner").hidden = problems.length === 0; setText($("source-banner"), problems.slice(0, 3).join(" "));
-    const stale = !!state.snapshotError || problems.length > 0;
+    const stale = !!state.snapshotError && usesSnapshot || problems.length > 0 || view === "policy" && (!!resource("policy").error || !!resource("alerts").error) || view === "onboarding" && (!!resource("onboarding").error || !!state.nodeError);
     $("refresh-indicator").className = "status-dot" + (stale ? " stale" : "");
     const at = view === "logs" ? state.logObservedAt : state.renderedAt[view];
     setText($("snapshot-time"), at ? "显示于 " + time(at, true) + (stale && view !== "logs" ? " · 含过时 / 缺失数据" : "") : "尚未取得本页数据");
@@ -408,7 +487,7 @@
     setText($("read-only-banner"), managementError ? "实例管理暂不可用：" + errorText({ code: managementError }) + " 房间、玩家与日志仍可查看。" : fleet()?.ok === false || state.snapshotError ? "Fleet 最新状态不可用，管理入口暂时关闭。页面保留上次成功记录，仍可查询日志；此问题不代表控制台登录失效。" : "只读观测：可以查看房间、玩家、资源指标与日志。此部署尚未启用实例排空或创建重试；不影响匹配与对局。");
     $("retry-creation-button").hidden = !enabled;
     setText($("worker-management-note"), "CPU 按实例统计，无法单独测量每个房间。" + (enabled ? "排空仅停止接纳新房间，现有对局正常结束后退出；不支持强退单个房间。" : "当前可查看实例状态与日志，实例管理尚不可用。"));
-    if (!enabled && $("confirm-dialog").open) $("confirm-dialog").close("cancel");
+    if (!enabled && state.confirmScope === "fleet" && $("confirm-dialog").open) $("confirm-dialog").close("cancel");
     // Capability changes apply immediately, including a hidden page's old buttons.
     for (const item of document.querySelectorAll("[data-management-action]")) item.hidden = !enabled;
   }
@@ -429,6 +508,20 @@
       metric("运行实例", ok ? live.length : undefined, "个", "已就绪 " + (ok ? count(live.filter((worker) => worker.ready && !worker.draining).length) : "—") + " · 上限 " + count(fleet()?.max_processes)),
       metric("实例已占用房间", ok ? sum(live, "occupied_rooms") : undefined, "/ " + (ok ? count(sum(live, "max_rooms")) : "—"), "占用包含已预留房间，受心跳刷新影响")
     ]);
+    const sources = regions(), observed = sources.filter((region) => region.ok || region.stale);
+    const complete = sources.length > 0 && observed.length === sources.length;
+    const visibleNodes = observed.flatMap((region) => list(region.nodes));
+    const visiblePods = observed.flatMap((region) => list(region.pods));
+    const namespaces = [...new Set(visiblePods.map((pod) => pod.namespace).filter(Boolean))].sort();
+    const topology = [
+      ["已注册节点", complete ? visibleNodes.length : undefined, "台 VPS", "管理节点 " + count(visibleNodes.filter((item) => item.role === "control").length) + " · 战斗节点 " + count(visibleNodes.filter((item) => item.role === "game").length) + "；角色按已读取标签统计。"],
+      ["可见 Pod", complete ? visiblePods.length : undefined, "个", namespaces.length ? "本次可见命名空间：" + namespaces.join("、") : "等待观察范围内的 Pod 数据。"],
+      ["游戏服实例", ok ? live.length : undefined, "个进程", "Fleet 管理的非终态实例；一个实例可承载多个对局房间。"]
+    ];
+    patchRegion($("topology-overview"), topology.map(([title, value, unit, note]) => {
+      const item = keyed(node("article", "topology-card"), title), amount = node("div", "topology-value", count(value));
+      amount.append(node("span", "", unit)); item.append(node("h3", "", title), amount, node("p", "", note)); return item;
+    }));
     const blocked = typeof fleet()?.creation_blocked_reason === "string" && fleet().creation_blocked_reason !== "";
     $("creation-banner").hidden = !blocked; setText($("creation-reason"), blocked ? fleet().creation_blocked_reason : "");
     const regionList = $("region-overview");
@@ -445,7 +538,7 @@
     for (const region of regions()) {
       if (!region.ok) notes.push(healthItem(region.name + "：集群读取失败", errorText({code:region.error}), "failed"));
       else if (!region.metrics_ok) notes.push(healthItem(region.name + "：资源指标未就绪", "节点与 Pod 可见，CPU / 内存采集暂时不可用。", "stale"));
-      else notes.push(healthItem(region.name + "：资源指标可用", "节点 " + count(list(region.nodes).length) + " 个，Pod " + count(list(region.pods).length) + " 个。"));
+      else notes.push(healthItem(region.name + "：资源指标可用", "已注册节点 " + count(list(region.nodes).length) + " 个；观察范围内 Pod " + count(list(region.pods).length) + " 个（非全群总数）。"));
       const warningEvents = list(region.events).filter((event) => event.type === "Warning").slice(0, 3);
       for (const event of warningEvents) notes.push(healthItem(text(event.reason) + " · " + text(event.object_name), text(event.message) + " · " + time(event.time), "stale"));
     }
@@ -460,9 +553,9 @@
     title.title = text(worker.id); top.append(title, badge(workerStatus(worker)));
     card.append(top, node("p", "worker-card-region", text(worker.region) + " · " + text(pod?.node)));
     const details = node("dl", "worker-card-metrics");
-    for (const [label, value] of [["房间 / 容量", count(worker.occupied_rooms) + " / " + count(worker.max_rooms)], ["CPU", cpu(pod?.cpu_millicores)], ["帧间隔 P99", ms(metrics.frame_p99_ms)]]) { const pair = node("div"); pair.append(node("dt", "", label), node("dd", "", value)); details.append(pair); }
+    for (const [label, value] of [["房间 / 容量", count(worker.occupied_rooms) + " / " + count(worker.max_rooms)], ["Pod CPU", cpu(pod?.cpu_millicores)], ["Pod 内存", bytes(pod?.memory_bytes)], ["帧间隔 P99", ms(metrics.frame_p99_ms)]]) { const pair = node("div"); pair.append(node("dt", "", label), node("dd", "", value)); details.append(pair); }
     const actions = node("div", "worker-card-actions"); actions.append(button("查看实例", () => openDetail("worker", worker.id)), button("运行日志", () => openLogs(worker), "button small quiet"));
-    card.append(details, actions); return card;
+    card.append(details, node("p", "worker-card-footnote", "CPU / 内存为 Pod 内容器合计，含 sidecar。"), actions); return card;
   }
   function renderRooms() {
     const query = $("room-search").value.trim().toLowerCase(), region = $("room-region").value, status = $("room-state").value, scope = $("room-scope").value;
@@ -487,16 +580,477 @@
   }
   function renderNodes() {
     const query = $("node-search").value.trim().toLowerCase(), filterRegion = $("node-region").value, status = $("node-state").value;
-    const nodes = regions().flatMap((region) => list(region.nodes).map((item) => ({ ...item, region: region.name, stale: region.stale })));
-    const filtered = nodes.filter((item) => (!filterRegion || item.region === filterRegion) && (!query || [item.name, item.role].some((value) => String(value || "").toLowerCase().includes(query))) && (!status || (status === "unready" ? !item.ready : status === "unschedulable" ? item.ready && item.unschedulable : item.ready && !item.unschedulable)));
+    const nodes = allNodes();
+    const filtered = nodes.filter((item) => (!filterRegion || item.region === filterRegion) && nodeMatches(item, query) && (!status || (status === "unready" ? nodeReadyStatus(item) === "False" : status === "unknown" ? nodeReadyStatus(item) === "Unknown" : status === "unschedulable" ? item.ready && item.unschedulable : item.ready && !item.unschedulable)));
     setText($("node-count"), regions().some((region) => region.ok || region.stale) ? count(filtered.length) + " 个" : "尚无可用数据");
-    table($("nodes-table"), ["节点 / 地区", "调度状态", "角色", "CPU 使用 / 可分配", "内存使用 / 可分配", "快照中的 Pod"], filtered.map((item) => {
-      const region = regions().find((region) => region.name === item.region);
-      const status = item.ready !== true ? badge("未就绪", "danger") : item.unschedulable ? badge("已暂停调度", "warning") : badge("可调度", "good");
+    table($("nodes-table"), ["节点 / 地区", "Ready / 调度", "公网 IP", "内网 IP", "角色", "CPU 使用 / 可分配", "内存使用 / 可分配", "可见 Pod", "操作"], filtered.map((item) => {
+      const region = regions().find((region) => region.name === item.region), address = nodePublicIP(item);
+      const statusCell = cell(badge(nodeReadyLabel(item), nodeReadyStatus(item) === "True" ? "good" : nodeReadyStatus(item) === "False" ? "danger" : "warning"), item.unschedulable ? "已暂停调度" : nodeReadyStatus(item) === "True" ? "可调度" : "不据此推断 VPS 已关机 / 到期");
       const podCount = region ? list(region.pods).filter((pod) => pod.node === item.name).length : undefined;
-      return { key: item.region + "/" + item.name, cells: [cell(text(item.name), text(item.region) + (item.stale ? " · 上次记录" : "")), status, text(item.role), cell(cpu(item.cpu_millicores), "可分配 " + cpu(item.cpu_allocatable_millicores)), cell(bytes(item.memory_bytes), "可分配 " + bytes(item.memory_allocatable_bytes)), count(podCount)] };
+      return { key: nodeKey(item), cells: [cell(identifierButton(item.name, () => openDetail("node", nodeKey(item))), text(item.region) + (item.stale ? " · 上次记录" : "")), statusCell, cell(node("span", "identifier", address.value), address.label.includes("管理备注") ? "管理备注" : "ExternalIP"), node("span", "identifier", nodePrivateIP(item)), cell(nodeRole(item.role), item.role ? "标签：" + item.role : "尚无角色标签"), cell(cpu(item.cpu_millicores), "可分配 " + cpu(item.cpu_allocatable_millicores)), cell(bytes(item.memory_bytes), "可分配 " + bytes(item.memory_allocatable_bytes)), count(podCount), button("节点详情", () => openDetail("node", nodeKey(item)), "button small quiet")] };
     }), "暂无符合筛选的节点记录；集群读取失败时会保留上次成功快照。");
+    const nodeIDs = new Set(filtered.map(nodeKey));
+    const visiblePods = regions().flatMap((region) => list(region.pods).map((pod) => ({ ...pod, region: region.name, stale: region.stale }))).filter((pod) => (!filterRegion || pod.region === filterRegion) && (!status || nodeIDs.has(pod.region + "/" + pod.node)) && (!query || nodeIDs.has(pod.region + "/" + pod.node) || [pod.name, pod.node, pod.namespace].some((value) => String(value || "").toLowerCase().includes(query))));
+    setText($("pod-count"), regions().some((region) => region.ok || region.stale) ? count(visiblePods.length) + " 个 · 当前观察范围" : "尚无可用数据");
+    table($("pods-table"), ["Pod / 命名空间", "节点", "状态", "关联游戏服", "容器", "Pod CPU / 内存"], visiblePods.map((pod) => {
+      const worker = workers().find((item) => item.id === pod.worker_id || item.pod === pod.name && item.region === pod.region), host = nodes.find((item) => item.region === pod.region && item.name === pod.node);
+      return { key: pod.region + "/" + pod.namespace + "/" + pod.name, cells: [cell(text(pod.name), text(pod.namespace) + (pod.stale ? " · 上次记录" : "")), cell(host ? identifierButton(host.name, () => openDetail("node", nodeKey(host))) : text(pod.node), pod.region), badge(pod.phase), worker ? identifierButton(worker.id, () => openDetail("worker", worker.id)) : cell("未关联 Fleet 实例", pod.worker_id ? "快照暂无对应实例" : "不按 Pod 名推断用途"), list(pod.containers).join("、") || "—", cell(cpu(pod.cpu_millicores), bytes(pod.memory_bytes))] };
+    }), "当前观察范围没有符合筛选的 Pod；这不代表整个集群没有 Pod。");
   }
+  function freshRetirement() { return { key: "", check: null, error: null, busy: false, job: null, jobBusy: false, requestedAt: 0, confirmation: null }; }
+  function retirementCandidate(host) {
+    if (!host) return "当前快照没有这个节点记录。";
+    if (state.snapshotError || host.stale) return "节点状态暂不可确认，请先恢复集群读取。";
+    if (host.role === "control" || host.game_node !== true) return "管理节点与未标注为受管战斗节点的记录不能从此入口移除。";
+    if (nodeReadyStatus(host) === "True") return "节点仍为 Ready=True，不能移除。";
+    return "";
+  }
+  function retirementReason(code) {
+    return ({ node_identity_unavailable: "未能取得完整 Node 身份，不允许移除。", node_not_owned_worker: "该节点不是此系统管理的战斗节点。", node_still_ready: "节点仍为 Ready=True，不允许移除。", node_readiness_unknown: "缺少可确认的 Ready 条件，不能据此判断永久离线。", node_has_pods: "节点仍有关联的非允许 Pod，不能移除。", node_inventory_incomplete: "节点工作负载清单不完整，不能安全移除。", fleet_snapshot_required: "需要可用的 Fleet 快照来检查实例与对局。", fleet_snapshot_invalid: "Fleet 快照无效，无法确认实例与对局已结束。", node_has_processing_worker: "节点仍有关联处理中的游戏服进程。", worker_location_unavailable: "无法确认游戏服实例的所在节点，禁止移除。", node_has_active_allocations: "节点仍有关联活动分配或对局，不能移除。", node_ready: "节点仍处于 Ready=True。", node_not_offline: "服务端尚未确认节点离线。", control_node_protected: "管理节点受保护，不能移除。", protected_control_node: "管理节点受保护，不能移除。", game_node_required: "该记录不是受管战斗节点。", node_has_workloads: "节点仍有关联工作负载，不能移除。", node_has_gameservers: "节点仍有关联游戏服，不能移除。", node_identity_changed: "节点身份或资源版本已变化，需重新检查。", node_retirement_disabled: "此部署未开放离线节点移除能力。", node_onboarding_disabled: "此部署未开放离线节点移除能力。", node_retirement_not_configured: "此部署未配置离线节点移除控制器。", node_not_found: "节点记录已不存在，请刷新列表。" })[code] || "服务端尚未允许移除，请核对节点状态和阻断项。";
+  }
+  function retirementIdentityIPs(identity) { return [...nodeIPs(identity, "external_ips"), ...nodeIPs(identity, "internal_ips")]; }
+  function retirementEligible(host) {
+    const item = state.retirement, value = item.check;
+    return !retirementCandidate(host) && !retirementJobRunning(item.job) && item.key === nodeKey(host) && !item.error && value?.enabled === true && value.eligible === true && value.identity?.name === host.name && typeof value.identity.uid === "string" && value.identity.uid !== "" && typeof value.identity.resource_version === "string" && value.identity.resource_version !== "" && retirementIdentityIPs(value.identity).length > 0;
+  }
+  function retirementControl(host) {
+    const section = keyed(node("section", "node-retirement-section"), "node-retirement"), actions = node("div", "detail-actions"), item = state.retirement;
+    section.append(node("h3", "detail-section", "永久失效节点的退役移除"), node("p", "table-note", "只移除 Kubernetes Node 注册记录，不调用腾讯云关机或销毁 API。普通离线不能证明永久失效；已有游戏服和非允许的工作负载会阻止移除。"));
+    const localReason = retirementCandidate(host), check = item.key === nodeKey(host) ? item.check : null;
+    const checkButton = button(item.busy && item.key === nodeKey(host) ? "正在检查…" : "检查退役条件", () => loadRetirement(host));
+    checkButton.disabled = !!localReason || item.busy || retirementJobRunning(item.job); actions.append(checkButton);
+    let message = localReason || (retirementJobRunning(item.job) ? "已有退役任务执行中，不能重复提交。" : !check ? "尚未读取服务端退役条件；没有移除授权。" : !check.enabled ? "此部署未开放离线节点移除能力。" : check.eligible ? "服务端初步检查允许移除；仍需确认该 VPS 已永久退役并输入节点名、IP。提交时会再次检查。" : retirementReason(check.reason));
+    if (item.key === nodeKey(host) && item.error) message = errorText(item.error);
+    section.append(node("p", "inline-note", message));
+    if (retirementEligible(host)) actions.append(button("移除已退役 Node 记录", () => openRetirement(host), "button danger"));
+    section.append(actions);
+    if (check?.blockers?.length) section.append(retirementItems(check.blockers, "阻断项"));
+    return section;
+  }
+  function retirementItems(items, title) {
+    const section = node("div"); section.append(node("h3", "detail-section", title));
+    const wrapper = node("div", "table-wrap");
+    table(wrapper, ["类型", "命名空间 / 名称", "说明"], list(items).map((item, index) => ({ key: text(item.kind) + "/" + text(item.namespace) + "/" + text(item.name) + "/" + index, cells: [text(item.kind), cell(text(item.name), item.namespace), text(item.reason)] })), "无已报告项目。");
+    section.append(wrapper); return section;
+  }
+  async function loadRetirement(host, { render = true } = {}) {
+    if (!state.session || retirementCandidate(host) || state.retirement.busy) return null;
+    const item = state.retirement, generation = state.sessionGeneration, key = nodeKey(host);
+    item.key = key; item.busy = true; item.error = null;
+    if (render && state.detail?.kind === "node") renderDetail();
+    try {
+      const value = await api("node-retirement?" + new URLSearchParams({ region: host.region, node: host.name }));
+      if (!state.session || generation !== state.sessionGeneration) return null;
+      if (!value || typeof value.enabled !== "boolean" || value.enabled && typeof value.eligible !== "boolean") { const error = new Error("invalid_retirement"); error.code = "upstream_invalid_response"; throw error; }
+      item.check = value; return value;
+    } catch (error) { if (generation === state.sessionGeneration && state.session) { item.check = null; item.error = error; } return null; }
+    finally { if (generation === state.sessionGeneration) { item.busy = false; if (render && state.detail?.kind === "node") renderDetail(); } }
+  }
+  function openRetirement(host) {
+    if (!retirementEligible(host) || state.retirement.busy) return;
+    state.retirement.confirmation = { key: nodeKey(host), host: { name: host.name, region: host.region }, identity: state.retirement.check.identity };
+    $("node-retire-form").reset();
+    setText($("node-retire-target"), "地区 " + host.region + " · 节点 " + host.name + "\n可用于确认的 Node 上报 IP：" + retirementIdentityIPs(state.retirement.check.identity).join("、"));
+    setText($("node-retire-error"), ""); $("node-retire-error").hidden = true;
+    $("node-retire-dialog").showModal(); renderRetirementConfirmation();
+  }
+  function renderRetirementConfirmation() {
+    if (!$("node-retire-dialog").open) return;
+    const confirmation = state.retirement.confirmation, host = allNodes().find((item) => nodeKey(item) === confirmation?.key), identity = confirmation?.identity;
+    const allowed = !!host && retirementEligible(host) && !state.retirement.busy && identity && $("node-retire-name").value === identity.name && retirementIdentityIPs(identity).includes($("node-retire-ip").value.trim()) && $("node-retire-permanent").checked;
+    $("node-retire-submit").disabled = !allowed;
+    $("node-retire-cancel").disabled = state.retirement.busy;
+    setText($("node-retire-submit"), state.retirement.busy ? "正在复查并提交…" : "仅移除 Node 注册记录");
+  }
+  async function submitRetirement(event) {
+    event.preventDefault();
+    const current = state.retirement.confirmation, item = state.retirement;
+    if (!current || item.busy || !$("node-retire-form").reportValidity()) return;
+    const host = allNodes().find((value) => nodeKey(value) === current.key), confirmedName = $("node-retire-name").value, confirmedIP = $("node-retire-ip").value.trim();
+    if (!host || !retirementEligible(host) || confirmedName !== current.identity.name || !retirementIdentityIPs(current.identity).includes(confirmedIP) || !$("node-retire-permanent").checked) return;
+    const generation = state.sessionGeneration;
+    $("node-retire-submit").disabled = true; $("node-retire-error").hidden = true;
+    const checked = await loadRetirement(host, { render: false });
+    if (!state.session || generation !== state.sessionGeneration || item.confirmation !== current) return;
+    if (!checked || !retirementEligible(allNodes().find((value) => nodeKey(value) === current.key))) {
+      setText($("node-retire-error"), item.error ? errorText(item.error) : retirementReason(checked?.reason)); $("node-retire-error").hidden = false; renderRetirementConfirmation(); return;
+    }
+    const identity = checked.identity;
+    if (identity.uid !== current.identity.uid || identity.resource_version !== current.identity.resource_version || identity.name !== confirmedName || !retirementIdentityIPs(identity).includes(confirmedIP)) {
+      item.confirmation = { ...current, identity }; $("node-retire-form").reset();
+      setText($("node-retire-target"), "地区 " + host.region + " · 节点 " + identity.name + "\n可用于确认的 Node 上报 IP：" + retirementIdentityIPs(identity).join("、"));
+      setText($("node-retire-error"), "节点身份、地址或资源版本已经变化，请重新核对并输入确认。未提交删除。"); $("node-retire-error").hidden = false; renderRetirementConfirmation(); return;
+    }
+    item.busy = true; renderRetirementConfirmation();
+    try {
+      const job = await api("node-retirement", { method: "POST", body: { region: host.region, node_name: identity.name, node_uid: identity.uid, resource_version: identity.resource_version, confirmed_node_name: confirmedName, confirmed_ip: confirmedIP, permanent_retirement: true } });
+      if (!state.session || generation !== state.sessionGeneration) return;
+      if (!job || typeof job.id !== "string" || !/^[a-f0-9]{32}$/.test(job.id) || typeof job.state !== "string") { const error = new Error("invalid_retirement_job"); error.code = "upstream_invalid_response"; throw error; }
+      item.job = { region: host.region, node_name: identity.name, ...job }; item.requestedAt = 0; item.check = null;
+      $("node-retire-dialog").close();
+      if ($("detail-dialog").open) $("detail-dialog").close();
+      setView("nodes"); renderRetirementJob();
+      $("node-retirement-panel").scrollIntoView({ block: "nearest" });
+      toast("退役移除任务已提交，尚未确认删除；请查看任务结果。");
+      requestSnapshot(["nodes"]);
+    } catch (error) { if (generation === state.sessionGeneration && state.session) { setText($("node-retire-error"), errorText(error) + " 不会自动重试删除。"); $("node-retire-error").hidden = false; } }
+    finally { if (generation === state.sessionGeneration) { item.busy = false; renderRetirementConfirmation(); } }
+  }
+  function retirementJobRunning(job) { return ["queued", "checking", "cordoned"].includes(job?.state); }
+  function renderRetirementJob() {
+    const job = state.retirement.job; $("node-retirement-panel").hidden = !job;
+    if (!job) return;
+    const stateLabel = ({ queued: "等待执行", checking: "复查中", cordoned: "待继续处理", deleted: "Node 记录已移除", blocked: "已阻止移除", needs_review: "需人工复核" })[job.state] || text(job.state);
+    const body = [detailGrid([["任务 ID", job.id], ["地区 / 节点", text(job.region) + " / " + text(job.node_name)], ["状态", stateLabel], ["最近更新", time(job.updated_at)]])];
+    body.push(node("p", "table-note", job.state === "deleted" ? "仅 Kubernetes Node 注册记录已移除。腾讯云 VPS 未被此操作关闭、销毁或释放。" : retirementJobRunning(job) ? "地域 controller 正在复查并执行受限任务，每 5 秒读取结果；不会自动提交第二次删除。" : "任务未确认完成删除。请查看阻断项并人工核对，普通离线不等于永久失效。"));
+    if (state.retirement.error) body.push(node("p", "form-error", errorText(state.retirement.error) + " 当前任务结果尚未确认；继续读取状态，不会重新提交删除。"));
+    if (job.reason || job.error) body.push(node("p", "inline-note", retirementReason(job.reason || job.error)));
+    if (list(job.blockers).length) body.push(retirementItems(job.blockers, "阻断项"));
+    if (list(job.allowed_system_pods).length) body.push(retirementItems(job.allowed_system_pods, "控制器允许的系统 DaemonSet Pod"));
+    patchRegion($("node-retirement-result"), body);
+  }
+  async function fetchRetirementJob() {
+    const item = state.retirement, job = item.job;
+    if (!state.session || !retirementJobRunning(job) || item.jobBusy) return;
+    item.jobBusy = true; item.requestedAt = Date.now(); const generation = state.sessionGeneration;
+    try {
+      const value = await api("node-retirement/jobs?" + new URLSearchParams({ id: job.id }));
+      if (!state.session || generation !== state.sessionGeneration || item.job?.id !== job.id) return;
+      if (!value || value.id !== job.id || typeof value.state !== "string") { const error = new Error("invalid_retirement_job"); error.code = "upstream_invalid_response"; throw error; }
+      item.job = { ...job, ...value }; item.error = null;
+      if (value.state === "deleted") requestSnapshot(["nodes", ...(state.detail ? ["details"] : [])]);
+    } catch (error) { if (generation === state.sessionGeneration && state.session) { item.error = error; } }
+    finally { if (generation === state.sessionGeneration) { item.jobBusy = false; if (state.session && state.view === "nodes") renderRetirementJob(); } }
+  }
+
+  function resource(name) { return state.resources[name]; }
+  function featureData(name) { return resource(name).data; }
+  function featureAvailable(name, capability) { const item = resource(name); return !!state.session && !item.error && item.data?.[capability] === true; }
+  function setDisabled(ids, disabled) { for (const id of ids) $(id).disabled = disabled; }
+  function cpuBudget(value) { return number(value) ? decimal(value / 1000, 3) + " 核" : "—"; }
+  function cpuLimit(value) { return value === 0 ? "未设置上限" : cpuBudget(value); }
+  function expired(value) {
+    const until = typeof value === "number" ? value * 1000 : Date.parse(value);
+    return !Number.isFinite(until) || Date.now() >= until;
+  }
+  function errorBanner(id, error) { $(id).hidden = !error; if (error) setText($(id), errorText(error) + " 已有记录保留，修改不会自动重试。"); }
+  async function loadFeature(name, path, { fresh = false } = {}) {
+    if (!state.session) return;
+    const entry = resource(name);
+    if (entry.promise && !fresh) return entry.promise;
+    if (fresh) entry.controller?.abort();
+    const generation = state.sessionGeneration, controller = new AbortController();
+    entry.controller = controller;
+    const task = (async () => {
+      try {
+        const data = await api(path, { signal: controller.signal });
+        if (!state.session || generation !== state.sessionGeneration || controller.signal.aborted) return;
+        if (!data || typeof data !== "object" || (name === "policy" && (!data.desired || data.revision === undefined)) || (name === "alerts" && (!data.config || data.revision === undefined)) || (name === "onboarding" && typeof data.enabled !== "boolean")) {
+          const failure = new Error("invalid_feature_response"); failure.code = "upstream_invalid_response"; throw failure;
+        }
+        entry.data = data; entry.error = null; entry.observedAt = data.observed_at || new Date().toISOString();
+        state.renderedAt[name === "onboarding" ? "onboarding" : "policy"] = entry.observedAt;
+        if (name === "onboarding" && state.currentJob) {
+          const updated = list(data.jobs).find((job) => job.id === state.currentJob.id);
+          if (updated) state.currentJob = { ...state.currentJob, ...updated };
+        }
+      } catch (error) {
+        if (state.session && generation === state.sessionGeneration && !controller.signal.aborted) {
+          if (error.status === 404) error.code = "feature_unavailable";
+          entry.error = error;
+        }
+      } finally {
+        if (entry.controller === controller) { entry.promise = null; entry.controller = null; }
+        if (state.session && generation === state.sessionGeneration && ["policy", "onboarding"].includes(state.view)) renderCurrentView();
+      }
+    })();
+    entry.promise = task;
+    return task;
+  }
+  function refreshPolicy() {
+    state.requestedAt.policy = Date.now();
+    return Promise.all([loadFeature("policy", "v1/policy"), loadFeature("alerts", "v1/alerts"), requestSnapshot(["policy"])]);
+  }
+  function refreshOnboarding() { state.requestedAt.onboarding = Date.now(); return loadFeature("onboarding", "node-onboarding"); }
+  function hydratePolicy(force = false) {
+    const value = featureData("policy"), form = $("policy-form");
+    if (!value || state.policySaving || (!force && (state.policyDirty || form.contains(document.activeElement)))) return;
+    const desired = value.desired || {};
+    $("policy-rooms").value = number(desired.rooms_per_instance) ? String(desired.rooms_per_instance) : "";
+    $("policy-cpu").value = number(desired.cpu_request_millicores) && desired.cpu_request_millicores === desired.cpu_limit_millicores ? String(desired.cpu_request_millicores / 1000) : "";
+    state.policyBaseRevision = value.revision; state.policyDirty = false; state.policyConflict = false;
+  }
+  function hydrateAlerts(force = false) {
+    const value = featureData("alerts"), form = $("alert-form");
+    if (!value || state.alertSaving || (!force && (state.alertDirty || form.contains(document.activeElement)))) return;
+    const config = value.config || {};
+    $("alerts-enabled").checked = config.enabled === true;
+    $("feishu-enabled").checked = config.feishu_enabled === true;
+    for (const [id, key] of [["alert-wait", "wait_p95_ms"], ["alert-frame", "frame_p99_ms"], ["alert-hold", "hold_seconds"], ["alert-cooldown", "cooldown_seconds"], ["alert-samples", "min_samples"]]) $(id).value = number(config[key]) ? String(config[key]) : "";
+    // Secret fields are write-only. A response can never populate these inputs.
+    state.alertBaseRevision = value.revision; state.alertDirty = false; state.alertConflict = false;
+  }
+  function sampleCell(window) {
+    if (!window) return cell("—", "尚无客户端上报");
+    const available = number(window.count) && window.count > 0;
+    return cell(available ? ms(window.p95) : "—", count(window.count) + " 样本 · " + count(window.window_seconds) + " 秒窗口 · " + (number(window.last_sample_age_seconds) ? "最新样本 " + seconds(window.last_sample_age_seconds) + "前" : "暂无新样本"));
+  }
+  function alertKind(kind) { return ({ client_wait_high: "停球后等待 p95", client_settlement_wait_high: "停球后结算等待 p95", frame_p99_high: "帧间隔 p99", physical_capacity_shortage: "节点物理容量不足" })[kind] || text(kind); }
+  function alertValue(item, key) { return item.kind === "physical_capacity_shortage" ? count(item[key]) + " 个 Pending Pod" : ms(item[key]); }
+  function renderPolicy() {
+    const policy = featureData("policy"), alerts = featureData("alerts");
+    errorBanner("policy-error", resource("policy").error); errorBanner("alerts-error", resource("alerts").error);
+    hydratePolicy(); hydrateAlerts();
+    const manage = featureAvailable("policy", "can_manage"), configure = featureAvailable("alerts", "can_configure");
+    const desired = policy?.desired || {};
+    setText($("policy-revision"), policy ? "目标修订 " + text(policy.revision) : "尚未取得策略");
+    if (policy) patchRegion($("policy-summary"), [detailGrid([["目标房间上限", count(desired.rooms_per_instance) + " 间 / 实例"], ["目标 CPU request", cpuBudget(desired.cpu_request_millicores)], ["目标 CPU limit", cpuLimit(desired.cpu_limit_millicores)], ["需重建实例", count(policy.requires_replacement_count)]])]);
+    else empty($("policy-summary"), "尚无策略数据；不会用预设值冒充正在生效的配置。");
+    $("policy-legacy-note").hidden = !policy || desired.cpu_request_millicores === desired.cpu_limit_millicores;
+    setText($("policy-draft-state"), !policy ? "等待服务器配置。" : !manage ? "当前可查看策略，服务端未开放策略修改。" : state.policyConflict ? "服务器修订已变化；草稿保留，请重新载入并核对后再保存。" : state.policyDirty ? "有未保存修改 · 自动刷新只更新状态，不覆盖输入。" : "保存只影响后续创建的实例，现有实例不会自动重建。");
+    setDisabled(["policy-rooms", "policy-cpu", "policy-cpu-preset"], !manage || state.policySaving);
+    $("policy-save-button").disabled = !manage || state.policySaving || state.policyConflict || state.policyBaseRevision === undefined;
+    $("policy-reload-button").disabled = !policy || state.policySaving;
+    setText($("policy-save-button"), state.policySaving ? "正在保存…" : "保存目标策略");
+    const effective = list(policy?.effective_instances);
+    setText($("policy-effective-count"), policy ? count(effective.length) + " 个" : "等待数据");
+    table($("policy-effective-table"), ["实例", "状态", "有效房间上限", "有效 CPU request / limit", "实例策略修订", "与目标比较"], effective.map((item) => ({ key: item.worker_id, cells: [identifierButton(item.worker_id, () => openDetail("worker", item.worker_id)), badge(item.state), count(item.rooms_per_instance), cell(cpuBudget(item.cpu_request_millicores), "上限 " + cpuLimit(item.cpu_limit_millicores)), text(item.policy_revision), item.requires_replacement === true ? badge("需排空重建", "warning") : item.requires_replacement === false ? badge("与目标一致", "good") : "—"] })), policy ? "暂无运行实例；新实例将使用上方目标策略。" : "尚未读取实例有效配置。");
+    const active = workers().filter((item) => !WORKER_TERMINAL.has(item.state));
+    table($("alert-metric-table"), ["实例 / 地区", "停球 → 可继续操作 p95", "停球 → 结算 p95", "帧间隔 p99", "来源"], active.map((worker) => ({ key: worker.id, cells: [cell(identifierButton(worker.pod || worker.id, () => openDetail("worker", worker.id)), worker.region), sampleCell(worker.metrics?.client_presentation_to_ready_ms), sampleCell(worker.metrics?.client_presentation_to_settlement_ms), ms(worker.metrics?.frame_p99_ms), cell("客户端自报等待", "帧间隔来自服务端心跳")] })), state.goodFleet ? "暂无运行实例的样本；没有样本不表示延迟为 0。" : "实例指标暂不可用，未将缺失数据显示为零。");
+    setText($("alerts-status"), !alerts ? "等待告警配置" : alerts.config?.enabled ? "监测已开启" : "监测已关闭");
+    $("alerts-status").className = "badge " + (alerts?.config?.enabled ? "good" : "");
+    setText($("feishu-config-state"), !alerts ? "等待配置状态；Webhook 和签名密钥不会回显。" : "通知：" + (alerts.config?.feishu_enabled ? alerts.config?.enabled ? "已启用" : "已配置开启，监测关闭时不发送" : "未启用") + " · Webhook：" + (alerts.feishu_configured ? "已配置" : "未配置，不影响控制台监测") + " · 签名：" + (alerts.feishu_signing_configured ? "已配置" : "未配置") + "。留空保留，私密值不回显、不持久化到浏览器。");
+    setText($("alert-draft-state"), !alerts ? "等待服务器配置。" : !configure ? "此部署未开放告警配置修改。" : state.alertConflict ? "服务器修订已变化；草稿保留，请重新载入后核对。" : state.alertDirty ? "有未保存修改 · 私密输入提交后即清空。" : "等待指标需达到最少样本数并持续超阈值才告警。");
+    const alertFields = ["alerts-enabled", "feishu-enabled", "alert-wait", "alert-frame", "alert-hold", "alert-cooldown", "alert-samples", "feishu-clear-webhook", "feishu-clear-secret"];
+    setDisabled(alertFields, !configure || state.alertSaving);
+    $("feishu-webhook").disabled = !configure || state.alertSaving || $("feishu-clear-webhook").checked;
+    $("feishu-secret").disabled = !configure || state.alertSaving || $("feishu-clear-secret").checked;
+    $("alert-save-button").disabled = !configure || state.alertSaving || state.alertConflict || state.alertBaseRevision === undefined;
+    $("alert-reload-button").disabled = !alerts || state.alertSaving;
+    setText($("alert-save-button"), state.alertSaving ? "正在保存…" : "保存告警设置");
+    setText($("alert-delivery-state"), alerts ? "最近通知成功：" + time(alerts.delivery?.last_success_at) + (alerts.delivery?.last_error_code ? " · 最近错误：" + errorText({ code: alerts.delivery.last_error_code }) : " · 无已报告的投递错误") : "尚无通知结果；不会发送测试消息。");
+    const current = list(alerts?.active);
+    if (!current.length) empty($("alerts-active"), alerts ? "当前没有活动告警；请检查监测是否开启、样本是否充足。飞书通知关闭不影响这里显示。" : "等待告警状态。");
+    else patchRegion($("alerts-active"), current.map((item) => {
+      const row = keyed(node("article", "alert-entry"), item.key), body = node("div");
+      body.append(node("strong", "", alertKind(item.kind) + (item.worker_id ? " · " + shortID(item.worker_id) : "")), node("p", "", text(item.region) + " · 当前 " + alertValue(item, "value") + " / 阈值 " + alertValue(item, "threshold") + " · 自 " + time(item.since)), node("p", "", "来源 " + text(item.source) + " · 最近通知 " + time(item.last_notified_at)));
+      row.append(body, badge(item.state === "pending" ? "持续观察" : item.state, item.state === "firing" ? "danger" : item.state === "unknown" ? "" : "warning")); return row;
+    }));
+    table($("alerts-history-table"), ["时间", "指标", "事件", "实例", "观测值"], list(alerts?.history).map((item, index) => ({ key: text(item.at) + "/" + text(item.key) + "/" + index, cells: [time(item.at), alertKind(item.kind), badge(item.event, item.event === "recovered" ? "good" : "danger"), text(item.worker_id), alertValue(item, "value")] })), "尚无告警变更记录。");
+    table($("policy-audit-table"), ["时间", "修订", "操作者"], list(policy?.audit).map((item, index) => ({ key: text(item.after?.revision) + "/" + index, cells: [time(item.at), text(item.after?.revision), text(item.actor)] })), "尚无策略变更记录。");
+  }
+  async function reloadSettings(name) {
+    const dirty = name === "policy" ? state.policyDirty : state.alertDirty;
+    if (dirty && !await confirmAction("放弃本页未保存修改？", "重新载入会用服务器当前配置替换这份草稿。私密输入会清空，不会提交。", "", "重新载入", name)) return;
+    const generation = state.sessionGeneration;
+    await loadFeature(name, "v1/" + (name === "policy" ? "policy" : "alerts"), { fresh: true });
+    if (!state.session || generation !== state.sessionGeneration || resource(name).error) return;
+    if (name === "policy") hydratePolicy(true);
+    else { clearFeishuInputs(); hydrateAlerts(true); }
+    renderCurrentView();
+  }
+  async function savePolicy(event) {
+    event.preventDefault();
+    if (state.policySaving || !featureAvailable("policy", "can_manage") || state.policyConflict) return;
+    if (!$("policy-form").reportValidity()) return;
+    const cores = Number($("policy-cpu").value), millis = Math.round(cores * 1000), roomLimit = Number($("policy-rooms").value);
+    if (!Number.isInteger(roomLimit) || !Number.isFinite(cores) || Math.abs(cores * 1000 - millis) > 0.000001) { toast("请按整数房间数和最多三位小数的 CPU 核数填写。", true); return; }
+    const payload = { expected_revision: state.policyBaseRevision, rooms_per_instance: roomLimit, cpu_request_millicores: millis, cpu_limit_millicores: millis };
+    if (!await confirmAction("保存新实例的目标策略？", "新实例将采用 " + roomLimit + " 间房、CPU request / limit 均为 " + decimal(cores, 3) + " 核。现有实例不会自动排空；需要更新时请等待当前对局结束并排空重建。", "", "保存目标策略", "policy")) return;
+    if (!featureAvailable("policy", "can_manage") || state.policySaving) return;
+    const generation = state.sessionGeneration; state.policySaving = true; renderCurrentView();
+    try {
+      await api("policy", { method: "POST", body: payload });
+      if (!state.session || generation !== state.sessionGeneration) return;
+      await loadFeature("policy", "v1/policy", { fresh: true });
+      if (!state.session || generation !== state.sessionGeneration) return;
+      state.policySaving = false;
+      if (!resource("policy").error) hydratePolicy(true);
+      toast("目标策略已保存，仅新实例采用；现有实例未自动排空。");
+    } catch (error) {
+      if (state.session && generation === state.sessionGeneration) { if (error.code === "policy_conflict" || error.status === 409) state.policyConflict = true; toast(errorText(error), true); }
+    } finally { if (generation === state.sessionGeneration) { state.policySaving = false; if (state.session) renderCurrentView(); } }
+  }
+  function clearFeishuInputs() {
+    $("feishu-webhook").value = ""; $("feishu-secret").value = "";
+    $("feishu-clear-webhook").checked = false; $("feishu-clear-secret").checked = false;
+  }
+  async function saveAlerts(event) {
+    event.preventDefault();
+    if (state.alertSaving || !featureAvailable("alerts", "can_configure") || state.alertConflict || !$("alert-form").reportValidity()) return;
+    const payload = { expected_revision: state.alertBaseRevision, enabled: $("alerts-enabled").checked, feishu_enabled: $("feishu-enabled").checked };
+    const hasWebhook = !$("feishu-clear-webhook").checked && (featureData("alerts")?.feishu_configured === true || !!$("feishu-webhook").value.trim());
+    if (payload.feishu_enabled && !hasWebhook) { toast(errorMessages.feishu_not_configured, true); $("feishu-webhook").focus(); return; }
+    for (const [id, key] of [["alert-wait", "wait_p95_ms"], ["alert-frame", "frame_p99_ms"], ["alert-hold", "hold_seconds"], ["alert-cooldown", "cooldown_seconds"], ["alert-samples", "min_samples"]]) payload[key] = Number($(id).value);
+    if (!await confirmAction("保存告警设置？", "控制台监测" + (payload.enabled ? "开启" : "关闭") + "，飞书通知" + (payload.feishu_enabled ? "开启" : "关闭") + "。Webhook / 签名留空时保留；勾选清除时才删除。保存不发送测试通知，也不会自动扩容或排空实例。", "", "保存告警设置", "alerts")) return;
+    if (!featureAvailable("alerts", "can_configure") || state.alertSaving) return;
+    if ($("feishu-clear-webhook").checked) payload.feishu_webhook = ""; else if ($("feishu-webhook").value.trim()) payload.feishu_webhook = $("feishu-webhook").value.trim();
+    if ($("feishu-clear-secret").checked) payload.feishu_signing_secret = ""; else if ($("feishu-secret").value.trim()) payload.feishu_signing_secret = $("feishu-secret").value.trim();
+    clearFeishuInputs();
+    const generation = state.sessionGeneration; state.alertSaving = true; renderCurrentView();
+    try {
+      await api("alerts", { method: "POST", body: payload });
+      if (!state.session || generation !== state.sessionGeneration) return;
+      await loadFeature("alerts", "v1/alerts", { fresh: true });
+      if (!state.session || generation !== state.sessionGeneration) return;
+      state.alertSaving = false;
+      if (!resource("alerts").error) hydrateAlerts(true);
+      toast("告警设置已保存；未发送测试通知。");
+    } catch (error) {
+      if (state.session && generation === state.sessionGeneration) { if (error.code === "alerts_conflict" || error.status === 409) state.alertConflict = true; toast(errorText(error) + " 私密输入已清空，需要时请重新填写。", true); }
+    } finally { delete payload.feishu_webhook; delete payload.feishu_signing_secret; if (generation === state.sessionGeneration) { state.alertSaving = false; if (state.session) renderCurrentView(); } }
+  }
+  function nodeTargetKey() { return [$("node-join-region").value, $("node-join-host").value.trim(), $("node-join-port").value].join("\n"); }
+  function clearNodeAuthorization() {
+    state.nodeScan = null; state.nodePreflight = null; state.nodeScanTarget = "";
+    $("node-join-password").value = ""; $("node-fingerprint-confirmed").checked = false;
+    $("node-fingerprint").replaceChildren();
+  }
+  function nodeJobs() {
+    const data = list(featureData("onboarding")?.jobs);
+    if (!state.currentJob) return data;
+    return [state.currentJob, ...data.filter((job) => job.id !== state.currentJob.id)];
+  }
+  function jobRunning(job) {
+    if (!job || ["AwaitingPreflight", "AwaitingApproval", "Ready", "Failed", "NeedsReview", "Expired"].includes(job.phase)) return false;
+    return ["queued", "scanning", "preflighting", "installing", "verifying"].includes(job.state) || ["Scanning", "Preflighting", "Installing", "Verifying"].includes(job.phase);
+  }
+  function enrollmentLabel(job) { return ({ Scanning: "扫描主机指纹", AwaitingPreflight: "待核验指纹", Preflighting: "环境预检中", AwaitingApproval: "待确认安装", Installing: "安装中", Verifying: "验证节点", Ready: "节点已就绪", Failed: "任务失败", NeedsReview: "需人工复核", Expired: "任务已过期" })[job?.phase] || labels[job?.state] || text(job?.state); }
+  function enrollmentFailed(job) { return ["failed", "needs_review", "expired"].includes(job?.state) || ["Failed", "NeedsReview", "Expired"].includes(job?.phase); }
+  function acceptNodeScan(result, target) {
+    if (!result || typeof result.scan_id !== "string" || !list(result.fingerprints).some((item) => typeof item.fingerprint === "string")) { const failure = new Error("invalid_scan"); failure.code = "upstream_invalid_response"; throw failure; }
+    state.nodeScan = result; state.nodeScanTarget = target;
+    $("node-fingerprint").replaceChildren(...list(result.fingerprints).filter((item) => typeof item.fingerprint === "string").map((item) => new Option(text(item.algorithm) + " · " + item.fingerprint, item.fingerprint)));
+  }
+  function acceptNodePreflight(result) {
+    if (!result || typeof result.preflight_id !== "string" || typeof result.can_join !== "boolean") { const failure = new Error("invalid_preflight"); failure.code = "upstream_invalid_response"; throw failure; }
+    state.nodePreflight = result;
+  }
+  function beginPendingEnrollment(result, kind, target, info) {
+    if (typeof result.id !== "string" || !/^[a-f0-9]{32}$/.test(result.id)) { const failure = new Error("invalid_job"); failure.code = "upstream_invalid_response"; throw failure; }
+    state.currentJob = { ...info, ...result }; state.pendingEnrollment = { id: result.id, kind, target };
+    state.jobRequestedAt = 0;
+  }
+  function acceptEnrollmentJob(job) {
+    const pending = state.pendingEnrollment;
+    if (!pending || job.id !== pending.id) return;
+    if (enrollmentFailed(job)) { state.pendingEnrollment = null; state.nodeAction = ""; return; }
+    if (pending.kind === "scan" && job.scan) { acceptNodeScan(job.scan, pending.target); state.pendingEnrollment = null; state.nodeAction = ""; }
+    else if (pending.kind === "preflight" && job.preflight) { acceptNodePreflight(job.preflight); state.pendingEnrollment = null; state.nodeAction = ""; }
+  }
+  function renderChecks(id, checks) {
+    patchRegion($(id), list(checks).map((item, index) => {
+      const row = keyed(node("div", "check-row"), text(item.name) + "/" + index), body = node("div");
+      body.append(node("strong", "", text(item.name)), node("p", "", text(item.detail)));
+      row.append(badge(item.ok === true ? "通过" : item.ok === false ? "未通过" : "未知", item.ok === true ? "good" : item.ok === false ? "danger" : ""), body); return row;
+    }));
+  }
+  function renderOnboarding() {
+    const capability = featureData("onboarding"), available = featureAvailable("onboarding", "enabled"), busy = state.nodeBusy || !!state.pendingEnrollment;
+    errorBanner("onboarding-error", state.nodeError || resource("onboarding").error);
+    $("node-action-status").hidden = !busy;
+    setText($("node-action-status"), state.nodeAction === "preflight" ? "正在认证并执行只读预检；密码已从输入框清空，请稍候。" : state.nodeAction === "join" ? "正在提交安装任务，请稍候；Kubernetes 任务接受后由所选地域 controller 执行。" : "正在读取 SSH 主机指纹；此步骤未提交密码，请稍候。");
+    setText($("onboarding-capability"), !capability ? "正在读取节点接入能力…" : !available ? "此部署未启用节点接入，仍可查看节点与实例。请由运维通过现有安装流程接入。" : "控制台通过 Kubernetes API 提交受限任务；所选地域管理节点的 controller 负责连接目标 VPS，执行预检与安装。当前仅支持 root；先核对主机指纹，再预检和确认安装。云防火墙与公网 UDP 连通性需另行验收。");
+    const choices = list(capability?.regions);
+    options("node-join-region", choices.map((item) => item.name), "选择地区");
+    if (choices.length === 1 && !$("node-join-region").value && !state.nodeScan && $("node-join-region") !== document.activeElement) $("node-join-region").value = choices[0].name;
+    const selected = choices.find((item) => item.name === $("node-join-region").value);
+    setText($("node-region-plan"), selected ? "目标集群 " + text(selected.cluster_id) + " · API " + text(selected.server) + " · 游戏 UDP 端口 " + text(selected.game_port_min) + "–" + text(selected.game_port_max) : "选择地区后显示接入目标和游戏端口范围。");
+    setDisabled(["node-join-region", "node-join-host", "node-join-port"], !available || busy);
+    $("node-scan-button").disabled = !available || busy;
+    setText($("node-scan-button"), state.nodeAction === "scan" ? "正在扫描…" : "扫描 SSH 主机指纹");
+    const scan = state.nodeScan, preflight = state.nodePreflight, job = state.currentJob;
+    $("node-identity-panel").hidden = !scan;
+    if (scan) {
+      setText($("node-scan-expiry"), text(scan.host) + ":" + text(scan.port) + " · 指纹记录有效至 " + time(scan.expires_at) + (expired(scan.expires_at) ? "（已过期，请重新扫描）" : ""));
+      const option = $("node-fingerprint").selectedOptions[0]; setText($("node-fingerprint-preview"), option ? option.textContent : "尚无可选指纹。");
+    }
+    setDisabled(["node-fingerprint", "node-fingerprint-confirmed", "node-join-password"], !available || busy || !scan || expired(scan.expires_at));
+    $("node-preflight-button").disabled = !available || busy || !scan || expired(scan.expires_at) || !$("node-fingerprint-confirmed").checked;
+    setText($("node-preflight-button"), state.nodeAction === "preflight" ? "正在预检…" : "认证并执行只读预检");
+    $("node-plan-panel").hidden = !preflight;
+    if (preflight) {
+      setText($("node-preflight-expiry"), "本次认证与计划有效至 " + time(preflight.expires_at) + (expired(preflight.expires_at) ? "（已过期，需重新认证）" : ""));
+      setText($("node-preflight-status"), preflight.can_join ? "预检通过" : "预检未通过"); $("node-preflight-status").className = "badge " + (preflight.can_join ? "good" : "danger");
+      patchRegion($("node-preflight-summary"), [detailGrid([["SSH 主机", preflight.host], ["地区 / 节点名", text(preflight.region) + " / " + text(preflight.node_name)], ["私网 IP / 网卡", text(preflight.private_ip) + " / " + text(preflight.interface)], ["外部 IP", preflight.external_ip], ["CPU", number(preflight.cpu_cores) ? decimal(preflight.cpu_cores, 2) + " 核" : "—"], ["内存", number(preflight.memory_mib) ? bytes(preflight.memory_mib * 1048576) : "—"], ["剩余磁盘", number(preflight.disk_free_gib) ? decimal(preflight.disk_free_gib) + " GiB" : "—"], ["已有安装", typeof preflight.existing_installation === "boolean" ? preflight.existing_installation ? "存在" : "无" : text(preflight.existing_installation)]])]);
+      renderChecks("node-preflight-checks", preflight.checks);
+      patchRegion($("node-install-plan"), list(preflight.plan).map((step, index) => keyed(node("li", "", text(step)), index)));
+    }
+    $("node-join-button").disabled = !available || busy || !preflight || preflight.can_join !== true || expired(preflight.expires_at) || nodeJobs().some(jobRunning);
+    setText($("node-join-button"), state.nodeAction === "join" ? "正在提交…" : nodeJobs().some(jobRunning) ? "已有任务执行中" : "确认计划并加入集群");
+    $("node-job-panel").hidden = !job;
+    if (job) {
+      setText($("node-job-state"), enrollmentLabel(job)); $("node-job-state").className = "badge " + (job.state === "ready" || job.phase === "Ready" ? "good" : enrollmentFailed(job) ? "danger" : "warning");
+      patchRegion($("node-job-summary"), [detailGrid([["任务 ID", job.id], ["主机", job.host], ["地区 / 节点", text(job.region) + " / " + text(job.node_name)], ["当前步骤", job.stage || enrollmentLabel(job)], ["提交时间", time(job.created_at)], ["最近更新", time(job.updated_at)]])]);
+      renderChecks("node-job-checks", job.checks);
+      setText($("node-job-note"), job.state === "ready" ? "K3s 节点已就绪。公网 UDP 与真实游戏连接仍需实测，Ready 不代表玩家网络已验收。" : enrollmentFailed(job) ? "任务未完成；请先核对状态，不会自动重复安装。" + (job.error ? errorText({ code: job.error }) : "请核对上方检查结果后处理；不会自动重复安装。") : job.phase === "AwaitingPreflight" ? "指纹扫描完成；需核验主机身份后才提交密码，尚未安装。" : job.phase === "AwaitingApproval" ? "只读预检已完成，等待你确认安装计划，尚未加入集群。" : "Kubernetes 接入任务由所选地域 controller 继续执行；页面每 5 秒读取状态，关闭页面不会取消正在执行的任务。");
+    }
+    const jobs = nodeJobs(); setText($("node-job-count"), capability ? count(jobs.length) + " 个" : "等待数据");
+    table($("node-jobs-table"), ["主机 / 地区", "节点", "状态", "步骤", "更新时间", "操作"], jobs.map((item) => ({ key: item.id, cells: [cell(text(item.host), text(item.region)), text(item.node_name), badge(enrollmentLabel(item)), text(item.stage || enrollmentLabel(item)), time(item.updated_at), enrollmentViewButton(item, busy)] })), capability ? "暂无接入任务。完成预检并确认安装后会创建任务。" : "尚未读取接入任务。");
+    const phase = state.pendingEnrollment?.kind === "scan" || state.nodeAction === "scan" ? "scan" : state.pendingEnrollment?.kind === "preflight" || state.nodeAction === "preflight" ? "preflight" : preflight ? "plan" : scan ? "preflight" : jobRunning(job) || job?.state === "ready" ? "job" : "scan";
+    for (const key of ["scan", "preflight", "plan", "job"]) $("join-step-" + key).classList.toggle("active", key === phase);
+  }
+  function enrollmentViewButton(item, disabled) {
+    const action = button("查看任务", () => { state.currentJob = item; renderCurrentView(); fetchNodeJob(true); }, "button small quiet"); action.disabled = disabled; return action;
+  }
+  async function scanNode(event) {
+    event.preventDefault();
+    if (!featureAvailable("onboarding", "enabled") || state.nodeBusy || state.pendingEnrollment || !$("node-scan-form").reportValidity()) return;
+    const payload = { region: $("node-join-region").value, host: $("node-join-host").value.trim(), port: Number($("node-join-port").value) }, target = nodeTargetKey();
+    clearNodeAuthorization(); state.currentJob = null; state.nodeError = null; state.nodeBusy = true; state.nodeAction = "scan"; renderCurrentView();
+    const generation = state.sessionGeneration;
+    try {
+      const result = await api("node-onboarding/scan", { method: "POST", body: payload });
+      if (!state.session || generation !== state.sessionGeneration) return;
+      if (result?.pending === true) beginPendingEnrollment(result, "scan", target, payload);
+      else acceptNodeScan(result, target);
+    } catch (error) { if (state.session && generation === state.sessionGeneration) state.nodeError = error; }
+    finally { if (generation === state.sessionGeneration) { state.nodeBusy = false; if (!state.pendingEnrollment) state.nodeAction = ""; if (state.session) renderCurrentView(); } }
+  }
+  async function preflightNode(event) {
+    event.preventDefault();
+    if (!featureAvailable("onboarding", "enabled") || state.nodeBusy || state.pendingEnrollment || !state.nodeScan || expired(state.nodeScan.expires_at) || !$("node-preflight-form").reportValidity()) return;
+    const scan = state.nodeScan, target = state.nodeScanTarget;
+    const payload = { scan_id: scan.scan_id, username: "root", password: $("node-join-password").value, fingerprint: $("node-fingerprint").value };
+    // A scan is single-use server-side, including failed authentication.
+    clearNodeAuthorization(); state.nodeError = null; state.nodeBusy = true; state.nodeAction = "preflight"; renderCurrentView();
+    const generation = state.sessionGeneration;
+    try {
+      const result = await api("node-onboarding/preflight", { method: "POST", body: payload, timeoutMs: 25000 });
+      if (!state.session || generation !== state.sessionGeneration) return;
+      if (result?.pending === true) beginPendingEnrollment(result, "preflight", target, { host: scan.host, region: $("node-join-region").value });
+      else acceptNodePreflight(result);
+    } catch (error) { if (state.session && generation === state.sessionGeneration) state.nodeError = error; }
+    finally { delete payload.password; if (generation === state.sessionGeneration) { $("node-join-password").value = ""; state.nodeBusy = false; if (!state.pendingEnrollment) state.nodeAction = ""; if (state.session) renderCurrentView(); } }
+  }
+  async function joinNode() {
+    const preflight = state.nodePreflight;
+    if (!featureAvailable("onboarding", "enabled") || state.nodeBusy || !preflight || !preflight.can_join || expired(preflight.expires_at) || nodeJobs().some(jobRunning)) return;
+    if (!await confirmAction("按已展示计划加入这个 VPS？", "将提交受限 Kubernetes 任务，由所选地域管理节点的 controller 使用刚才核验的主机身份和临时认证，在目标 VPS 执行上方安装计划并加入 K3s。不会购买服务器或修改云防火墙；节点 Ready 后仍需验证公网 UDP 游戏连接。", text(preflight.host) + " · " + text(preflight.region) + " · " + text(preflight.node_name), "确认安装并加入", "onboarding")) return;
+    if (!featureAvailable("onboarding", "enabled") || state.nodeBusy || state.nodePreflight !== preflight || expired(preflight.expires_at)) return;
+    const generation = state.sessionGeneration; state.nodeBusy = true; state.nodeAction = "join"; state.nodeError = null; renderCurrentView();
+    try {
+      const job = await api("node-onboarding/join", { method: "POST", body: { preflight_id: preflight.preflight_id } });
+      if (!state.session || generation !== state.sessionGeneration) return;
+      if (!job || typeof job.id !== "string" || typeof job.state !== "string") { const failure = new Error("invalid_job"); failure.code = "upstream_invalid_response"; throw failure; }
+      state.currentJob = job; state.jobRequestedAt = Date.now(); clearNodeAuthorization();
+      toast("接入任务已提交，安装与验证状态将每 5 秒更新。");
+    } catch (error) { if (state.session && generation === state.sessionGeneration) state.nodeError = error; }
+    finally { if (generation === state.sessionGeneration) { state.nodeBusy = false; if (!state.pendingEnrollment) state.nodeAction = ""; if (state.session) renderCurrentView(); } }
+  }
+  async function fetchNodeJob(manual = false) {
+    const job = state.currentJob;
+    if (!state.session || !job || state.jobBusy || (!manual && !state.pendingEnrollment && !jobRunning(job))) return;
+    state.jobBusy = true; state.jobRequestedAt = Date.now(); const generation = state.sessionGeneration;
+    try {
+      const result = await api("node-onboarding/jobs?" + new URLSearchParams({ id: job.id }));
+      if (!state.session || generation !== state.sessionGeneration || state.currentJob?.id !== job.id) return;
+      if (!result || result.id !== job.id || typeof result.state !== "string") { const failure = new Error("invalid_job"); failure.code = "upstream_invalid_response"; throw failure; }
+      state.currentJob = result; acceptEnrollmentJob(result); state.nodeError = null;
+    } catch (error) { if (state.session && generation === state.sessionGeneration && state.currentJob?.id === job.id) state.nodeError = error; }
+    finally { if (generation === state.sessionGeneration) { state.jobBusy = false; if (state.session && state.view === "onboarding") renderCurrentView(); } }
+  }
+
   function detailGrid(pairs) {
     const grid = keyed(node("dl", "detail-grid"), "fields");
     for (const [label, value] of pairs) { const item = keyed(node("div"), label); item.append(node("dt", "", label), node("dd", "", text(value))); grid.append(item); }
@@ -537,6 +1091,16 @@
         content.push(tableWrap, keyed(node("p", "table-note", historical ? "此对局已结束；以上为席位末次记录，不代表当前仍有连接。座位按协议从 0 编号。" : "连接状态来自游戏服心跳；座位按协议从 0 编号。进入对局后，入场预约截止不表示对局结束时间。房间不提供独立 CPU 指标。"), "player-note"));
         const worker = workers().find((item) => item.id === room.worker_id);
         if (worker) { const actions = keyed(node("div", "detail-actions"), "actions"); actions.append(button("查看所属实例", () => openDetail("worker", worker.id)), button("查看实例日志", () => openLogs(worker))); content.push(actions); }
+      } else if (detail.kind === "node") {
+        const host = allNodes().find((item) => nodeKey(item) === detail.id);
+        setText($("detail-eyebrow"), "VPS / Kubernetes 节点"); setText($("detail-title"), text(host?.name || detail.id));
+        if (!host) { empty(body, "当前快照中没有这个 Node 记录。记录消失不代表云 VPS 已被关闭或删除。"); return; }
+        const address = nodePublicIP(host), region = regions().find((item) => item.name === host.region), pods = list(region?.pods).filter((item) => item.node === host.name);
+        content.push(detailGrid([["节点名", host.name], ["地区", host.region], ["角色标签", nodeRole(host.role)], ["Ready 状态", nodeReadyStatus(host) + " · " + nodeReadyLabel(host)], ["Ready 最近变更", time(host.ready_last_transition_at)], ["调度暂停", host.unschedulable ? "是" : "否"], [address.label, address.value], ["内网 IP · InternalIP", nodePrivateIP(host)], ["CPU 使用 / 可分配", cpu(host.cpu_millicores) + " / " + cpu(host.cpu_allocatable_millicores)], ["内存使用 / 可分配", bytes(host.memory_bytes) + " / " + bytes(host.memory_allocatable_bytes)], ["观察范围内 Pod", count(pods.length)]]));
+        content.push(keyed(node("p", "table-note", "地址来自 Node.status.addresses；ExternalIP 未上报时才显示明确标注的管理备注。备注不修改节点网络，也不能用于退役确认。Ready=False / Unknown 不等于云 VPS 已关机、到期或永久退役。"), "node-address-note"));
+        const podTable = keyed(node("div", "table-wrap"), "node-pods");
+        table(podTable, ["可见 Pod", "命名空间", "状态", "关联游戏服"], pods.map((pod) => { const worker = workers().find((item) => item.pod === pod.name && item.region === host.region); return { key: pod.namespace + "/" + pod.name, cells: [pod.name, pod.namespace, badge(pod.phase), worker ? identifierButton(worker.id, () => openDetail("worker", worker.id)) : "未关联 Fleet 实例"] }; }), "当前观察范围没有此节点的 Pod；不代表节点没有其他系统工作负载。");
+        content.push(podTable, retirementControl(host));
       } else {
         const worker = workers().find((item) => item.id === detail.id);
         setText($("detail-eyebrow"), "游戏服实例"); setText($("detail-title"), text(worker?.pod || detail.id));
@@ -551,16 +1115,17 @@
       patchRegion(body, content);
     });
     state.renderArea = null;
-    const stale = fleet()?.ok !== true || !!state.snapshotError;
-    setText($("detail-status"), state.deferred.has("details") ? "正在选择或操作详情，局部更新暂缓" : (stale ? "上次成功记录 · " : "快照 · ") + time(state.goodFleetAt, true));
-    if (!state.deferred.has("details")) state.renderedAt.details = state.goodFleetAt;
+    const selectedNode = detail.kind === "node" ? allNodes().find((item) => nodeKey(item) === detail.id) : null;
+    const stale = !!state.snapshotError || (detail.kind === "node" ? !selectedNode || selectedNode.stale : fleet()?.ok !== true), observed = detail.kind === "node" ? state.snapshot?.observed_at : state.goodFleetAt;
+    setText($("detail-status"), state.deferred.has("details") ? "正在选择或操作详情，局部更新暂缓" : (detail.kind === "node" && stale ? "节点保留上次成功记录；当前读取未确认" : (stale ? "上次成功记录 · " : "快照 · ") + time(observed, true)));
+    if (!state.deferred.has("details")) state.renderedAt.details = observed;
   }
-  function confirmAction(title, description, target, label) {
+  function confirmAction(title, description, target, label, scope = "fleet") {
     const dialog = $("confirm-dialog");
     if (dialog.open) return Promise.resolve(false);
     setText($("confirm-title"), title); setText($("confirm-description"), description); setText($("confirm-target"), target || ""); $("confirm-target").hidden = !target; setText($("confirm-submit"), label);
-    dialog.returnValue = "cancel";
-    return new Promise((resolve) => { dialog.addEventListener("close", () => resolve(dialog.returnValue === "confirm"), { once: true }); dialog.showModal(); });
+    dialog.returnValue = "cancel"; state.confirmScope = scope;
+    return new Promise((resolve) => { dialog.addEventListener("close", () => { state.confirmScope = null; resolve(dialog.returnValue === "confirm"); }, { once: true }); dialog.showModal(); });
   }
   async function drainWorker(worker) {
     if (state.mutationBusy || !state.session) return;
@@ -659,7 +1224,7 @@
     });
   }
   function refreshCurrent() {
-    if (state.view === "logs") fetchLogs({ manual: true }); else requestSnapshot([state.view]);
+    if (state.view === "logs") fetchLogs({ manual: true }); else if (state.view === "policy") refreshPolicy(); else if (state.view === "onboarding") { refreshOnboarding(); fetchNodeJob(true); } else requestSnapshot([state.view]);
   }
   $("login-form").addEventListener("submit", async (event) => {
     event.preventDefault(); $("login-button").disabled = true; $("login-error").hidden = true;
@@ -709,6 +1274,29 @@
     try { await navigator.clipboard.writeText(state.logs); toast("日志已复制。"); }
     catch (_) { toast("浏览器未允许自动复制，请在日志区手动选择文本。", true); }
   });
+  $("policy-form").addEventListener("input", () => { state.policyDirty = true; renderPolicy(); });
+  $("policy-cpu-preset").addEventListener("click", () => { $("policy-cpu").value = "1.5"; state.policyDirty = true; renderPolicy(); $("policy-cpu").focus(); });
+  $("policy-form").addEventListener("submit", savePolicy);
+  $("policy-reload-button").addEventListener("click", () => reloadSettings("policy"));
+  $("alert-form").addEventListener("input", () => { state.alertDirty = true; renderPolicy(); });
+  $("alert-form").addEventListener("submit", saveAlerts);
+  $("alert-reload-button").addEventListener("click", () => reloadSettings("alerts"));
+  for (const [toggle, input] of [["feishu-clear-webhook", "feishu-webhook"], ["feishu-clear-secret", "feishu-secret"]]) $(toggle).addEventListener("change", () => { if ($(toggle).checked) $(input).value = ""; state.alertDirty = true; renderPolicy(); });
+  $("node-retire-form").addEventListener("submit", submitRetirement);
+  $("node-retire-form").addEventListener("input", renderRetirementConfirmation);
+  $("node-retire-cancel").addEventListener("click", () => { if (!state.retirement.busy) $("node-retire-dialog").close(); });
+  $("node-retire-dialog").addEventListener("cancel", (event) => { if (state.retirement.busy) event.preventDefault(); });
+  $("node-retire-dialog").addEventListener("close", () => { state.retirement.confirmation = null; $("node-retire-form").reset(); });
+  $("node-scan-form").addEventListener("submit", scanNode);
+  $("node-preflight-form").addEventListener("submit", preflightNode);
+  $("node-join-button").addEventListener("click", joinNode);
+  for (const id of ["node-join-region", "node-join-host", "node-join-port"]) $(id).addEventListener($(id).tagName === "SELECT" ? "change" : "input", () => {
+    if (state.nodeScanTarget && nodeTargetKey() !== state.nodeScanTarget) { clearNodeAuthorization(); state.nodeError = null; }
+    renderOnboarding();
+  });
+  $("node-fingerprint").addEventListener("change", () => { $("node-fingerprint-confirmed").checked = false; state.nodePreflight = null; renderOnboarding(); });
+  $("node-fingerprint-confirmed").addEventListener("change", renderOnboarding);
+  window.addEventListener("pagehide", () => { clearFeishuInputs(); $("node-join-password").value = ""; });
   document.addEventListener("focusout", flushInteractions);
   document.addEventListener("selectionchange", flushInteractions);
   // A single cheap scheduler chooses due areas. No page reloads, no global DOM
@@ -718,10 +1306,14 @@
     const now = Date.now(), targets = [], interval = state.intervals[state.view];
     if (interval > 0 && now - (state.requestedAt[state.view] || 0) >= interval * 1000) {
       if (state.view === "logs") { if (state.logQuery && !state.logDraftDirty) fetchLogs(); }
+      else if (state.view === "policy") refreshPolicy();
+      else if (state.view === "onboarding") refreshOnboarding();
       else targets.push(state.view);
     }
     if (state.detail && $("detail-dialog").open && state.intervals.details > 0 && now - (state.requestedAt.details || 0) >= state.intervals.details * 1000) targets.push("details");
     if (targets.length) requestSnapshot(targets);
+    if ((state.pendingEnrollment || jobRunning(state.currentJob)) && now - state.jobRequestedAt >= 5000) fetchNodeJob();
+    if (retirementJobRunning(state.retirement.job) && now - state.retirement.requestedAt >= 5000) fetchRetirementJob();
   }
   document.addEventListener("visibilitychange", () => { if (!document.hidden) scheduleRefresh(); });
   setInterval(scheduleRefresh, 1000);

@@ -27,6 +27,14 @@ jobs:
       - run: python3 deploy/observability/validate.py
       - run: python3 -m py_compile scripts/local_cluster.py scripts/k3s_node.py scripts/issue_nakama_token.py examples/room-worker/server.py
       - run: python3 -m unittest discover -s tests
+      - name: Validate optional regional controller image
+        run: |
+          docker build --platform linux/amd64 -f deploy/enrollment/Dockerfile \
+            --build-arg "PYTHON_IMAGE=$(cat deploy/enrollment/base-image.txt)" \
+            --build-arg "VCS_REF=$GITHUB_SHA" -t node-enrollment:ci .
+          test "$(docker image inspect node-enrollment:ci --format '{{.Config.User}}')" = '10001:10001'
+          docker run --rm --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges node-enrollment:ci --help
   integration:
     runs-on: ubuntu-latest
     timeout-minutes: 30

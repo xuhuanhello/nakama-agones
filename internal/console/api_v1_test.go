@@ -182,3 +182,20 @@ func TestVersionedLogsAndBrowserSessionCompatibility(t *testing.T) {
 		t.Fatal("browser API session lost its separate capability")
 	}
 }
+
+func TestVersionedTimingProjectionPreservesUnknownAndDropsSecrets(t *testing.T) {
+	s, backend, token := queryFixture(t)
+	workers := backend.value.(map[string]any)["fleet"].(map[string]any)["workers"].([]any)
+	metrics := workers[1].(map[string]any)["metrics"].(map[string]any)
+	metrics["client_presentation_to_ready_ms"] = map[string]any{"window_seconds": 60, "count": 0, "p95": nil, "secret": "must-not-leak"}
+	metrics["simulation_workers"] = 2
+	w := perform(s, apiRequest(token, "instances?worker_id=worker-a"))
+	if w.Code != 200 || strings.Contains(w.Body.String(), "must-not-leak") {
+		t.Fatal("unsafe timing projection")
+	}
+	value := responseObject(t, w.Body.Bytes())
+	m := value["data"].([]any)[0].(map[string]any)["metrics"].(map[string]any)
+	if m["client_presentation_to_ready_ms"].(map[string]any)["p95"] != nil || m["simulation_workers"] != float64(2) {
+		t.Fatal("timing unavailable falsely became zero")
+	}
+}

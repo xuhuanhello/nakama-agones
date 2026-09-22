@@ -220,12 +220,23 @@ func (c *Client) desired(req provider.StartRequest) (gameServer, secret, error) 
 	for _, k := range keys {
 		gameContainer.Env = append(gameContainer.Env, environment{Name: k, ValueFrom: &secretValue{secretRef{Name: secretName(req.Name), Key: k}}})
 	}
-	for k, v := range map[string]string{"cpu": c.cfg.CPURequest, "memory": c.cfg.MemoryRequest} {
+	cpuRequest, cpuLimit := c.cfg.CPURequest, c.cfg.CPULimit
+	if req.CPUResources != nil {
+		cpuRequest, cpuLimit = req.CPUResources.Request, req.CPUResources.Limit
+		for _, v := range []string{cpuRequest, cpuLimit} {
+			if v != "" {
+				if _, ok := quantityValue(v); !ok {
+					return gameServer{}, secret{}, failure("start", 0, "invalid_cpu_resources", false)
+				}
+			}
+		}
+	}
+	for k, v := range map[string]string{"cpu": cpuRequest, "memory": c.cfg.MemoryRequest} {
 		if v != "" {
 			gameContainer.Resources.Requests[k] = v
 		}
 	}
-	for k, v := range map[string]string{"cpu": c.cfg.CPULimit, "memory": c.cfg.MemoryLimit} {
+	for k, v := range map[string]string{"cpu": cpuLimit, "memory": c.cfg.MemoryLimit} {
 		if v != "" {
 			gameContainer.Resources.Limits[k] = v
 		}

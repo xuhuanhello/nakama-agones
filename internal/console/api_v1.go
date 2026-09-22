@@ -40,7 +40,7 @@ type apiResponse struct {
 func (s *Server) versionedAPI(w http.ResponseWriter, r *http.Request) {
 	resource := strings.TrimPrefix(r.URL.Path, apiV1Prefix)
 	switch resource {
-	case "overview", "rooms", "instances", "nodes", "events", "logs":
+	case "overview", "rooms", "instances", "nodes", "events", "logs", "policy", "alerts":
 	default:
 		writeError(w, 404, "not_found")
 		return
@@ -64,6 +64,41 @@ func (s *Server) versionedAPI(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), backendTimeout)
 	defer cancel()
+	if resource == "policy" || resource == "alerts" {
+		if len(query) != 0 {
+			writeError(w, 400, "invalid_query")
+			return
+		}
+		if resource == "policy" {
+			b, ok := s.backend.(policyBackend)
+			if !ok {
+				writeError(w, 503, "policy_unavailable")
+				return
+			}
+			value, err := b.Policy(ctx)
+			if p, ok := value.(PolicyView); ok && mode == "api_token" {
+				p.CanManage = false
+				p.ReadOnly = true
+				value = p
+			}
+			writeBackend(w, value, err)
+		} else {
+			b, ok := s.backend.(alertsBackend)
+			if !ok {
+				writeError(w, 403, "alerts_disabled")
+				return
+			}
+			value, err := b.Alerts(ctx)
+			if v, ok := value.(map[string]any); ok {
+				v["read_only"] = mode == "api_token"
+				if mode == "api_token" {
+					v["can_configure"] = false
+				}
+			}
+			writeBackend(w, value, err)
+		}
+		return
+	}
 	if resource == "logs" {
 		if !validAPIQuery(query, "region", "namespace", "pod", "container", "mode", "minutes", "limit", "search", "before") {
 			writeError(w, 400, "invalid_query")
@@ -302,11 +337,15 @@ func overviewProjection(snapshot, fleet map[string]any, regions []map[string]any
 	}
 	regionViews := []any{}
 	for _, region := range regions {
-		item := fields(region, "name", "ok", "metrics_ok", "error")
+		item := fields(region, "name", "ok", "metrics_ok", "error", "observed_namespaces", "pod_count_scope")
 		item["nodes_sampled"], item["pods_sampled"], item["events_sampled"] = len(objects(region["nodes"])), len(objects(region["pods"])), len(objects(region["events"]))
 		regionViews = append(regionViews, item)
 	}
-	return map[string]any{"fleet": view, "regions": regionViews, "log_retention_days": snapshot["log_retention_days"], "drain_scope": "instance"}
+	capacityRegions := make([]any, 0, len(regions))
+	for _, region := range regions {
+		capacityRegions = append(capacityRegions, region)
+	}
+	return map[string]any{"fleet": view, "regions": regionViews, "capacity": capacityProjection(fleet, capacityRegions), "log_retention_days": snapshot["log_retention_days"], "drain_scope": "instance"}
 }
 
 func projectRows(resource string, fleet map[string]any, regions []map[string]any) []map[string]any {
@@ -327,7 +366,16 @@ func projectRows(resource string, fleet map[string]any, regions []map[string]any
 		for _, worker := range objects(fleet["workers"]) {
 			row := fields(worker, "id", "pod", "region", "build_hash", "state", "host", "port", "max_rooms", "occupied_rooms", "player_count", "ready", "draining", "created_at", "last_heartbeat", "metrics", "error")
 			if metrics, ok := worker["metrics"].(map[string]any); ok {
-				row["metrics"] = fields(metrics, "simulation_pending", "simulation_active", "simulation_oldest_seconds", "memory_bytes", "frame_p99_ms", "audit_pending", "audit_active", "pending_results")
+				projected := fields(metrics, "simulation_pending", "simulation_active", "simulation_oldest_seconds", "memory_bytes", "frame_p99_ms", "audit_pending", "audit_active", "pending_results", "simulation_workers", "audit_workers")
+				for _, key := range timingMetricNames {
+					if raw, exists := metrics[key]; exists {
+						projected[key] = nil
+						if window, ok := raw.(map[string]any); ok {
+							projected[key] = fields(window, "window_seconds", "count", "p50", "p95", "p99", "max", "last_sample_age_seconds")
+						}
+					}
+				}
+				row["metrics"] = projected
 			}
 			row["pod_status"] = nil
 			for _, region := range regions {
@@ -338,7 +386,7 @@ func projectRows(resource string, fleet map[string]any, regions []map[string]any
 					if textField(pod, "worker_id") == textField(worker, "id") {
 						row["node"] = pod["node"]
 						row["namespace"] = pod["namespace"]
-						row["pod_status"] = fields(pod, "name", "namespace", "node", "phase", "ready", "restarts", "reason", "containers", "cpu_millicores", "memory_bytes")
+						row["pod_status"] = fields(pod, "name", "namespace", "node", "phase", "ready", "restarts", "reason", "containers", "cpu_millicores", "memory_bytes", "scheduling_capacity_shortage")
 					}
 				}
 			}
@@ -350,7 +398,7 @@ func projectRows(resource string, fleet map[string]any, regions []map[string]any
 		for _, row := range objects(region[resource]) {
 			var projected map[string]any
 			if resource == "nodes" {
-				projected = fields(row, "name", "ready", "unschedulable", "role", "cpu_capacity_millicores", "memory_capacity_bytes", "cpu_allocatable_millicores", "memory_allocatable_bytes", "cpu_millicores", "memory_bytes")
+				projected = fields(row, "name", "ready", "internal_ips", "external_ips", "operator_public_ip", "ready_status", "ready_last_transition_at", "unschedulable", "role", "cpu_capacity_millicores", "memory_capacity_bytes", "cpu_allocatable_millicores", "memory_allocatable_bytes", "cpu_millicores", "memory_bytes")
 			} else {
 				projected = fields(row, "namespace", "object_name", "type", "reason", "message", "time")
 			}

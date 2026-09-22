@@ -19,3 +19,9 @@ For a console-only upgrade, use the standalone bundle:
 This pins the module's Go version, builds Linux amd64 static binaries, includes public service/config templates, log manifests, credential/export helpers and console documentation, then generates SHA256SUMS. It does not pull the Nakama image or rebuild `agones.so`. The manual package workflow builds this bundle independently; tagged releases attach it beside the plugin archive after release checks pass.
 
 Install from a verified archive and follow [console deployment](console.md). Preserve the VPS's private configuration and local log PVCs across updates. Restart only the changed console/broker service; replacing the Go runtime plugin remains a separate maintenance operation.
+
+## Regional node controller image
+
+Tagged releases also publish `ghcr.io/<owner>/nakama-agones-node-controller`. It is an optional, separate Linux amd64 image, not a Nakama module or a privileged node daemon. The official Python base is pinned in `deploy/enrollment/base-image.txt`; the source revision is recorded in OCI labels. CI checks the non-root entrypoint before publishing.
+
+Pin the resulting repository digest in the [regional enrollment deployment](console-node-onboarding.md). The standalone console archive includes the public manifests and renderer, but no join token, SSH password or registry credential. Upgrading this controller does not restart Nakama or game instances. A controller interruption during a node installation deliberately requires operator review before any retry.

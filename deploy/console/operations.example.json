@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "revision": 1,
+  "config": {
+    "enabled": true,
+    "feishu_enabled": false,
+    "wait_p95_ms": 1000,
+    "frame_p99_ms": 100,
+    "hold_seconds": 60,
+    "cooldown_seconds": 600,
+    "min_samples": 5
+  },
+  "feishu_webhook": "",
+  "feishu_signing_secret": "",
+  "active": {},
+  "history": [],
+  "delivery": {"last_success_at": 0, "last_error_code": ""},
+  "audit": []
+}

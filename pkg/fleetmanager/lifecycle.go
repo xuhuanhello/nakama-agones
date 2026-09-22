@@ -169,7 +169,7 @@ func (m *Manager) Tick(ctx context.Context) error {
 			}
 		}
 		if s.CreationBlockedReason == "" && now >= s.NextCreateAt && m.liveCount(s) < m.cfg.MaxInstances && (q > bootCapacity || ready < m.cfg.MinInstances && bootCapacity == 0) {
-			m.newWorker(s, now, m.cfg.MaxRooms)
+			m.newWorker(s, now, m.policy(s).RoomsPerInstance)
 			s.NextCreateAt = now + 1
 		}
 		for _, w := range s.Workers {
@@ -376,7 +376,7 @@ func (m *Manager) start(ctx context.Context, w *state.Worker) error {
 }
 
 func (m *Manager) startRequest(w *state.Worker) provider.StartRequest {
-	req := provider.StartRequest{Name: "nag-" + w.ID, Region: m.cfg.Region,
+	req := provider.StartRequest{CPUResources: &provider.CPUResources{Request: w.CPURequest, Limit: w.CPULimit}, Name: "nag-" + w.ID, Region: m.cfg.Region,
 		CustomData:           map[string]any{"fleet_owner": m.cfg.DeploymentID, "worker_id": w.ID, "build_hash": m.cfg.BuildHash},
 		EnvironmentVariables: map[string]string{"AGONES_FLEET_WORKER_ID": w.ID, "AGONES_FLEET_BOOTSTRAP_TOKEN": encoded(derive(m.cfg.SigningKey, "bootstrap:"+w.ID)), "AGONES_FLEET_ADMISSION_KEY": encoded(derive(m.cfg.SigningKey, "admission:"+w.ID)), "AGONES_FLEET_CONTROL_URL": m.cfg.ControlURL, "AGONES_FLEET_BUILD_HASH": m.cfg.BuildHash, "AGONES_FLEET_MAX_ROOMS": fmt.Sprint(w.MaxRooms), "AGONES_FLEET_GAME_PORT": fmt.Sprint(m.cfg.Kubernetes.GamePort), "AGONES_FLEET_GAME_PORT_NAME": m.cfg.PortName},
 	}

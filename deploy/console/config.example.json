@@ -4,9 +4,11 @@
   "username": "admin",
   "password_hash": "REPLACE_WITH_HASH_FROM_FLEET_CONSOLE_HASH_PASSWORD",
   "read_api_token_hash": "",
+  "node_onboarding": null,
   "source": {
     "allow_management": false,
     "control_socket": "",
+    "operations_file": "/var/lib/fleet-console/operations/operations.json",
     "max_processes": 4,
     "rooms_per_process": 2,
     "log_retention_days": 7,

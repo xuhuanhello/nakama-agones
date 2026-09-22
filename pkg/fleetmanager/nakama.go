@@ -24,7 +24,7 @@ func Register(ctx context.Context, logger runtime.Logger, db *sql.DB, nk runtime
 	}
 	handler := m.HTTPHandler()
 	// Nakama's router treats RegisterHttp paths as exact Gorilla routes.
-	for _, path := range []string{"/agones/fleet/v1/agent/bootstrap", "/agones/fleet/v1/agent/heartbeat", "/agones/fleet/v1/admin/status", "/agones/fleet/v1/admin/drain", "/agones/fleet/v1/admin/allocate", "/agones/fleet/v1/admin/retry-creation"} {
+	for _, path := range []string{"/agones/fleet/v1/agent/bootstrap", "/agones/fleet/v1/agent/heartbeat", "/agones/fleet/v1/admin/status", "/agones/fleet/v1/admin/drain", "/agones/fleet/v1/admin/allocate", "/agones/fleet/v1/admin/retry-creation", "/agones/fleet/v1/admin/policy"} {
 		if err := initializer.RegisterHttp(path, func(w http.ResponseWriter, r *http.Request) { handler.ServeHTTP(w, r) }); err != nil {
 			return err
 		}
