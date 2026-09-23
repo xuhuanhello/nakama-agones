@@ -1060,6 +1060,59 @@
     for (const [label, value] of pairs) { const item = keyed(node("div"), label); item.append(node("dt", "", label), node("dd", "", text(value))); grid.append(item); }
     return grid;
   }
+  function workerDetailSection(key, title, description) {
+    const section = keyed(node("section"), key);
+    section.append(node("h3", "detail-section", title));
+    if (description) section.append(node("p", "inline-note", description));
+    return section;
+  }
+  function workerTimingTable(metrics, key, title, description, definitions) {
+    const section = workerDetailSection(key, title, description), wrapper = node("div", "table-wrap");
+    wrapper.tabIndex = 0; wrapper.setAttribute("aria-label", title + "，可横向滚动查看各列");
+    table(wrapper, ["阶段", "P50", "P95", "P99", "样本 / 窗口", "最近样本年龄"], definitions.map(([field, label, note]) => {
+      const value = metrics[field], windowKnown = value?.window_seconds === 60, countKnown = Number.isInteger(value?.count) && value.count >= 0;
+      const available = windowKnown && countKnown && value.count > 0 && [value.p50, value.p95, value.p99, value.last_sample_age_seconds].every((item) => number(item) && item >= 0) && value.last_sample_age_seconds <= value.window_seconds;
+      const missing = !value ? "未上报" : countKnown && value.count === 0 ? "暂无样本" : "数据未知";
+      return { key: field, cells: [cell(label, note), ...["p50", "p95", "p99"].map((quantile) => node("span", "nowrap", available ? ms(value[quantile]) : "—")), cell(countKnown ? count(value.count) + " 个" : "未知", windowKnown ? "60 秒窗口" : "窗口未知"), cell(available ? seconds(value.last_sample_age_seconds) : "—", available ? "按该次心跳上报" : missing)] };
+    }), "尚无阶段采样。");
+    section.append(wrapper); return section;
+  }
+  function workerDiagnostics(worker, pod) {
+    const metrics = worker.metrics || {}, terminal = WORKER_TERMINAL.has(worker.state), parts = [];
+    const resources = workerDetailSection("worker-resources", "进程与容器", "Pod 指标来自 Kubernetes Metrics API，汇总其返回的各容器用量；游戏进程内存由宿主心跳上报。两者采样时间与统计口径不同，不能直接相减计算 sidecar 内存。");
+    resources.append(detailGrid([["Pod CPU", cpu(pod?.cpu_millicores)], ["Pod 内存 · 容器合计", bytes(pod?.memory_bytes)], ["游戏进程内存 · 心跳", number(metrics.memory_bytes) && metrics.memory_bytes > 0 ? bytes(metrics.memory_bytes) : "未知"], ["帧间隔 P99", ms(metrics.frame_p99_ms)], ["待写回结果", count(metrics.pending_results)], ["容器重启次数", count(pod?.restarts)]]));
+    parts.push(resources);
+    const concurrency = workerDetailSection("worker-concurrency", "工作线程与队列", "实际工作线程数来自游戏宿主上报，不从 CPU 核数或预算推断。未上报显示未知。");
+    const concurrencyTable = node("div", "table-wrap"), threads = (value) => Number.isInteger(value) && value > 0 ? count(value) : "未知";
+    table(concurrencyTable, ["任务", "实际工作线程", "正在运行", "等待队列"], [
+      { key: "simulation", cells: ["模拟", threads(metrics.simulation_workers), count(metrics.simulation_active), count(metrics.simulation_pending)] },
+      { key: "audit", cells: ["审计", threads(metrics.audit_workers), count(metrics.audit_active), count(metrics.audit_pending)] }
+    ], "尚无线程数据。");
+    concurrency.append(concurrencyTable, node("p", "table-note", "最老模拟排队：" + seconds(metrics.simulation_oldest_seconds))); parts.push(concurrency);
+    const reference = workerDetailSection("worker-timing-reference", "采样与告警参考 · 只读", (terminal ? "实例已退出，以下仅为末次心跳记录。" : "以下是最近心跳中报告的采样窗口，样本年龄不是页面实时计时。") + "窗口为最近 60 秒；缺失或零样本时分位数未知，不能解释为 0 ms。页面不会据此自动扩容或排空实例。");
+    const alerts = state.snapshotError ? null : state.snapshot?.alerts, config = alerts?.config;
+    if (!config) reference.append(node("p", "inline-note", "告警阈值未知：本次快照未返回可用的只读告警配置。没有用预设值替代线上设置。"));
+    else {
+      const configured = (value, format) => number(value) ? format(value) : "未知";
+      reference.append(node("p", "inline-note", "来源：本次快照的 alerts.config · 修订 " + text(alerts.revision) + " · 监测" + (config.enabled === true ? "已启用" : config.enabled === false ? "已关闭（以下为已保存配置）" : "状态未知") + "。客户端两类等待的 P95 阈值：" + configured(config.wait_p95_ms, ms) + "；帧间隔 P99 阈值：" + configured(config.frame_p99_ms, ms) + "；最少 " + configured(config.min_samples, count) + " 个样本，持续 " + configured(config.hold_seconds, seconds) + "。服务器 ACK 与模拟阶段没有对应的独立告警阈值。"));
+    }
+    parts.push(reference);
+    parts.push(workerTimingTable(metrics, "timing-client", "客户端 · 停球后等待", "客户端自报：从视觉播放结束到可以继续操作或收到结算。包含客户端侧观察，不能当作服务器执行时间；告警状态仍以服务端监测结果为准。", [
+      ["client_presentation_to_ready_ms", "停球 → Ready", "可再次操作"],
+      ["client_presentation_to_settlement_ms", "停球 → 结算", "收到最终结算"]
+    ]));
+    parts.push(workerTimingTable(metrics, "timing-server", "服务器 · 播放 ACK 后处理", "首个 ACK 阶段包含等待另一名玩家确认播放结束；末个 ACK 阶段从双方有效确认后开始。这里只反映服务端阶段，不等于完整玩家体验或网络 RTT。", [
+      ["server_first_ack_to_ready_ms", "首个 ACK → Ready", "包含等待另一名玩家"],
+      ["server_first_ack_to_settlement_ms", "首个 ACK → 结算", "包含等待另一名玩家"],
+      ["server_last_ack_to_ready_ms", "末个 ACK → Ready", "双方有效 ACK 后"],
+      ["server_last_ack_to_settlement_ms", "末个 ACK → 结算", "双方有效 ACK 后"]
+    ]));
+    parts.push(workerTimingTable(metrics, "timing-simulation", "模拟 · 排队与执行", "工作队列与计算阶段的独立采样，用于定位服务器处理瓶颈；不包含完整网络传输和客户端渲染。", [
+      ["simulation_queue_ms", "模拟排队", "等待工作线程"],
+      ["simulation_work_ms", "模拟执行", "工作线程计算"]
+    ]));
+    return parts;
+  }
   function openDetail(kind, id) {
     if (!id) { toast("此记录尚未关联实例。", true); return; }
     const changed = state.detail?.kind !== kind || state.detail?.id !== id;
@@ -1109,8 +1162,9 @@
         const worker = workers().find((item) => item.id === detail.id);
         setText($("detail-eyebrow"), "游戏服实例"); setText($("detail-title"), text(worker?.pod || detail.id));
         if (!worker) { empty(body, "当前 Fleet 状态中没有此实例。若已退出，可在日志页手填 Pod 名查询归档。"); return; }
-        const pod = podFor(worker), metrics = worker.metrics || {}, terminal = WORKER_TERMINAL.has(worker.state);
-        content.push(detailGrid([["实例 ID", worker.id], ["状态", labels[workerStatus(worker)] || workerStatus(worker)], ["地区", worker.region], ["Pod / 命名空间", text(worker.pod) + " / " + text(pod?.namespace)], ["节点", pod?.node], ["联机版本", worker.build_hash], ["地址", worker.host ? text(worker.host) + ":" + text(worker.port) : "—"], ["房间 / 容量", count(worker.occupied_rooms) + " / " + count(worker.max_rooms)], [terminal ? "末次在线玩家" : "在线玩家", count(worker.player_count)], ["Pod CPU", cpu(pod?.cpu_millicores)], ["Pod 内存", bytes(pod?.memory_bytes)], ["游戏进程内存", bytes(metrics.memory_bytes)], ["帧间隔 P99", ms(metrics.frame_p99_ms)], ["模拟运行 / 排队", count(metrics.simulation_active) + " / " + count(metrics.simulation_pending)], ["最老模拟排队", seconds(metrics.simulation_oldest_seconds)], ["审计运行 / 排队", count(metrics.audit_active) + " / " + count(metrics.audit_pending)], ["待写回结果", count(metrics.pending_results)], ["容器重启次数", count(pod?.restarts)], ["创建时间", time(worker.created_at)], ["最近心跳", time(worker.last_heartbeat)], ["错误 / Pod 原因", worker.error || pod?.reason]]));
+        const pod = podFor(worker), terminal = WORKER_TERMINAL.has(worker.state);
+        content.push(detailGrid([["实例 ID", worker.id], ["状态", labels[workerStatus(worker)] || workerStatus(worker)], ["地区", worker.region], ["Pod / 命名空间", text(worker.pod) + " / " + text(pod?.namespace)], ["节点", pod?.node], ["联机版本", worker.build_hash], ["地址", worker.host ? text(worker.host) + ":" + text(worker.port) : "—"], ["房间 / 容量", count(worker.occupied_rooms) + " / " + count(worker.max_rooms)], [terminal ? "末次在线玩家" : "在线玩家", count(worker.player_count)], ["创建时间", time(worker.created_at)], ["最近心跳", time(worker.last_heartbeat)], ["错误 / Pod 原因", worker.error || pod?.reason]]));
+        content.push(...workerDiagnostics(worker, pod));
         const actions = keyed(node("div", "detail-actions"), "actions");
         actions.append(button("游戏服日志", () => openLogs(worker, "game")), button("Agones sidecar 日志", () => openLogs(worker, "agones-gameserver-sidecar")));
         if (canDrainWorker(worker)) actions.append(managementButton("排空实例", () => drainWorker(worker)));
