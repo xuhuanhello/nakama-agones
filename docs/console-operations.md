@@ -7,10 +7,14 @@ Install using [console deployment](console.md), then connect with the [SSH acces
 | View | Use |
 | --- | --- |
 | Overview | Active rooms/players, available capacity, startup blocks and unhealthy sources |
-| Rooms | Filter active or historical rooms; inspect Nakama user IDs, seats, reconnect state and assigned instance |
-| Instances | Process capacity, heartbeat, memory, frame p99, simulation/audit/result queues and graceful drain |
-| Nodes | Scheduling/readiness and Kubernetes CPU/memory measurements |
-| Logs | Select region, namespace, Pod/container, time range and live or archived source |
+| Rooms | Filter active or historical rooms; inspect Nakama user IDs, seats, reconnect state and the associated game Pod or retained scheduling record |
+| Pods / workloads | All Pods in the configured observation scope; filter game Pods, region, namespace, node and phase. Pod details separate container resources from game-process diagnostics and business rooms |
+| Nodes / VPS | VPS addresses, scheduling/readiness and node CPU/memory; drill down to its Pods |
+| Logs | Owned game Pod/container logs, time range and live or archived source; visible system Pods do not gain log access |
+
+Nodes represent VPS hosts. Pods are container groups scheduled on those hosts; game servers are a subset of those Pods, not a parallel resource total. A game Pod can contain the Unity game container and Agones sidecar. Rooms belong to the game process. The Pod list reflects only the authorized namespaces and server-side ownership filters, not the whole Kubernetes cluster.
+
+Fleet records without a Pod in the latest visible inventory stay in a separate collapsible scheduling/history section and are excluded from Pod counts. A missing Pod observation does not prove it was never created or that its cloud host was removed. A source error retains clearly marked prior data. Historical game records still provide archive-log navigation. Container names may include init containers; the current API does not expose individual container state/type/resource usage, so the UI does not infer those values.
 
 Unavailable metrics are shown as unknown, not zero. A finished room's last seat snapshot is historical state, not proof that its players remain online. Per-room CPU/RAM and player nicknames are not currently supplied. Room history is limited by Fleet state retention; the seven-day setting applies to collected logs.
 
@@ -22,7 +26,7 @@ Changing a refresh interval changes observation frequency only. It does not chan
 
 ## Graceful instance drain
 
-Select an active instance, review its occupancy and confirm drain. Drain stops new room allocation to that process. Existing matches, reconnect reservations and pending durable results must finish before normal process removal. A room is an allocation inside a shared process: an instance drain is not an immediate room kick.
+Select a game Pod, review its Unity-process occupancy and confirm drain in the business section. Drain stops new room allocation to that process. Existing matches, reconnect reservations and pending durable results must finish before normal process removal. A room is an allocation inside a shared process: an instance drain is not an immediate room kick.
 
 The optional `fleet-console-control` service must be enabled. A missing/broken broker leaves observation usable but management disabled with a reason. Browser mutations require authentication, same Origin and CSRF. The machine read-only API token cannot call them.
 
