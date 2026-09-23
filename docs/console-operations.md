@@ -44,3 +44,9 @@ There is no general Pod delete, container exec, force-kick-room or user-data edi
 - Kibana/Elasticsearch: an alternative search/visualization stack, not installed here. Kafka is a streaming transport, not a log-search UI; it is not required by this stack.
 
 The current deployment is not an HA observability platform: there is no replicated log store, long-term metric history, alert routing or distributed trace backend. Add those in response to measured operational needs. See [log storage, disk limits and failure modes](console-logs.md).
+
+### 容器资源指标
+
+Pod 详情按容器名称关联 Kubernetes Metrics API，分别显示应用容器与初始化容器的 CPU、内存、采样时间与窗口。资源申请和上限来自 Pod 规格，不代表实时用量。未取得采样显示未知；初始化容器可能已经退出。内存为 Metrics API 的工作集口径，不能直接等同于 Unity 托管堆或进程心跳内存。
+
+只读 API 的 Pod 数据新增 `container_details`，保留原有 `containers` 名称数组。每项含 `name`、`kind`、`requests`、`limits`，以及存在时的 `cpu_millicores`、`memory_bytes`、`metrics_timestamp`、`metrics_window`。缺少用量字段代表没有采样，不是零。

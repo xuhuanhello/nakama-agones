@@ -363,15 +363,21 @@ type condition struct {
 	Status             string `json:"status"`
 	LastTransitionTime string `json:"lastTransitionTime"`
 }
+type containerResources struct {
+	Requests map[string]string `json:"requests"`
+	Limits   map[string]string `json:"limits"`
+}
 type podObject struct {
 	Metadata meta `json:"metadata"`
 	Spec     struct {
 		NodeName   string `json:"nodeName"`
 		Containers []struct {
-			Name string `json:"name"`
+			Name      string             `json:"name"`
+			Resources containerResources `json:"resources"`
 		} `json:"containers"`
 		InitContainers []struct {
-			Name string `json:"name"`
+			Name      string             `json:"name"`
+			Resources containerResources `json:"resources"`
 		} `json:"initContainers"`
 	} `json:"spec"`
 	Status struct {
@@ -412,12 +418,46 @@ type nodeObject struct {
 	} `json:"status"`
 }
 type resourceMetric struct {
+	Timestamp  string            `json:"timestamp"`
+	Window     string            `json:"window"`
 	Metadata   meta              `json:"metadata"`
 	Usage      map[string]string `json:"usage"`
 	Containers []struct {
+		Name  string            `json:"name"`
 		Usage map[string]string `json:"usage"`
 	} `json:"containers"`
 }
+
+// Additive projection: retain the legacy name list and never turn absent usage into zero.
+func projectContainers(p podObject, metric resourceMetric) []any {
+	usage := map[string]map[string]string{}
+	for _, c := range metric.Containers {
+		usage[c.Name] = c.Usage
+	}
+	out := []any{}
+	appendContainer := func(name, kind string, resources containerResources) {
+		row := map[string]any{"name": name, "kind": kind}
+		addUsage(row, usage[name])
+		if len(usage[name]) > 0 {
+			row["metrics_timestamp"] = metric.Timestamp
+			row["metrics_window"] = metric.Window
+		}
+		request, limit := map[string]any{}, map[string]any{}
+		addUsage(request, resources.Requests)
+		addUsage(limit, resources.Limits)
+		row["requests"] = request
+		row["limits"] = limit
+		out = append(out, row)
+	}
+	for _, c := range p.Spec.Containers {
+		appendContainer(c.Name, "app", c.Resources)
+	}
+	for _, c := range p.Spec.InitContainers {
+		appendContainer(c.Name, "init", c.Resources)
+	}
+	return out
+}
+
 type eventObject struct {
 	Metadata       meta   `json:"metadata"`
 	Type           string `json:"type"`
@@ -576,7 +616,9 @@ func (r regionSource) snapshot(ctx context.Context) any {
 	esOut := []any{}
 	for i := range namespaces {
 		pm := map[string]map[string]string{}
+		detailedMetrics := map[string]resourceMetric{}
 		for _, p := range metrics[i] {
+			detailedMetrics[p.Metadata.Name] = p
 			cpu, mem := 0.0, 0.0
 			for _, c := range p.Containers {
 				cpu += quantity(c.Usage["cpu"])
@@ -603,7 +645,7 @@ func (r regionSource) snapshot(ctx context.Context) any {
 					reason = c.State.Waiting.Reason
 				}
 			}
-			m := map[string]any{"name": p.Metadata.Name, "namespace": p.Metadata.Namespace, "node": p.Spec.NodeName, "phase": p.Status.Phase, "worker_id": p.Metadata.Labels["nakama-agones.io/worker"], "ready": isReady(p.Status.Conditions), "restarts": restarts, "reason": safeText(reason), "containers": containers}
+			m := map[string]any{"name": p.Metadata.Name, "namespace": p.Metadata.Namespace, "node": p.Spec.NodeName, "phase": p.Status.Phase, "worker_id": p.Metadata.Labels["nakama-agones.io/worker"], "ready": isReady(p.Status.Conditions), "restarts": restarts, "reason": safeText(reason), "containers": containers, "container_details": projectContainers(p, detailedMetrics[p.Metadata.Name])}
 			for _, condition := range p.Status.Conditions {
 				if condition.Type == "PodScheduled" && condition.Status == "False" && condition.Reason == "Unschedulable" {
 					text := strings.ToLower(condition.Message)

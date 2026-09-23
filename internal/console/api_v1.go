@@ -386,7 +386,7 @@ func projectRows(resource string, fleet map[string]any, regions []map[string]any
 					if textField(pod, "worker_id") == textField(worker, "id") {
 						row["node"] = pod["node"]
 						row["namespace"] = pod["namespace"]
-						row["pod_status"] = fields(pod, "name", "namespace", "node", "phase", "ready", "restarts", "reason", "containers", "cpu_millicores", "memory_bytes", "scheduling_capacity_shortage")
+						row["pod_status"] = fields(pod, "name", "namespace", "node", "phase", "ready", "restarts", "reason", "containers", "container_details", "cpu_millicores", "memory_bytes", "scheduling_capacity_shortage")
 					}
 				}
 			}

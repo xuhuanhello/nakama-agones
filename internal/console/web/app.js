@@ -392,6 +392,18 @@
     return allPods().find((pod) => pod.region === worker.region && (worker.pod ? pod.name === worker.pod && (!pod.worker_id || pod.worker_id === worker.id) : pod.worker_id === worker.id));
   }
   const isGamePod = (pod) => /^[a-f0-9]{32}$/.test(pod.worker_id || "") || !!workerFor(pod);
+  const internalPodTypes = new Map([["agones-controller", "Agones 控制器"], ["agones-extensions", "Agones 扩展服务"]]);
+  function podPurpose(pod) {
+    if (isGamePod(pod)) return "游戏 Pod";
+    const details = list(pod.container_details);
+    const appContainers = details.length ? details.filter((container) => container?.kind === "app").map((container) => container.name) : list(pod.containers);
+    const knownTypes = [...new Set(appContainers.map((name) => internalPodTypes.get(name)).filter(Boolean))];
+    return knownTypes.length ? knownTypes.join(" / ") + " Pod" : "未知用途 Pod";
+  }
+  function podPurposeNote(pod) {
+    const purpose = podPurpose(pod);
+    return purpose === "游戏 Pod" ? "游戏 Pod · 可见 Pod 的子集" : purpose === "未知用途 Pod" ? "未知用途 Pod · 未关联 Fleet 游戏" : purpose + " · Agones 系统工作负载";
+  }
   function canReadGameLogs(pod, container) {
     const id = pod.worker_id || workerFor(pod)?.id;
     return !!id && pod.name === "nag-" + id && /^[a-f0-9]{32}$/.test(id) && list(pod.containers).includes(container) && ["game", "agones-gameserver-sidecar"].includes(container);
@@ -512,7 +524,7 @@
     $("read-only-banner").hidden = enabled;
     setText($("read-only-banner"), managementError ? "实例管理暂不可用：" + errorText({ code: managementError }) + " 房间、玩家与日志仍可查看。" : fleet()?.ok === false || state.snapshotError ? "Fleet 最新状态不可用，管理入口暂时关闭。页面保留上次成功记录，仍可查询日志；此问题不代表控制台登录失效。" : "只读观测：可以查看房间、玩家、资源指标与日志。此部署尚未启用实例排空或创建重试；不影响匹配与对局。");
     $("retry-creation-button").hidden = !enabled;
-    setText($("worker-management-note"), "Pod CPU / 内存是容器合计，房间不提供独立资源指标。游戏 Pod 可查看业务诊断与已授权容器日志；其他 Pod 不提供日志入口。" + (enabled ? "排空针对游戏进程：只停止接纳新房间，已有对局正常结束后退出。" : "当前游戏进程排空暂不可用。"));
+    setText($("worker-management-note"), "Pod CPU / 内存是容器合计，房间不提供独立资源指标。游戏 Pod 可查看业务诊断与已授权容器日志；非游戏 Pod 不提供日志入口。" + (enabled ? "排空针对游戏进程：只停止接纳新房间，已有对局正常结束后退出。" : "当前游戏进程排空暂不可用。"));
     if (!enabled && state.confirmScope === "fleet" && $("confirm-dialog").open) $("confirm-dialog").close("cancel");
     // Capability changes apply immediately, including a hidden page's old buttons.
     for (const item of document.querySelectorAll("[data-management-action]")) item.hidden = !enabled;
@@ -542,7 +554,7 @@
     const nodeLinks = node("div", "topology-links"); nodeLinks.append(button("查看 VPS", () => setView("nodes"), "button small quiet")); nodeCard.append(nodeLinks);
     const podCard = keyed(node("article", "topology-card"), "pods"), podAmount = node("div", "topology-value", complete ? count(visiblePods.length) : "—");
     podAmount.append(node("span", "", "个可见 Pod")); podCard.append(node("h3", "", "Pod · VPS 上的容器组"), podAmount, node("p", "", observedScope()));
-    const subset = node("div", "topology-subset"); subset.append(button("其中游戏 Pod " + (complete ? count(gamePods.length) : "—"), () => showPods({ kind: "game" }), "button small"), button("其他 Pod " + (complete ? count(visiblePods.length - gamePods.length) : "—"), () => showPods({ kind: "other" }), "button small quiet"), node("p", "pod-subtitle", "游戏 Pod 内：Unity 游戏进程 + Agones sidecar；对局房间属于游戏进程。")); podCard.append(subset);
+    const subset = node("div", "topology-subset"); subset.append(button("其中游戏 Pod " + (complete ? count(gamePods.length) : "—"), () => showPods({ kind: "game" }), "button small"), button("非游戏 Pod " + (complete ? count(visiblePods.length - gamePods.length) : "—"), () => showPods({ kind: "other" }), "button small quiet"), node("p", "pod-subtitle", "游戏 Pod 内：Unity 游戏进程 + Agones sidecar；对局房间属于游戏进程。")); podCard.append(subset);
     patchRegion($("topology-overview"), [nodeCard, podCard]);
     const blocked = typeof fleet()?.creation_blocked_reason === "string" && fleet().creation_blocked_reason !== "";
     $("creation-banner").hidden = !blocked; setText($("creation-reason"), blocked ? fleet().creation_blocked_reason : "");
@@ -605,7 +617,8 @@
       actions.append(button("Pod 详情", () => openDetail("pod", podKey(pod)), "button small quiet"));
       if (canReadGameLogs(pod, "game")) actions.append(button("游戏日志", () => openLogs(podLogTarget(pod)), "button small quiet"));
       const title = button(pod.name, () => openDetail("pod", podKey(pod)), "id-button identifier pod-name");
-      return { key: podKey(pod), cells: [cell(title, text(pod.namespace) + (pod.stale ? " · 上次记录" : "")), badge(game ? "游戏 Pod" : "其他 Pod", game ? "info" : ""), cell(host ? identifierButton(host.name, () => openDetail("node", nodeKey(host))) : pod.node || "尚未调度", pod.region), cell(badge(pod.phase), "Ready " + (pod.ready === true ? "True" : pod.ready === false ? "False" : "未知")), cell(list(pod.containers).join("、") || "未返回", pod.reason || ""), cell(cpu(pod.cpu_millicores), bytes(pod.memory_bytes)), worker ? cell(count(worker.occupied_rooms) + " / " + count(worker.max_rooms), "游戏进程 · " + text(labels[workerStatus(worker)] || workerStatus(worker))) : game ? "Fleet 记录未取得" : "不适用", actions] };
+      const purpose = podPurpose(pod);
+      return { key: podKey(pod), cells: [cell(title, text(pod.namespace) + (pod.stale ? " · 上次记录" : "")), badge(purpose, game || purpose.startsWith("Agones ") ? "info" : ""), cell(host ? identifierButton(host.name, () => openDetail("node", nodeKey(host))) : pod.node || "尚未调度", pod.region), cell(badge(pod.phase), "Ready " + (pod.ready === true ? "True" : pod.ready === false ? "False" : "未知")), cell(list(pod.containers).join("、") || "未返回", pod.reason || ""), cell(cpu(pod.cpu_millicores), bytes(pod.memory_bytes)), worker ? cell(count(worker.occupied_rooms) + " / " + count(worker.max_rooms), "游戏进程 · " + text(labels[workerStatus(worker)] || workerStatus(worker))) : game ? "Fleet 记录未取得" : "不适用", actions] };
     }), observed ? "观察范围内没有符合筛选的 Pod。调度记录不会作为 Pod 填入此表。" : "Pod 清单尚未取得，未将缺失数据显示为零。");
     const orphaned = workers().filter((worker) => !podFor(worker)), recordQuery = $("record-search").value.trim().toLowerCase(), recordRegion = $("record-region").value, scope = $("record-scope").value;
     setText($("worker-count"), state.goodFleet ? count(orphaned.length) + " 条 · 未结束 " + count(orphaned.filter((worker) => !WORKER_TERMINAL.has(worker.state)).length) : "尚无可用记录");
@@ -1195,7 +1208,7 @@
         content.push(detailGrid([["节点名", host.name], ["地区", host.region], ["角色标签", nodeRole(host.role)], ["Ready 状态", nodeReadyStatus(host) + " · " + nodeReadyLabel(host)], ["Ready 最近变更", time(host.ready_last_transition_at)], ["调度暂停", host.unschedulable ? "是" : "否"], [address.label, address.value], ["内网 IP · InternalIP", nodePrivateIP(host)], ["CPU 使用 / 可分配", cpu(host.cpu_millicores) + " / " + cpu(host.cpu_allocatable_millicores)], ["内存使用 / 可分配", bytes(host.memory_bytes) + " / " + bytes(host.memory_allocatable_bytes)], ["观察范围内 Pod", count(pods.length)]]));
         content.push(keyed(node("p", "table-note", "地址来自 Node.status.addresses；ExternalIP 未上报时才显示明确标注的管理备注。备注不修改节点网络，也不能用于退役确认。Ready=False / Unknown 不等于云 VPS 已关机、到期或永久退役。"), "node-address-note"));
         const podTable = keyed(node("div", "table-wrap"), "node-pods");
-        table(podTable, ["可见 Pod", "命名空间", "阶段", "用途"], pods.map((item) => { const pod = { ...item, region: host.region }; return { key: podKey(pod), cells: [button(pod.name, () => openDetail("pod", podKey(pod)), "id-button identifier pod-name"), pod.namespace, badge(pod.phase), isGamePod(pod) ? "游戏 Pod" : "其他 Pod"] }; }), "当前观察范围没有此节点的 Pod；不代表节点没有其他系统工作负载。");
+        table(podTable, ["可见 Pod", "命名空间", "阶段", "用途"], pods.map((item) => { const pod = { ...item, region: host.region }; return { key: podKey(pod), cells: [button(pod.name, () => openDetail("pod", podKey(pod)), "id-button identifier pod-name"), pod.namespace, badge(pod.phase), podPurpose(pod)] }; }), "当前观察范围没有此节点的 Pod；不代表节点没有其他系统工作负载。");
         const podActions = keyed(node("div", "detail-actions"), "node-pod-actions"); podActions.append(button("在工作负载页查看此节点的 Pod", () => showPods({ region: host.region, host: host.name })));
         content.push(podTable, podActions, retirementControl(host));
       } else if (detail.kind === "pod") {
@@ -1206,14 +1219,18 @@
           empty(body, "当前观察快照已没有此 Pod。它不会继续显示为运行资源；请核对区域读取状态，或查看保留的调度记录。", worker ? button("查看 Fleet 调度记录", () => openDetail("worker", worker.id)) : undefined); return;
         }
         const worker = workerFor(pod), host = allNodes().find((item) => item.region === pod.region && item.name === pod.node);
-        content.push(detailGrid([["Pod 名称", pod.name], ["命名空间", pod.namespace], ["地区", pod.region], ["所在 VPS / 节点", pod.node || "尚未调度"], ["Pod 阶段", text(pod.phase) + " · " + text(labels[pod.phase])], ["Pod Ready", pod.ready === true ? "True" : pod.ready === false ? "False" : "未知"], ["用途", isGamePod(pod) ? "游戏 Pod · 可见 Pod 的子集" : "其他 Pod · 未关联 Fleet 游戏"], ["Pod CPU", cpu(pod.cpu_millicores)], ["Pod 内存 · 容器合计", bytes(pod.memory_bytes)], ["容器累计重启", count(pod.restarts)], ["原因", pod.reason]]));
+        content.push(detailGrid([["Pod 名称", pod.name], ["命名空间", pod.namespace], ["地区", pod.region], ["所在 VPS / 节点", pod.node || "尚未调度"], ["Pod 阶段", text(pod.phase) + " · " + text(labels[pod.phase])], ["Pod Ready", pod.ready === true ? "True" : pod.ready === false ? "False" : "未知"], ["用途", podPurposeNote(pod)], ["Pod CPU", cpu(pod.cpu_millicores)], ["Pod 内存 · 容器合计", bytes(pod.memory_bytes)], ["容器累计重启", count(pod.restarts)], ["原因", pod.reason]]));
         if (host) { const actions = keyed(node("div", "detail-actions"), "pod-host"); actions.append(button("查看所在 VPS", () => openDetail("node", nodeKey(host)))); content.push(actions); }
-        const containers = workerDetailSection("pod-containers", "容器", "以下是 API 返回的容器名称清单，可能包含初始化容器；未提供各容器的独立状态、类型或用量，不能据此推断它们同时运行。Pod CPU / 内存为已采集容器合计。");
+        const containers = workerDetailSection("pod-containers", "容器", "CPU / 内存来自 Kubernetes 容器采样，配额来自 Pod 规格。未取得采样显示未知，不能当作零；初始化容器不一定仍在运行。");
         const containerTable = node("div", "table-wrap");
-        table(containerTable, ["容器名称", "已知职责", "日志"], list(pod.containers).map((name) => ({ key: name, cells: [node("span", "identifier", name), isGamePod(pod) && name === "game" ? "游戏进程 · 承载业务房间" : isGamePod(pod) && name === "agones-gameserver-sidecar" ? "Agones 生命周期协作" : "未标注，不按名称推断", canReadGameLogs(pod, name) ? button("查看 " + (name === "game" ? "游戏" : "sidecar") + " 日志", () => openLogs(podLogTarget(pod), name), "button small quiet") : "当前日志入口未授权"] })), "当前 API 未提供容器名称清单。");
+        const containerRows = list(pod.container_details).length ? list(pod.container_details) : list(pod.containers).map((name) => ({ name }));
+        table(containerTable, ["容器 / 类型", "当前 CPU / 内存", "CPU 申请 / 上限", "内存申请 / 上限", "采样", "日志"], containerRows.map((item) => {
+          const name = item.name;
+          return { key: name, cells: [cell(name, item.kind === "init" ? "初始化容器" : item.kind === "app" ? "应用容器" : "类型未知"), cell(cpu(item.cpu_millicores), bytes(item.memory_bytes)), cell(cpu(item.requests?.cpu_millicores), cpu(item.limits?.cpu_millicores)), cell(bytes(item.requests?.memory_bytes), bytes(item.limits?.memory_bytes)), cell(item.metrics_timestamp ? time(item.metrics_timestamp, true) : "未知", item.metrics_window ? "窗口 " + item.metrics_window : "未取得采样"), canReadGameLogs(pod, name) ? button("查看 " + (name === "game" ? "游戏" : "sidecar") + " 日志", () => openLogs(podLogTarget(pod), name), "button small quiet") : "当前日志入口未授权"] };
+        }), "当前 API 未提供容器名称清单。");
         containers.append(containerTable); content.push(containers);
         if (worker) content.push(...workerBusinessDetails(worker, pod));
-        else content.push(keyed(node("p", "inline-note", isGamePod(pod) ? "此游戏 Pod 有 worker 标签，但 Fleet 快照尚无匹配的调度记录。房间、容量和游戏进程诊断暂不可用，未视为零。" : "此 Pod 没有 Fleet 游戏业务关联，不展示房间或游戏进程指标。可见资源不代表有权读取其日志。"), "pod-business-unavailable"));
+        else content.push(keyed(node("p", "inline-note", isGamePod(pod) ? "此游戏 Pod 有 worker 标签，但 Fleet 快照尚无匹配的调度记录。房间、容量和游戏进程诊断暂不可用，未视为零。" : "此非游戏 Pod 没有 Fleet 游戏业务关联，不展示房间或游戏进程指标。可见资源不代表有权读取其日志。"), "pod-business-unavailable"));
       } else {
         const worker = workers().find((item) => item.id === detail.id);
         setText($("detail-eyebrow"), "Fleet 调度记录 · 非 Pod 资源"); setText($("detail-title"), text(worker?.id || detail.id));
