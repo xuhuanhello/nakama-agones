@@ -1,5 +1,7 @@
 # Documentation
 
+- [GameFleet 候选薄适配与 pilot 配置](gamefleet-pilot.md)：新平台接入、RPC 与隔离验证；默认仍保留旧模式。
+
 Start with the workflow below. The README describes scope; this index separates installation, daily operation and reference material. Example addresses and credentials are never production configuration.
 
 ## 1. Understand the components

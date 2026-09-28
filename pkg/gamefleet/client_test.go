@@ -1,0 +1,392 @@
+package gamefleet
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+func clientConfig(origin string) Config {
+	return Config{URL: origin, Key: "gfbiz_" + strings.Repeat("a", 43), ApplicationID: "app-one", PlacementID: "placement-one", RevisionID: "revision-one", Region: "us-west", Compatibility: "dm-v1"}
+}
+func testReservation() Reservation {
+	now := time.Date(2026, 9, 28, 1, 0, 0, 0, time.UTC)
+	return Reservation{ReservationID: "reservation-one", AllocationID: "allocation-one", RoomID: "room-one", ApplicationID: "app-one", PlacementID: "placement-one", RevisionID: "revision-one", Region: "us-west", State: "prepared", CreatedAt: now, UpdatedAt: now}
+}
+func testAssignment(previous int64) Assignment {
+	return Assignment{Ticket: Ticket{ID: "ticket-one", State: "issued", Token: "gft1.YQ." + strings.Repeat("a", 86), Generation: previous + 1, ExpiresAt: time.Now().Add(time.Minute)}, Endpoint: &Endpoint{Address: "203.0.113.7", Ports: []Port{{Name: "game", Protocol: "UDP", Port: 20000}}}}
+}
+func respond(w http.ResponseWriter, data any) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"data": data, "requestId": "http-test"})
+}
+func mustClient(t *testing.T, origin string) *Client {
+	t.Helper()
+	c, err := NewClient(clientConfig(origin))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(c.Close)
+	return c
+}
+func statusError(t *testing.T, err error, want int) {
+	t.Helper()
+	var e *Error
+	if !errors.As(err, &e) || e.Status != want {
+		t.Fatalf("error = %v, want status %d", err, want)
+	}
+}
+
+func TestClientRejectsNonLoopbackAndAmbiguousOrigins(t *testing.T) {
+	for _, origin := range []string{"", "https://127.0.0.1:17682", "http://localhost:17682", "http://192.0.2.1:17682", "http://127.0.0.1", "http://127.0.0.1:0", "http://127.0.0.1:99999", "http://127.0.0.1:017682", "http://user:pass@127.0.0.1:17682", "http://127.0.0.1:17682/business", "http://127.0.0.1:17682?x=1", "http://127.0.0.1:17682?", "http://127.0.0.1:17682/#x", "http://[::1%25lo0]:17682", "http://127.0.0.1:17682/%2f"} {
+		t.Run(origin, func(t *testing.T) {
+			if c, err := NewClient(clientConfig(origin)); err == nil {
+				c.Close()
+				t.Fatal("invalid origin accepted")
+			}
+		})
+	}
+	for _, origin := range []string{"http://127.0.0.1:17682", "http://[::1]:17682/"} {
+		c, err := NewClient(clientConfig(origin))
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.Close()
+	}
+	for _, change := range []func(*Config){func(c *Config) { c.ApplicationID = "../app" }, func(c *Config) { c.PlacementID = "" }, func(c *Config) { c.RevisionID = "bad revision" }, func(c *Config) { c.Region = " west" }, func(c *Config) { c.Compatibility = "v1\n" }, func(c *Config) { c.Key = "secret\nheader" }} {
+		cfg := clientConfig("http://127.0.0.1:17682")
+		change(&cfg)
+		if c, err := NewClient(cfg); err == nil {
+			c.Close()
+			t.Fatal("invalid config accepted")
+		}
+	}
+}
+
+func TestClientHTTPContractAndExactReplay(t *testing.T) {
+	var bodies [][]byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer "+clientConfig("").Key || r.URL.RawQuery != "" || r.Header.Get("Cookie") != "" || r.Header.Get("Origin") != "" {
+			t.Error("unexpected credential or ambient authority")
+		}
+		if r.Method != "GET" && r.Header.Get("Content-Type") != "application/json" {
+			t.Error("missing content type")
+		}
+		var payload map[string]any
+		if r.Method != "GET" {
+			if json.NewDecoder(r.Body).Decode(&payload) != nil {
+				t.Fatal("invalid request JSON")
+			}
+		}
+		switch r.URL.Path {
+		case "/business/v1/caller":
+			respond(w, Scope{CallerID: "caller-one", ApplicationID: "app-one", PlacementID: "placement-one", RevisionID: "revision-one", Region: "us-west", Operations: []string{"reserve", "read", "cancel", "assignment", "resume"}})
+		case "/business/v1/reservations/current":
+			if !reflect.DeepEqual(payload, map[string]any{"version": RoomVersion, "participantId": "player-one"}) {
+				t.Errorf("current payload: %v", payload)
+			}
+			respond(w, CurrentResult{Current: &Current{Reservation: testReservation(), ConnectionGeneration: 2}})
+		case "/business/v1/reservations":
+			if payload["version"] != RoomVersion || payload["compatibility"] != "dm-v1" || payload["idempotencyKey"] != "request-1234" {
+				t.Errorf("reserve payload: %v", payload)
+			}
+			respond(w, ReservationResult{Reservation: testReservation()})
+		case "/business/v1/reservations/allocation-one/resume":
+			expected := map[string]any{"version": TicketVersion, "participantId": "player-one", "idempotencyKey": "attempt-1234", "previousConnectionGeneration": float64(2)}
+			if !reflect.DeepEqual(payload, expected) {
+				t.Errorf("resume payload: %v", payload)
+			}
+			raw, _ := json.Marshal(payload)
+			bodies = append(bodies, raw)
+			respond(w, AssignmentResult{Assignment: testAssignment(2), Replay: len(bodies) > 1})
+		case "/business/v1/reservations/allocation-one/cancel":
+			if len(payload) != 0 {
+				t.Error("cancel body must be empty")
+			}
+			r := testReservation()
+			r.CancellationRequested = true
+			respond(w, ReservationResult{Reservation: r})
+		default:
+			t.Errorf("unexpected request: %s", r.URL.Path)
+			w.WriteHeader(404)
+		}
+	}))
+	defer server.Close()
+	c := mustClient(t, server.URL)
+	ctx := context.Background()
+	if err := c.CheckScope(ctx); err != nil {
+		t.Fatal(err)
+	}
+	cur, err := c.Current(ctx, "player-one")
+	if err != nil || cur.Current.ConnectionGeneration != 2 {
+		t.Fatalf("current: %v", err)
+	}
+	if _, err = c.Reserve(ctx, "request-1234", []string{"player-one", "player-two"}); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if _, err = c.Issue(ctx, "allocation-one", "player-one", "attempt-1234", 2, true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(bodies) != 2 || string(bodies[0]) != string(bodies[1]) {
+		t.Fatal("retry changed wire identity")
+	}
+	if _, err = c.Cancel(ctx, "allocation-one"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestClientRejectsRedirectAndIgnoresProxy(t *testing.T) {
+	var captured atomic.Int64
+	sink := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { captured.Add(1); respond(w, CurrentResult{}) }))
+	defer sink.Close()
+	t.Setenv("HTTP_PROXY", sink.URL)
+	t.Setenv("ALL_PROXY", sink.URL)
+	t.Setenv("NO_PROXY", "")
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { http.Redirect(w, r, sink.URL, 307) }))
+	defer origin.Close()
+	c := mustClient(t, origin.URL)
+	_, err := c.Current(context.Background(), "player-one")
+	statusError(t, err, 503)
+	if captured.Load() != 0 || c.http.Transport.(*http.Transport).Proxy != nil || c.http.Jar != nil {
+		t.Fatal("credential could escape to redirect/proxy/cookie jar")
+	}
+}
+
+func TestClientMalformedResponsesAndScopeChangesFailClosed(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(CurrentResult) any
+		raw    string
+		media  string
+	}{
+		{name: "missing", raw: `{"data":{},"requestId":"x"}`},
+		{name: "null envelope", raw: `{"data":null,"requestId":"x"}`},
+		{name: "trailing", raw: `{"data":{"current":null}} {}`},
+		{name: "unknown", raw: `{"data":{"current":null,"token":"secret"}}`},
+		{name: "wrong media", raw: `{"data":{"current":null}}`, media: "text/plain"},
+		{name: "too large", raw: strings.Repeat("x", (64<<10)+1)},
+		{name: "foreign application", mutate: func(r CurrentResult) any { r.Current.Reservation.ApplicationID = "other"; return r }},
+		{name: "foreign placement", mutate: func(r CurrentResult) any { r.Current.Reservation.PlacementID = "other"; return r }},
+		{name: "foreign revision", mutate: func(r CurrentResult) any { r.Current.Reservation.RevisionID = "other"; return r }},
+		{name: "foreign region", mutate: func(r CurrentResult) any { r.Current.Reservation.Region = "other"; return r }},
+		{name: "completed held", mutate: func(r CurrentResult) any { r.Current.Reservation.State = "completed"; return r }},
+		{name: "missing generation", mutate: func(r CurrentResult) any {
+			return map[string]any{"current": map[string]any{"reservation": r.Current.Reservation}}
+		}},
+		{name: "bad generation", mutate: func(r CurrentResult) any { r.Current.ConnectionGeneration = MaxGeneration + 1; return r }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if test.raw != "" {
+					media := test.media
+					if media == "" {
+						media = "application/json"
+					}
+					w.Header().Set("Content-Type", media)
+					fmt.Fprint(w, test.raw)
+					return
+				}
+				respond(w, test.mutate(CurrentResult{Current: &Current{Reservation: testReservation()}}))
+			}))
+			defer s.Close()
+			_, err := mustClient(t, s.URL).Current(context.Background(), "player-one")
+			statusError(t, err, 502)
+		})
+	}
+}
+
+func TestClientScopePreflight(t *testing.T) {
+	for _, field := range []string{"application", "placement", "revision", "region", "permission"} {
+		t.Run(field, func(t *testing.T) {
+			s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				scope := Scope{CallerID: "caller-one", ApplicationID: "app-one", PlacementID: "placement-one", RevisionID: "revision-one", Region: "us-west", Operations: []string{"read", "reserve", "cancel", "assignment", "resume"}}
+				switch field {
+				case "application":
+					scope.ApplicationID = "other"
+				case "placement":
+					scope.PlacementID = "other"
+				case "revision":
+					scope.RevisionID = "other"
+				case "region":
+					scope.Region = "other"
+				case "permission":
+					scope.Operations = []string{"read"}
+				}
+				respond(w, scope)
+			}))
+			defer s.Close()
+			if err := mustClient(t, s.URL).CheckScope(context.Background()); err == nil {
+				t.Fatal("wrong scope accepted")
+			}
+		})
+	}
+}
+
+func TestClientErrorsAreSanitizedAndRequestsAreBounded(t *testing.T) {
+	for _, code := range []int{301, 401, 403, 404, 409, 422, 429, 500, 503} {
+		t.Run(fmt.Sprint(code), func(t *testing.T) {
+			s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(code)
+				fmt.Fprint(w, "credential-secret ticket-secret arbitrary-error")
+			}))
+			defer s.Close()
+			_, err := mustClient(t, s.URL).Current(context.Background(), "player-one")
+			want := code
+			if code == 301 || code >= 500 {
+				want = 503
+			}
+			statusError(t, err, want)
+			if strings.Contains(err.Error(), "secret") {
+				t.Fatal("server body leaked")
+			}
+		})
+	}
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		select {
+		case <-r.Context().Done():
+		case <-time.After(time.Second):
+		}
+	}))
+	defer s.Close()
+	c := mustClient(t, s.URL)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	_, err := c.Current(ctx, "player-one")
+	statusError(t, err, 503)
+	if c.http.Timeout <= 0 || c.http.Timeout > 10*time.Second {
+		t.Fatal("missing request timeout")
+	}
+}
+
+func TestClientRejectsInvalidRequestsBeforeHTTP(t *testing.T) {
+	var calls atomic.Int64
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls.Add(1); w.WriteHeader(500) }))
+	defer s.Close()
+	c := mustClient(t, s.URL)
+	ctx := context.Background()
+	_, e := c.Current(ctx, " player-one")
+	statusError(t, e, 422)
+	_, e = c.Reserve(ctx, "bad:key", []string{"one", "two"})
+	statusError(t, e, 422)
+	_, e = c.Reserve(ctx, "request-1234", []string{"one", "one"})
+	statusError(t, e, 422)
+	_, e = c.Cancel(ctx, "../other")
+	statusError(t, e, 422)
+	for _, v := range []struct {
+		gen    int64
+		resume bool
+	}{{1, false}, {0, true}, {-1, true}, {MaxGeneration, true}} {
+		_, e = c.Issue(ctx, "allocation-one", "player-one", "attempt-1234", v.gen, v.resume)
+		statusError(t, e, 422)
+	}
+	if calls.Load() != 0 {
+		t.Fatal("invalid request reached HTTP")
+	}
+}
+
+func TestClientAssignmentReplayShapes(t *testing.T) {
+	for _, state := range []string{"issued", "expired", "superseded"} {
+		t.Run(state, func(t *testing.T) {
+			a := testAssignment(2)
+			a.Ticket.State = state
+			if state != "issued" {
+				a.Ticket.Token = ""
+				a.Endpoint = nil
+			}
+			s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				respond(w, AssignmentResult{Assignment: a, Replay: true})
+			}))
+			defer s.Close()
+			out, err := mustClient(t, s.URL).Issue(context.Background(), "allocation-one", "player-one", "attempt-1234", 2, true)
+			if err != nil || out.Assignment.Ticket.State != state || !out.Replay {
+				t.Fatalf("%+v %v", out, err)
+			}
+		})
+	}
+	for _, change := range []func(*Assignment){func(a *Assignment) { a.Ticket.Generation = 9 }, func(a *Assignment) { a.Ticket.Token = "" }, func(a *Assignment) { a.Ticket.Token = "gft1.invalid" }, func(a *Assignment) { a.Endpoint = nil }, func(a *Assignment) { a.Endpoint.Address = "url.invalid" }, func(a *Assignment) { a.Endpoint.Address = "127.0.0.1" }, func(a *Assignment) { a.Endpoint.Address = "169.254.1.1" }, func(a *Assignment) { a.Endpoint.Ports[0].Port = 0 }, func(a *Assignment) { a.Endpoint.Ports[0].Protocol = "HTTP" }, func(a *Assignment) { a.Ticket.State = "superseded" }} {
+		a := testAssignment(2)
+		change(&a)
+		if validAssignment(a, 3) {
+			t.Fatal("malformed assignment accepted")
+		}
+	}
+}
+
+func TestConfigPrivateKeyFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "business.key")
+	t.Setenv("GAMEFLEET_BUSINESS_KEY_FILE", path)
+	t.Setenv("GAMEFLEET_BUSINESS_URL", "http://127.0.0.1:17682")
+	if _, err := ConfigFromEnv(); err == nil {
+		t.Fatal("missing key accepted")
+	}
+	if err := os.WriteFile(path, []byte(clientConfig("").Key+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := ConfigFromEnv()
+	if err != nil || cfg.Key != clientConfig("").Key {
+		t.Fatal("private newline key failed", err)
+	}
+	if err = os.Chmod(path, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = ConfigFromEnv(); err == nil {
+		t.Fatal("world-readable key accepted")
+	}
+	if err = os.Chmod(path, 0600); err != nil {
+		t.Fatal(err)
+	}
+	link := path + ".link"
+	if err = os.Symlink(path, link); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GAMEFLEET_BUSINESS_KEY_FILE", link)
+	if _, err = ConfigFromEnv(); err == nil {
+		t.Fatal("symlink accepted")
+	}
+}
+
+func TestRequiredLifecycleAndReplayFields(t *testing.T) {
+	r := testReservation()
+	raw, _ := json.Marshal(r)
+	var fields map[string]any
+	json.Unmarshal(raw, &fields)
+	delete(fields, "cancellationRequested")
+	raw, _ = json.Marshal(fields)
+	var decoded Reservation
+	if strictObject(raw, &decoded) == nil {
+		t.Fatal("missing cancellation flag accepted")
+	}
+	for _, body := range []string{`{"reservation":{}}`, `{"reservation":{},"replay":null}`} {
+		var out ReservationResult
+		if strictObject([]byte(body), &out) == nil {
+			t.Fatal("missing replay accepted")
+		}
+	}
+	a := testAssignment(2)
+	a.Ticket.State = "expired"
+	a.Ticket.Token = ""
+	a.Endpoint = nil
+	for _, replay := range []any{nil, false} {
+		s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			respond(w, map[string]any{"assignment": a, "replay": replay})
+		}))
+		c := mustClient(t, s.URL)
+		_, err := c.Issue(context.Background(), "allocation-one", "player-one", "attempt-1234", 2, true)
+		statusError(t, err, 502)
+		s.Close()
+	}
+}

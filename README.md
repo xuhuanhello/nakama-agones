@@ -2,6 +2,8 @@
 
 Self-hosted, multi-room game server orchestration for **Nakama Community 3.41.0 + K3s + Agones**. The companion [Unity package](https://github.com/xuhuanhello/agones-server-nakama-plugin-unity) integrates a Linux authoritative game process. This is an independent project; it does not load or modify the PlayFlow plugins.
 
+GameFleet migration candidate: [Nakama thin adapter and pilot configuration](docs/gamefleet-pilot.md). It is explicit opt-in; the default Agones backend remains unchanged. The player pilot is not deployed yet.
+
 ## Implements
 
 - Nakama FleetManager registration, two-player matchmaking, room/seat allocation, signed admission and reconnect tickets.

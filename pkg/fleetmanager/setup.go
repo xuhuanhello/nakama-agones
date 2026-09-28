@@ -3,12 +3,15 @@ package fleetmanager
 import (
 	"context"
 	"database/sql"
+	"fmt"
+	"os"
 	"time"
 
 	"github.com/heroiclabs/nakama-common/runtime"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/xuhuanhello/nakama-agones/internal/agones"
 	"github.com/xuhuanhello/nakama-agones/internal/state"
+	"github.com/xuhuanhello/nakama-agones/pkg/gamefleet"
 )
 
 // NewFromEnv creates a manager without installing hooks. Run the fleet DB
@@ -52,6 +55,14 @@ func NewFromEnv(ctx context.Context) (manager *Manager, close func(), err error)
 // RegisterFromEnv is the public library entry point for the included two-player
 // bridge. It owns the matchmaker-matched hook; compose existing game hooks first.
 func RegisterFromEnv(ctx context.Context, logger runtime.Logger, db *sql.DB, nk runtime.NakamaModule, initializer runtime.Initializer) error {
+	switch os.Getenv("NAKAMA_FLEET_BACKEND") {
+	case "gamefleet":
+		return gamefleet.RegisterFromEnv(ctx, logger, db, nk, initializer)
+	case "", "agones":
+		// Legacy remains the default until the player pilot is accepted.
+	default:
+		return fmt.Errorf("unsupported NAKAMA_FLEET_BACKEND")
+	}
 	m, close, err := NewFromEnv(ctx)
 	if err != nil {
 		return err
