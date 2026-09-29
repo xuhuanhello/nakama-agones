@@ -45,6 +45,29 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+      # The official Heroic Labs gateway redirects to Docker Hub. Configure the
+      # disposable hosted runner before any k3d containers exist, so both Docker
+      # pulls and its built-in BuildKit use Google's digest-verified Hub cache.
+      - name: Prefer Google's public Docker Hub cache
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+        run: |
+          test "$RUNNER_KIND" = github-hosted
+          python3 - <<'PYCONFIG'
+          import json
+          import os
+          from pathlib import Path
+          source = Path('/etc/docker/daemon.json')
+          config = json.loads(source.read_text()) if source.exists() else {}
+          mirrors = config.get('registry-mirrors', [])
+          config['registry-mirrors'] = ['https://mirror.gcr.io'] + [
+              url for url in mirrors if url.rstrip('/') != 'https://mirror.gcr.io'
+          ]
+          (Path(os.environ['RUNNER_TEMP']) / 'nakama-docker-daemon.json').write_text(json.dumps(config))
+          PYCONFIG
+          sudo install -m 0644 "$RUNNER_TEMP/nakama-docker-daemon.json" /etc/docker/daemon.json
+          sudo systemctl restart docker
+          docker info --format '{{json .RegistryConfig.Mirrors}}'
       - run: ./scripts/bootstrap-tools.sh
       - run: python3 scripts/local_cluster.py up
       - run: node scripts/smoke.mjs
