@@ -153,4 +153,4 @@ Cancel 示例：
 
 此脚本要求本机能运行 Go 1.27.1，并可能下载该工具链/模块；只使用临时 modfile 和源码 overlay，不修改任一仓库的 go.mod，不使用部署配置或真实凭据，不登录 VPS。测试 fixture 位于 `tests/contracts/gamefleet_business_test.go.txt`，依赖该 GameFleet 候选中的测试辅助函数。
 
-这不是 Nakama 进程内加载 `.so` 的验收，也不是 Fixed/FishNet 双人对局验收。后续仍需构建与 Nakama 3.41.0 ABI 一致的插件镜像，接入 Fixed 的新 RPC 与席位流程，再做隔离 Pod 的真实联机验证。
+上述 BusinessHandler 合约测试不等同于进程加载或真实双人对局。P4d 随后已完成[官方 Nakama 3.41.0 进程加载、认证 RPC 与权限失败退出验收](gamefleet-runtime-validation.md)。Fixed Linux 镜像、实际房间分配和 FishNet 双人对局仍待隔离试点验证。
