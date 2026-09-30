@@ -27,6 +27,9 @@ REPO = Path.cwd()
 RUNTIME_IMAGE = os.environ.get("GF_P4D_RUNTIME_IMAGE", "nakama-gamefleet-p4d:924ddf85")
 POSTGRES_IMAGE = "postgres:16-alpine"
 SYNTHETIC_KEY = "gfbiz_p4d_synthetic_only_0123456789abcdef"
+BACKEND = "gamefleet"
+SERVICE_ID = "service_p4d_fixture"
+IDENTITY_ISSUER = "issuer_p4d_fixture"
 APP_ID = "app_p4d_fixture"
 PLACEMENT_ID = "placement_p4d_fixture"
 REVISION_ID = "revision_p4d_fixture"
@@ -60,6 +63,7 @@ const (
 	region = "p4d-local"
 	roomVersion = "gamefleet.player-room.v1"
 	searchVersion = "gamefleet.player-search.v1"
+	serviceSearchVersion = "gamefleet.service-player-search.v1"
 )
 
 type fixtureSearch struct {
@@ -129,6 +133,13 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 func main() {
 	key := os.Getenv("GF_P4D_FIXTURE_KEY")
 	mode := os.Getenv("GF_P4D_FIXTURE_MODE")
+	service := os.Getenv("GF_P4D_FIXTURE_BACKEND") == "gamefleet-service"
+	scopePath, currentPath, beginPath := "/business/v1/caller", "/business/v1/reservations/current", "/business/v1/searches"
+	beginVersion := searchVersion
+	if service {
+		scopePath, currentPath, beginPath = "/business/v1/history/service", "/business/v1/history/reservations/current", "/business/v1/service-searches"
+		beginVersion = serviceSearchVersion
+	}
 	var mu sync.Mutex
 	searches := map[string]*fixtureSearch{}
 	requestIDs := map[string]string{}
@@ -140,7 +151,7 @@ func main() {
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 	})
-	mux.HandleFunc("/business/v1/caller", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(scopePath, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method"})
 			return
@@ -156,6 +167,18 @@ func main() {
 			return
 		}
 		log.Print("p4d_fixture_scope_ok")
+		if service {
+			operations := []string{"read", "cancel", "assignment", "resume"}
+			if mode == "history-read-only" {
+				operations = []string{"read"}
+				log.Print("p4d_fixture_scope_read_only")
+			}
+			writeBusiness(w, http.StatusOK, map[string]any{
+				"serviceId": "service_p4d_fixture", "applicationId": appID,
+				"identityIssuer": "issuer_p4d_fixture", "operations": operations,
+			}, "p4d-fixture-service")
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"data": map[string]any{
 				"callerId": "caller_p4d_fixture", "applicationId": appID,
@@ -165,7 +188,7 @@ func main() {
 			"requestId": "p4d-fixture-caller",
 		})
 	})
-	mux.HandleFunc("/business/v1/reservations/current", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(currentPath, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method"})
 			return
@@ -196,7 +219,7 @@ func main() {
 		log.Printf("p4d_fixture_current_bound user=%s allocation=%s", request.ParticipantID, reservation.AllocationID)
 		writeBusiness(w, http.StatusOK, map[string]any{"current": map[string]any{"reservation": reservation, "connectionGeneration": 0}}, "p4d-fixture-current")
 	})
-	mux.HandleFunc("/business/v1/searches", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(beginPath, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method"})
 			return
@@ -211,8 +234,9 @@ func main() {
 			ParticipantID string `json:"participantId"`
 			RequestID string `json:"requestId"`
 			Compatibility string `json:"compatibility"`
+			Region string `json:"region"`
 		}
-		if decodeFixtureJSON(r, &request) != nil || request.Version != searchVersion || request.Compatibility != "p4d-smoke" || request.RequestID == "" || request.ParticipantID == "" {
+		if decodeFixtureJSON(r, &request) != nil || request.Version != beginVersion || request.Compatibility != "p4d-smoke" || request.RequestID == "" || request.ParticipantID == "" || (service && request.Region != region) || (!service && request.Region != "") {
 			log.Print("p4d_fixture_bad_search_begin")
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_fixture_request"})
 			return
@@ -238,7 +262,7 @@ func main() {
 		}
 		writeBusiness(w, status, result, "p4d-fixture-search-begin")
 	})
-	mux.HandleFunc("/business/v1/searches/match", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(beginPath+"/match", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method"})
 			return
@@ -252,13 +276,14 @@ func main() {
 			Version string `json:"version"`
 			IdempotencyKey string `json:"idempotencyKey"`
 			Compatibility string `json:"compatibility"`
+			Region string `json:"region"`
 			Members []struct {
 				ParticipantID string `json:"participantId"`
 				SearchID string `json:"searchId"`
 				NakamaTicket string `json:"nakamaTicket"`
 			} `json:"members"`
 		}
-		if decodeFixtureJSON(r, &request) != nil || request.Version != searchVersion || request.Compatibility != "p4d-smoke" || request.IdempotencyKey == "" || len(request.Members) != 2 {
+		if decodeFixtureJSON(r, &request) != nil || request.Version != beginVersion || request.Compatibility != "p4d-smoke" || request.IdempotencyKey == "" || len(request.Members) != 2 || (service && request.Region != region) || (!service && request.Region != "") {
 			log.Print("p4d_fixture_bad_search_match")
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_fixture_request"})
 			return
@@ -303,7 +328,7 @@ func main() {
 		log.Printf("p4d_fixture_search_match replay=false allocation=%s", reservation.AllocationID)
 		writeBusiness(w, http.StatusAccepted, map[string]any{"reservation": reservation, "replay": false}, "p4d-fixture-search-match")
 	})
-	mux.HandleFunc("/business/v1/searches/", func(w http.ResponseWriter, r *http.Request) {
+	searchHandler := func(prefix, expectedVersion, use string) http.HandlerFunc { return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method"})
 			return
@@ -313,9 +338,9 @@ func main() {
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
 			return
 		}
-		path := strings.TrimPrefix(r.URL.Path, "/business/v1/searches/")
+		path := strings.TrimPrefix(r.URL.Path, prefix)
 		parts := strings.Split(path, "/")
-		if len(parts) != 2 || (parts[1] != "status" && parts[1] != "cancel") {
+		if len(parts) != 2 || (parts[1] != "status" && parts[1] != "cancel") || (use == "mapped" && parts[1] == "cancel") {
 			writeJSON(w, http.StatusNotFound, map[string]any{"error": "not_found"})
 			return
 		}
@@ -323,7 +348,7 @@ func main() {
 			Version string `json:"version"`
 			ParticipantID string `json:"participantId"`
 		}
-		if decodeFixtureJSON(r, &request) != nil || request.Version != searchVersion || request.ParticipantID == "" {
+		if decodeFixtureJSON(r, &request) != nil || request.Version != expectedVersion || request.ParticipantID == "" {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_fixture_request"})
 			return
 		}
@@ -345,6 +370,7 @@ func main() {
 			result := map[string]any{"search": searchObject(search, participantRooms[request.ParticipantID]), "replay": replay}
 			mu.Unlock()
 			log.Printf("p4d_fixture_search_cancel user=%s state=%s replay=%t", request.ParticipantID, search.State, replay)
+			log.Printf("p4d_fixture_search_route use=%s operation=cancel", use)
 			writeBusiness(w, http.StatusOK, result, "p4d-fixture-search-cancel")
 			return
 		}
@@ -352,8 +378,15 @@ func main() {
 		statusResult := map[string]any{"search": searchObject(search, participantRooms[request.ParticipantID])}
 		mu.Unlock()
 		log.Printf("p4d_fixture_search_status user=%s state=%s", request.ParticipantID, state)
+		log.Printf("p4d_fixture_search_route use=%s operation=status", use)
 		writeBusiness(w, http.StatusOK, statusResult, "p4d-fixture-search-status")
-	})
+	} }
+	if service {
+		mux.HandleFunc(beginPath+"/", searchHandler(beginPath+"/", serviceSearchVersion, "mapped"))
+		mux.HandleFunc("/business/v1/history/searches/", searchHandler("/business/v1/history/searches/", searchVersion, "history"))
+	} else {
+		mux.HandleFunc(beginPath+"/", searchHandler(beginPath+"/", searchVersion, "ordinary"))
+	}
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("p4d_fixture_unexpected method=%s path=%s", r.Method, r.URL.Path)
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "not_found"})
@@ -716,6 +749,7 @@ def start_fixture(name: str, image: str, mode: str) -> None:
         "--network", "container:" + db_container,
         "--env", "GF_P4D_FIXTURE_KEY=" + SYNTHETIC_KEY,
         "--env", "GF_P4D_FIXTURE_MODE=" + mode,
+        "--env", "GF_P4D_FIXTURE_BACKEND=" + BACKEND,
         image,
     ])
     wait_for_fixture(name, time.monotonic() + 15)
@@ -724,7 +758,7 @@ def start_fixture(name: str, image: str, mode: str) -> None:
 def start_nakama(name: str, config_path: Path, key_path: Path) -> None:
     dsn = f"postgres:{db_password}@127.0.0.1:5432/nakama?sslmode=disable"
     env = {
-        "NAKAMA_FLEET_BACKEND": "gamefleet",
+        "NAKAMA_FLEET_BACKEND": BACKEND,
         "GAMEFLEET_BUSINESS_URL": "http://127.0.0.1:17682",
         "GAMEFLEET_BUSINESS_KEY_FILE": "/run/secrets/gamefleet-business-key",
         "GAMEFLEET_APPLICATION_ID": APP_ID,
@@ -735,6 +769,20 @@ def start_nakama(name: str, config_path: Path, key_path: Path) -> None:
         # Tripwire: GameFleet selection must bypass the legacy Agones backend.
         "AGONES_FLEET_DATABASE_URL": "intentionally-not-a-dsn",
     }
+    if BACKEND == "gamefleet-service":
+        # Independent configuration must bypass both the legacy manager and
+        # ordinary caller setup. Neither malformed tripwire may be consulted.
+        env.update({
+            "GAMEFLEET_SERVICE_URL": "http://127.0.0.1:17682",
+            "GAMEFLEET_SERVICE_KEY_FILE": "/run/secrets/gamefleet-business-key",
+            "GAMEFLEET_SERVICE_ID": SERVICE_ID,
+            "GAMEFLEET_SERVICE_APPLICATION_ID": APP_ID,
+            "GAMEFLEET_SERVICE_IDENTITY_ISSUER": IDENTITY_ISSUER,
+            "GAMEFLEET_SERVICE_REGION": REGION,
+            "GAMEFLEET_SERVICE_COMPATIBILITY": COMPATIBILITY,
+            "GAMEFLEET_BUSINESS_URL": "not-an-origin",
+            "GAMEFLEET_BUSINESS_KEY_FILE": "/ordinary-key-must-not-be-read",
+        })
     args = [
         "run", "--detach", "--pull=never", "--platform", "linux/amd64", "--name", name,
         "--network", "container:" + db_container,
@@ -749,17 +797,22 @@ def start_nakama(name: str, config_path: Path, key_path: Path) -> None:
 
 
 def main() -> None:
-    global db_container, db_password, REPO, RUNTIME_IMAGE, EVIDENCE_PATH
+    global db_container, db_password, REPO, RUNTIME_IMAGE, EVIDENCE_PATH, BACKEND, SYNTHETIC_KEY
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", type=Path, default=Path.cwd(), help="Nakama Agones checkout (default: current directory)")
     parser.add_argument("--image", default=RUNTIME_IMAGE, help="already-built linux/amd64 runtime image tag")
     parser.add_argument("--evidence", type=Path, default=EVIDENCE_PATH, help="evidence JSON output path (contains no bearer credentials)")
     parser.add_argument("--temp-root", type=Path, default=Path(tempfile.gettempdir()), help="temporary build/configuration directory parent")
-    parser.add_argument("--positive-only", action="store_true", help="stop after runtime load and two authenticated current-null RPCs")
+    parser.add_argument("--backend", choices=("gamefleet", "gamefleet-service"), default="gamefleet", help="explicit isolated bridge mode")
+    parser.add_argument("--positive-only", action="store_true", help="run the positive search/match flow and omit startup-denial checks")
     args = parser.parse_args()
     REPO = args.repo.resolve()
     RUNTIME_IMAGE = args.image
     EVIDENCE_PATH = args.evidence
+    BACKEND = args.backend
+    if BACKEND == "gamefleet-service":
+        # Public, deterministic fixture bytes, never a real service credential.
+        SYNTHETIC_KEY = "gfsvc_" + base64.urlsafe_b64encode(bytes(range(32))).decode("ascii").rstrip("=")
     if not REPO.is_dir():
         raise SmokeError(f"expected checkout missing: {REPO}")
     suffix = uuid.uuid4().hex[:8]
@@ -784,6 +837,7 @@ def main() -> None:
         "status": "running",
         "scope": "isolated Nakama plugin, search RPC, matchmaker hook and synthetic binding check; no real GameFleet allocation or Fixed gameplay",
         "runtime_image": RUNTIME_IMAGE,
+        "backend": BACKEND,
         "prefix": prefix,
         "checks": [],
         "limits": [
@@ -854,10 +908,12 @@ def main() -> None:
             evidence["nakama_startup_log_excerpt"] = safe_log_excerpt(logs(nakama_container))
             raise SmokeError("Nakama did not reach /healthcheck after GameFleet initialization")
         ok_logs = logs(nakama_container)
-        marker = "GameFleet pilot bridge registered; allocation and capacity are owned by GameFleet"
+        marker = ("GameFleet service bridge registered; allocation and capacity are owned by GameFleet"
+                  if BACKEND == "gamefleet-service" else
+                  "GameFleet pilot bridge registered; allocation and capacity are owned by GameFleet")
         if marker not in ok_logs:
             raise SmokeError("Nakama process became healthy without the GameFleet module registration log")
-        if "Agones FleetManager registered" in ok_logs:
+        if "Agones FleetManager registered" in ok_logs or (BACKEND == "gamefleet-service" and "GameFleet pilot bridge registered" in ok_logs):
             raise SmokeError("legacy Agones FleetManager unexpectedly registered in GameFleet mode")
         evidence["checks"].append("live Nakama process loaded agones.so, ran GameFleet scope preflight, and registered the GameFleet bridge")
         evidence["checks"].append("legacy Agones FleetManager registration log absent; invalid legacy DB URL was bypassed")
@@ -871,8 +927,9 @@ def main() -> None:
             if status != 200:
                 raise SmokeError("synthetic authenticated current RPC did not return HTTP 200")
         ok_fixture_logs = logs(fixture_container)
-        if ok_fixture_logs.count("p4d_fixture_scope_ok") != 1 or ok_fixture_logs.count("p4d_fixture_current_null user=") != 2:
-            raise SmokeError("fixture did not observe one scope preflight and current-null for both synthetic devices")
+        expected_scopes = 2 if BACKEND == "gamefleet-service" else 1
+        if ok_fixture_logs.count("p4d_fixture_scope_ok") != expected_scopes or ok_fixture_logs.count("p4d_fixture_current_null user=") != 2:
+            raise SmokeError("fixture did not observe the exact scope preflights and current-null for both synthetic devices")
         evidence["checks"].append("two synthetic Nakama devices authenticated and each received current=null through gamefleet_current_v1")
 
         searches = [
@@ -957,9 +1014,21 @@ def main() -> None:
         if "p4d_fixture_search_owner_denied" not in ok_fixture_logs or "p4d_fixture_search_status user=" not in ok_fixture_logs or "state=cancelled" not in ok_fixture_logs:
             raise SmokeError("cross-user search access or queueing a cancelled search was not rejected")
         evidence["checks"].append("cross-participant status/cancel and a late MatchmakerAdd for a cancelled search are rejected")
+        if "p4d_fixture_unexpected" in ok_fixture_logs:
+            raise SmokeError("bridge called a route outside its selected backend")
+        if BACKEND == "gamefleet-service":
+            route_counts = {
+                "mapped_status": ok_fixture_logs.count("p4d_fixture_search_route use=mapped operation=status"),
+                "history_status": ok_fixture_logs.count("p4d_fixture_search_route use=history operation=status"),
+                "history_cancel": ok_fixture_logs.count("p4d_fixture_search_route use=history operation=cancel"),
+            }
+            if min(route_counts.values()) < 2 or "p4d_fixture_search_route use=ordinary" in ok_fixture_logs:
+                raise SmokeError("service matching and player History did not use distinct routes and protocols")
+            evidence["service_route_counts"] = route_counts
+            evidence["checks"].append("independent gfsvc mode uses mapped search admission and separate History status/cancel; no ordinary caller routes")
         evidence["synthetic_devices"] = 3
         evidence["business_fixture_requests"] = {
-            "caller_scope": 1,
+            "scope_preflights": expected_scopes,
             "current_null_before_match": 2,
             "search_begin_calls_including_replay": ok_fixture_logs.count("p4d_fixture_search_begin user="),
             "search_status_calls": ok_fixture_logs.count("p4d_fixture_search_status user="),
@@ -975,32 +1044,39 @@ def main() -> None:
 
         docker(["stop", "--time", "10", nakama_container], check=False, timeout=20)
         docker(["stop", "--time", "5", fixture_container], check=False, timeout=15)
-        start_fixture(fail_fixture_container, fixture_image, "deny")
-        start_nakama(fail_nakama_container, config_path, key_path)
-        fail_logs = ""
-        fail_state = "running"
-        fail_code = 0
-        deadline = time.monotonic() + 45
-        while time.monotonic() < deadline:
+        failure_cases = [("deny", "p4d_fixture_scope_denied",
+                          "GameFleet service search scope preflight failed" if BACKEND == "gamefleet-service" else
+                          "GameFleet business scope preflight failed", "HTTP 403")]
+        if BACKEND == "gamefleet-service":
+            failure_cases.append(("history-read-only", "p4d_fixture_scope_read_only",
+                                  "GameFleet history service scope preflight failed", "HTTP 200; required History operations absent"))
+        evidence["scope_failures"] = []
+        for failure_mode, fixture_marker, failure_marker, fixture_status in failure_cases:
+            start_fixture(fail_fixture_container, fixture_image, failure_mode)
+            start_nakama(fail_nakama_container, config_path, key_path)
+            fail_state, fail_code = "running", 0
+            deadline = time.monotonic() + 45
+            while time.monotonic() < deadline:
+                fail_state, fail_code = container_state(fail_nakama_container)
+                if fail_state != "running":
+                    break
+                time.sleep(0.5)
             fail_logs = logs(fail_nakama_container)
-            fail_state, _ = container_state(fail_nakama_container)
-            if fail_state != "running":
-                _, fail_code = container_state(fail_nakama_container)
-                break
-            time.sleep(0.5)
-        fail_logs = logs(fail_nakama_container)
-        fixture_fail_logs = logs(fail_fixture_container)
-        if "p4d_fixture_scope_denied" not in fixture_fail_logs:
-            raise SmokeError("scope-denial fixture was not called")
-        if marker in fail_logs or "Agones FleetManager registered" in fail_logs:
-            raise SmokeError("scope-denial path registered a fleet backend")
-        if "GameFleet business scope preflight failed" not in fail_logs:
-            raise SmokeError("Nakama logs did not report the GameFleet scope preflight failure")
-        if fail_state != "exited" or fail_code == 0:
-            raise SmokeError(f"Nakama did not abort with a nonzero exit after scope preflight failure (state={fail_state}, code={fail_code})")
-        evidence["checks"].append("Business scope denial made the Nakama process exit nonzero before readiness")
-        evidence["scope_failure"] = {"fixture_status": "HTTP 403", "nakama_container_state": fail_state, "exit_code": fail_code}
-        evidence["checks"].append("invalid Business scope failed closed without falling back to Agones")
+            fixture_fail_logs = logs(fail_fixture_container)
+            if fixture_marker not in fixture_fail_logs:
+                raise SmokeError("scope-denial fixture was not called")
+            if marker in fail_logs or "Agones FleetManager registered" in fail_logs or "GameFleet pilot bridge registered" in fail_logs:
+                raise SmokeError("scope-denial path registered a fleet backend")
+            if failure_marker not in fail_logs:
+                raise SmokeError("Nakama logs did not report the expected scope preflight failure")
+            if failure_mode == "history-read-only" and fixture_fail_logs.count("p4d_fixture_scope_read_only") != 2:
+                raise SmokeError("read-only scope did not pass Search before failing the independent History preflight")
+            if fail_state != "exited" or fail_code == 0:
+                raise SmokeError(f"Nakama did not abort with a nonzero exit after scope preflight failure (state={fail_state}, code={fail_code})")
+            evidence["checks"].append(f"{failure_mode} scope made Nakama exit nonzero before readiness, without backend fallback")
+            evidence["scope_failures"].append({"mode": failure_mode, "fixture_status": fixture_status,
+                                                "nakama_container_state": fail_state, "exit_code": fail_code})
+            docker(["rm", "--force", fail_nakama_container, fail_fixture_container], check=False, timeout=20)
         evidence["status"] = "passed"
     except Exception as exc:
         evidence["status"] = "failed"

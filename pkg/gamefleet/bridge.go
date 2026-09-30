@@ -27,10 +27,13 @@ const (
 // Register owns the single matched hook, but never registers FleetManager,
 // database migrations, HTTP/admin endpoints or a background reconciler.
 func Register(initializer runtime.Initializer, backend Backend, cfg Config) error {
-	if backend == nil || !exactText(cfg.Region, 128) || !exactText(cfg.Compatibility, 128) {
+	return registerBridge(initializer, bridge{backend: backend, config: cfg})
+}
+
+func registerBridge(initializer runtime.Initializer, b bridge) error {
+	if initializer == nil || b.backend == nil || !exactText(b.config.Region, 128) || !exactText(b.config.Compatibility, 128) {
 		return errors.New("invalid GameFleet bridge configuration")
 	}
-	b := bridge{backend: backend, config: cfg}
 	if err := initializer.RegisterBeforeRt("MatchmakerAdd", b.before); err != nil {
 		return err
 	}
@@ -51,6 +54,9 @@ func Register(initializer runtime.Initializer, backend Backend, cfg Config) erro
 type bridge struct {
 	backend Backend
 	config  Config
+	// Existing records may be readable through History without being mapped to
+	// this matching service. Admission to Matchmaker uses this separate check.
+	matchingSearchStatus func(context.Context, string, string) (SearchStatus, error)
 }
 
 func authenticatedUser(ctx context.Context) (string, error) {
@@ -91,7 +97,11 @@ func (b bridge) before(ctx context.Context, _ runtime.Logger, _ *sql.DB, _ runti
 	if !attemptID.MatchString(id) {
 		return nil, runtime.NewError("owned search required", 3)
 	}
-	search, err := b.backend.SearchStatus(ctx, id, user)
+	status := b.backend.SearchStatus
+	if b.matchingSearchStatus != nil {
+		status = b.matchingSearchStatus
+	}
+	search, err := status(ctx, id, user)
 	if err != nil {
 		return nil, playerSearchError(err)
 	}
