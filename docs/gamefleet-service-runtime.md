@@ -1,6 +1,6 @@
 # GameFleet service runtime candidate
 
-`gamefleet-service` is an explicit Nakama runtime mode backed by a private GameFleet service credential (`gfsvc_`). It is a candidate configuration, not a deployed integration. The existing Agones default and ordinary `gamefleet` caller mode remain separate.
+The `gamefleet-service` candidate passed isolated M5i acceptance, but formal service cutover has not happened. It is an explicit Nakama runtime mode backed by a private GameFleet service credential (`gfsvc_`). The existing Agones default and ordinary `gamefleet` caller mode remain separate.
 
 Start from [`deploy/gamefleet-service.env.example`](../deploy/gamefleet-service.env.example). The adapter requires all seven `GAMEFLEET_SERVICE_*` values below; it does not inherit ordinary business key, application, placement, revision, region, or compatibility settings.
 
@@ -30,7 +30,7 @@ At startup, the search and History clients each call `GET /business/v1/history/s
 
 For `MatchmakerAdd`, the before hook checks that the authenticated user owns a pending mapped search using `POST /business/v1/service-searches/{searchId}/status`. The matched hook submits the exact pair to `POST /business/v1/service-searches/match`. These mapped routes use `gamefleet.service-player-search.v1`.
 
-Player recovery uses the History API instead:
+Player recovery uses the History API instead. The following table describes requests from Nakama to the platform's History HTTP API:
 
 | Player operation | History route | Request version |
 | --- | --- | --- |
@@ -39,7 +39,9 @@ Player recovery uses the History API instead:
 | Assignment or reconnect resume | `POST /business/v1/history/reservations/{allocationId}/assignment` or `/resume` | `gamefleet.player-ticket.v1` |
 | Search status or cancellation | `POST /business/v1/history/searches/{searchId}/status` or `/cancel` | `gamefleet.player-search.v1` |
 
-Search-status and search-cancel player RPC payloads use `gamefleet.player-search.v1`; the History client uses that version to access original search records. This differs from the mapped service-search protocol, `gamefleet.service-player-search.v1`. Room operations use `gamefleet.player-room.v1`; ticket operations use `gamefleet.player-ticket.v1`.
+The Nakama RPC contract and the upstream History HTTP contract are distinct. In particular, the authenticated Nakama assignment and resume RPCs take `version: "gamefleet.player-room.v1"`; they also take `compatibility`, `region`, `allocationId`, `requestId`, and `previousConnectionGeneration`. Nakama derives the participant from its authenticated runtime context. `ServiceHistoryClient` then transforms that request for the History HTTP API: it sends `version: "gamefleet.player-ticket.v1"` and maps `requestId` to `idempotencyKey`. Unity sends the RoomVersion to Nakama; it does not send TicketVersion to the Nakama RPC.
+
+Search-status and search-cancel player RPC payloads use `gamefleet.player-search.v1`; the History client uses that version to access original search records. This differs from the mapped service-search protocol, `gamefleet.service-player-search.v1`. Current, reservation status, cancellation, assignment, and resume RPCs use `gamefleet.player-room.v1`. The TicketVersion appears only in the upstream History HTTP request for assignment/resume.
 
 `Current` returning `null` means no active reservation was found in the History routes available to this service and participant. It is not proof that no old caller, pending search, or global allocation exists. Preserve an existing exact search/allocation pointer and query its status; do not clear it, rebind it, or start replacement work because `Current` is null.
 
@@ -53,8 +55,8 @@ The archive supports only exact participant-bound terminal reservation and searc
 
 ## Candidate status and validation boundary
 
-The runtime candidate is not deployed. CI is configured to run the official Nakama runtime harness in both ordinary `gamefleet` and `gamefleet-service` modes using synthetic local Business fixtures and an ephemeral Nakama database. That verifies runtime loading, bridge routing, scope failure behavior, and the synthetic search/match flow. It does not exercise real GameFleet owner grants, a real platform database or host, Fixed gameplay, production networking, or production acceptance.
+The isolated M5i acceptance passed with four native Fixed clients using the candidate service runtime. Two normal rooms completed two shots each; four shared shot results had matching hashes at the client pair and server, and the platform recorded four ticket consumptions. Existing M5d cached reads were preserved, and new terminal-history reads succeeded after the Fixed game Pods retired. Nakama ran in an independent Docker container and stopped only during cleanup. A separate lost-Add-ack fault cohort timed out on all four clients (exit code 1) and did not recover into gameplay automatically. Across both cohorts, all four rooms later had signed closure proofs at final generation 9 with zero held capacity. The temporary service key, search grant, match grant, and History route were revoked and returned HTTP 401.
 
-Source `13e6f39badf0a7cfa2271149751b26fd7146f0d8` passed [CI 36730575983](https://github.com/xuhuanhello/nakama-agones/actions/runs/36730575983). Source and integration jobs passed, including both official-runtime modes. The service mode also proved that an HTTP-denied scope and a scope containing only `read` both stop startup before backend registration; the latter passes Search preflight and fails the independently required History operations. Completed logs contain no error markers. Local full Go tests/vet, focused runtime race tests, Python syntax, the embedded Go fixture build, and its protocol/key-class contract checks passed.
+Candidate source `13e6f39badf0a7cfa2271149751b26fd7146f0d8` passed [CI 36730575983](https://github.com/xuhuanhello/nakama-agones/actions/runs/36730575983), including source and integration jobs with the official runtime in ordinary `gamefleet` and `gamefleet-service` modes. The isolated Nakama container ran image `nakama-gamefleet-service:13e6f39`, built from that exact source at `20260930144015` UTC. The image archive SHA-256 was `1b92c7a74ac0072e2d9a0ede503392e54b06cb9898a90d9ac4127880ac7b4109`; its verified OCI index digest was `sha256:bcbd3f17837b5ba1736fde81ff5ab508ce9caa8967307e3c73d8a7b5372cd3cb`. The image was verified before exercising the real service container. The separate Fixed client binary had SHA-256 `adf80df785e4d859c9426e04b7a5ba63009f0dfc9d5829e9d389c075fa7499b6` and matched the M5d artifact; it had no source-commit metadata, so its source provenance is unknown. The service-mode CI harness checks runtime loading, bridge routing, scope failures, and synthetic search/match flow; CI does not itself establish the isolated live acceptance. Local full Go tests/vet and focused runtime race checks also passed.
 
-Keep this file and the env example as candidate setup guidance until the exact candidate CI result and real platform/Fixed acceptance are recorded. Formal cutover follows those acceptance gates.
+The formal GameFleet platform remained at schema 21 on its own database. The production Nakama player database was not accessed or changed. The isolated candidate Nakama PostgreSQL catalog had 20 public tables and its catalog structure was preserved; the comparison point was after the fault cohort and before the normal player retry, and it compared schema only, not native table rows. See the [M5i runtime validation](validation/2026-09-30-gamefleet-service-runtime.md) and the related [M5i platform validation](https://github.com/xuhuanhello/selfhosted-gamefleet/blob/codex/m5-service-match/docs/validation/2026-09-30-m5i-service-runtime.md). This is an isolated candidate result, not formal cutover or production acceptance.
