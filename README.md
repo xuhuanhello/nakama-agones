@@ -4,6 +4,8 @@ Self-hosted, multi-room game server orchestration for **Nakama Community 3.41.0 
 
 GameFleet migration candidate: [Nakama thin adapter and pilot configuration](docs/gamefleet-pilot.md). It is explicit opt-in; the default Agones backend remains unchanged. The player pilot is not deployed yet.
 
+An optional [terminal history reader](docs/gamefleet-terminal-history.md) preserves exact old reservation/search recovery across business-key changes. Its independent service credential grants only explicitly authorized terminal reads.
+
 ## Implements
 
 - Nakama FleetManager registration, two-player matchmaking, room/seat allocation, signed admission and reconnect tickets.

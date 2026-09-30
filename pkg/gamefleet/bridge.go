@@ -215,15 +215,23 @@ func (b bridge) rpc(ctx context.Context, route, payload string) (string, error) 
 		if err = decodePlayer(payload, &req); err != nil {
 			return "", err
 		}
-		if err = b.searchProfile(req.Version, req.Compatibility, req.Region); err != nil {
-			return "", err
-		}
 		if !attemptID.MatchString(req.SearchID) {
 			return "", runtime.NewError("invalid payload", 3)
 		}
 		if route == SearchStatusRPC {
-			result, err = b.backend.SearchStatus(ctx, req.SearchID, user)
+			if err = b.searchProfile(req.Version, req.Compatibility, req.Region); err != nil {
+				archive, ok := b.backend.(archiveProfileReader)
+				if !ok || !archive.archiveSearchProfile(req.Version, req.Compatibility, req.Region) {
+					return "", err
+				}
+				result, err = archive.archiveSearchStatus(ctx, req.SearchID, user)
+			} else {
+				result, err = b.backend.SearchStatus(ctx, req.SearchID, user)
+			}
 		} else {
+			if err = b.searchProfile(req.Version, req.Compatibility, req.Region); err != nil {
+				return "", err
+			}
 			result, err = b.backend.CancelSearch(ctx, req.SearchID, user)
 		}
 	case CurrentRPC:
@@ -240,15 +248,20 @@ func (b bridge) rpc(ctx context.Context, route, payload string) (string, error) 
 		if err = decodePlayer(payload, &req); err != nil {
 			return "", err
 		}
-		if err = b.profile(req.Version, req.Compatibility, req.Region); err != nil {
-			return "", err
-		}
 		if !opaqueID.MatchString(req.AllocationID) {
 			return "", runtime.NewError("invalid payload", 3)
 		}
 		// Status is authorized from historical seat ownership by the business
 		// API, so it remains readable after the current reservation is released.
-		result, err = b.backend.Status(ctx, req.AllocationID, user)
+		if err = b.profile(req.Version, req.Compatibility, req.Region); err != nil {
+			archive, ok := b.backend.(archiveProfileReader)
+			if !ok || !archive.archiveRoomProfile(req.Version, req.Compatibility, req.Region) {
+				return "", err
+			}
+			result, err = archive.archiveStatus(ctx, req.AllocationID, user)
+		} else {
+			result, err = b.backend.Status(ctx, req.AllocationID, user)
+		}
 	case CancelRPC:
 		var req cancelRequest
 		if err = decodePlayer(payload, &req); err != nil {
