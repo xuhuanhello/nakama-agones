@@ -69,10 +69,10 @@ func TestGameFleetModeBypassesLegacyAndRegistersOnlyPlayerHooks(t *testing.T) {
 	if err := RegisterFromEnv(context.Background(), logger, nil, nil, i); err != nil {
 		t.Fatal(err)
 	}
-	if calls.Load() != 1 || i.before == nil || i.matched == nil || i.shutdown == nil || len(i.rpcs) != 5 {
+	if calls.Load() != 1 || i.before == nil || i.matched == nil || i.shutdown == nil || len(i.rpcs) != 8 {
 		t.Fatal("pilot hook/preflight contract missing")
 	}
-	for _, name := range []string{gamefleet.CurrentRPC, gamefleet.StatusRPC, gamefleet.AssignmentRPC, gamefleet.ResumeRPC, gamefleet.CancelRPC} {
+	for _, name := range []string{gamefleet.CurrentRPC, gamefleet.StatusRPC, gamefleet.AssignmentRPC, gamefleet.ResumeRPC, gamefleet.CancelRPC, gamefleet.SearchBeginRPC, gamefleet.SearchStatusRPC, gamefleet.SearchCancelRPC} {
 		if i.rpcs[name] == nil {
 			t.Fatalf("missing %s", name)
 		}

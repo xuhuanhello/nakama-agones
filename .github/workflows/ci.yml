@@ -71,6 +71,14 @@ jobs:
       - run: ./scripts/bootstrap-tools.sh
       - run: python3 scripts/local_cluster.py up
       - run: node scripts/smoke.mjs
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.1'
+      - name: Validate GameFleet search hooks in the official Nakama runtime
+        run: |
+          python3 scripts/test-gamefleet-runtime.py \
+            --image nakama-agones-local:dev \
+            --evidence .local/gamefleet-runtime-result.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:

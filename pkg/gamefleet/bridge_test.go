@@ -50,18 +50,24 @@ func (i *bridgeInitializer) RegisterRpc(name string, fn bridgeRPCHook) error {
 type bridgeBackend struct {
 	calls []string
 
-	currentFn func(context.Context, string) (CurrentResult, error)
-	statusFn  func(context.Context, string, string) (ReservationStatus, error)
-	reserveFn func(context.Context, string, []string) (ReservationResult, error)
-	issueFn   func(context.Context, string, string, string, int64, bool) (AssignmentResult, error)
-	cancelFn  func(context.Context, string) (ReservationResult, error)
+	currentFn      func(context.Context, string) (CurrentResult, error)
+	statusFn       func(context.Context, string, string) (ReservationStatus, error)
+	beginSearchFn  func(context.Context, string, string) (SearchResult, error)
+	searchStatusFn func(context.Context, string, string) (SearchStatus, error)
+	cancelSearchFn func(context.Context, string, string) (SearchResult, error)
+	matchSearchFn  func(context.Context, string, []SearchMatchMember) (ReservationResult, error)
+	issueFn        func(context.Context, string, string, string, int64, bool) (AssignmentResult, error)
+	cancelFn       func(context.Context, string) (ReservationResult, error)
 
-	currentUsers []string
-	statusArgs   []bridgeStatusCall
-	reserveKeys  []string
-	reserveUsers [][]string
-	issueArgs    []bridgeIssueCall
-	cancelIDs    []string
+	currentUsers     []string
+	statusArgs       []bridgeStatusCall
+	beginSearchArgs  []bridgeSearchCall
+	searchStatusArgs []bridgeSearchCall
+	cancelSearchArgs []bridgeSearchCall
+	matchKeys        []string
+	matchMembers     [][]SearchMatchMember
+	issueArgs        []bridgeIssueCall
+	cancelIDs        []string
 }
 
 type bridgeIssueCall struct {
@@ -75,6 +81,12 @@ type bridgeIssueCall struct {
 type bridgeStatusCall struct {
 	allocationID string
 	user         string
+}
+
+type bridgeSearchCall struct {
+	searchID string
+	user     string
+	key      string
 }
 
 func (f *bridgeBackend) Current(ctx context.Context, user string) (CurrentResult, error) {
@@ -93,12 +105,37 @@ func (f *bridgeBackend) Status(ctx context.Context, allocationID, user string) (
 	}
 	return ReservationStatus{}, nil
 }
-func (f *bridgeBackend) Reserve(ctx context.Context, key string, users []string) (ReservationResult, error) {
-	f.calls = append(f.calls, "reserve")
-	f.reserveKeys = append(f.reserveKeys, key)
-	f.reserveUsers = append(f.reserveUsers, append([]string(nil), users...))
-	if f.reserveFn != nil {
-		return f.reserveFn(ctx, key, users)
+func (f *bridgeBackend) BeginSearch(ctx context.Context, user, key string) (SearchResult, error) {
+	f.calls = append(f.calls, "begin_search")
+	f.beginSearchArgs = append(f.beginSearchArgs, bridgeSearchCall{user: user, key: key})
+	if f.beginSearchFn != nil {
+		return f.beginSearchFn(ctx, user, key)
+	}
+	return SearchResult{}, nil
+}
+func (f *bridgeBackend) SearchStatus(ctx context.Context, id, user string) (SearchStatus, error) {
+	f.calls = append(f.calls, "search_status")
+	f.searchStatusArgs = append(f.searchStatusArgs, bridgeSearchCall{searchID: id, user: user})
+	if f.searchStatusFn != nil {
+		return f.searchStatusFn(ctx, id, user)
+	}
+	cfg := bridgeTestConfig()
+	return SearchStatus{Search: Search{ID: id, State: "pending", Region: cfg.Region, Compatibility: cfg.Compatibility}}, nil
+}
+func (f *bridgeBackend) CancelSearch(ctx context.Context, id, user string) (SearchResult, error) {
+	f.calls = append(f.calls, "cancel_search")
+	f.cancelSearchArgs = append(f.cancelSearchArgs, bridgeSearchCall{searchID: id, user: user})
+	if f.cancelSearchFn != nil {
+		return f.cancelSearchFn(ctx, id, user)
+	}
+	return SearchResult{}, nil
+}
+func (f *bridgeBackend) MatchSearches(ctx context.Context, key string, members []SearchMatchMember) (ReservationResult, error) {
+	f.calls = append(f.calls, "match_searches")
+	f.matchKeys = append(f.matchKeys, key)
+	f.matchMembers = append(f.matchMembers, append([]SearchMatchMember(nil), members...))
+	if f.matchSearchFn != nil {
+		return f.matchSearchFn(ctx, key, members)
 	}
 	return ReservationResult{}, nil
 }
@@ -133,7 +170,7 @@ func bridgeHooks(t *testing.T, backend Backend) (*bridgeInitializer, Config) {
 	if i.beforeName != "MatchmakerAdd" || i.before == nil || i.matched == nil {
 		t.Fatal("bridge must register queue admission and matchmaker matched hooks")
 	}
-	wantRPCs := []string{CurrentRPC, StatusRPC, AssignmentRPC, ResumeRPC, CancelRPC}
+	wantRPCs := []string{CurrentRPC, StatusRPC, AssignmentRPC, ResumeRPC, CancelRPC, SearchBeginRPC, SearchStatusRPC, SearchCancelRPC}
 	if len(i.rpcs) != len(wantRPCs) {
 		t.Fatalf("registered RPCs = %v, want exactly %v", mapKeys(i.rpcs), wantRPCs)
 	}
@@ -142,7 +179,7 @@ func bridgeHooks(t *testing.T, backend Backend) (*bridgeInitializer, Config) {
 			t.Fatalf("missing RPC %q", name)
 		}
 	}
-	if len(i.registered) != 7 {
+	if len(i.registered) != 10 {
 		t.Fatalf("registration touched unexpected runtime surfaces: %v", i.registered)
 	}
 	return i, cfg
@@ -170,6 +207,16 @@ func bridgeStatusPayload(allocationID string) string {
 	return fmt.Sprintf(`{"version":%q,"compatibility":%q,"region":%q,"allocationId":%q}`, RoomVersion, cfg.Compatibility, cfg.Region, allocationID)
 }
 
+func bridgeSearchBeginPayload(requestID string) string {
+	cfg := bridgeTestConfig()
+	return fmt.Sprintf(`{"version":%q,"compatibility":%q,"region":%q,"requestId":%q}`, SearchVersion, cfg.Compatibility, cfg.Region, requestID)
+}
+
+func bridgeSearchParticipantPayload(searchID string) string {
+	cfg := bridgeTestConfig()
+	return fmt.Sprintf(`{"version":%q,"compatibility":%q,"region":%q,"searchId":%q}`, SearchVersion, cfg.Compatibility, cfg.Region, searchID)
+}
+
 func bridgeTicketPayload(allocationID, requestID string, previous int64) string {
 	cfg := bridgeTestConfig()
 	return fmt.Sprintf(`{"version":%q,"compatibility":%q,"region":%q,"allocationId":%q,"requestId":%q,"previousConnectionGeneration":%d}`,
@@ -194,7 +241,7 @@ func assertNoBackendCalls(t *testing.T, backend *bridgeBackend) {
 func TestRegisterInstallsOnlyPlayerBridgeHooksAndRPCs(t *testing.T) {
 	backend := &bridgeBackend{}
 	i, _ := bridgeHooks(t, backend)
-	if !reflect.DeepEqual(i.registered, []string{"before:MatchmakerAdd", "matched", "rpc:" + CurrentRPC, "rpc:" + StatusRPC, "rpc:" + AssignmentRPC, "rpc:" + ResumeRPC, "rpc:" + CancelRPC}) {
+	if !reflect.DeepEqual(i.registered, []string{"before:MatchmakerAdd", "matched", "rpc:" + CurrentRPC, "rpc:" + StatusRPC, "rpc:" + AssignmentRPC, "rpc:" + ResumeRPC, "rpc:" + CancelRPC, "rpc:" + SearchBeginRPC, "rpc:" + SearchStatusRPC, "rpc:" + SearchCancelRPC}) {
 		t.Fatalf("unexpected registrations: %v", i.registered)
 	}
 	assertNoBackendCalls(t, backend)
@@ -204,7 +251,7 @@ func matchmakerEnvelope(version, compatibility, region string, countMultiple *wr
 	return &rtapi.Envelope{Cid: "request-17", Message: &rtapi.Envelope_MatchmakerAdd{MatchmakerAdd: &rtapi.MatchmakerAdd{
 		MinCount: 2, MaxCount: 2, CountMultiple: countMultiple,
 		Query:             "properties.region:local-west",
-		StringProperties:  map[string]string{"gamefleet_protocol": version, "build_hash": compatibility, "region": region, "custom": "kept"},
+		StringProperties:  map[string]string{"gamefleet_protocol": version, "build_hash": compatibility, "region": region, "gamefleet_search_id": "search_player-a", "custom": "kept"},
 		NumericProperties: map[string]float64{"skill": 1234},
 	}}}
 }
@@ -212,6 +259,7 @@ func matchmakerEnvelope(version, compatibility, region string, countMultiple *wr
 func TestMatchmakerAddRequiresAuthenticatedExactTwoPlayerProfileAndPreservesEnvelope(t *testing.T) {
 	backend := &bridgeBackend{}
 	i, cfg := bridgeHooks(t, backend)
+	validSearchCalls := 0
 	for _, tc := range []struct {
 		name            string
 		ctx             context.Context
@@ -224,6 +272,16 @@ func TestMatchmakerAddRequiresAuthenticatedExactTwoPlayerProfileAndPreservesEnve
 		{name: "wrong_version", ctx: bridgeCtx("player-a"), request: matchmakerEnvelope("old", cfg.Compatibility, cfg.Region, nil), code: 9, message: "gamefleet_protocol_mismatch"},
 		{name: "wrong_compatibility", ctx: bridgeCtx("player-a"), request: matchmakerEnvelope(RoomVersion, "old-build", cfg.Region, nil), code: 9, message: "fleet_build_mismatch"},
 		{name: "wrong_region", ctx: bridgeCtx("player-a"), request: matchmakerEnvelope(RoomVersion, cfg.Compatibility, "other", nil), code: 9, message: "fleet_region_mismatch"},
+		{name: "missing_search", ctx: bridgeCtx("player-a"), request: func() *rtapi.Envelope {
+			e := matchmakerEnvelope(RoomVersion, cfg.Compatibility, cfg.Region, nil)
+			delete(e.GetMatchmakerAdd().StringProperties, "gamefleet_search_id")
+			return e
+		}(), code: 3, message: "owned search required"},
+		{name: "invalid_search", ctx: bridgeCtx("player-a"), request: func() *rtapi.Envelope {
+			e := matchmakerEnvelope(RoomVersion, cfg.Compatibility, cfg.Region, nil)
+			e.GetMatchmakerAdd().StringProperties["gamefleet_search_id"] = "short"
+			return e
+		}(), code: 3, message: "owned search required"},
 		{name: "count_multiple_one", ctx: bridgeCtx("player-a"), request: matchmakerEnvelope(RoomVersion, cfg.Compatibility, cfg.Region, wrapperspb.Int32(1)), code: 3, message: "two-player match required"},
 		{name: "count_multiple_three", ctx: bridgeCtx("player-a"), request: matchmakerEnvelope(RoomVersion, cfg.Compatibility, cfg.Region, wrapperspb.Int32(3)), code: 3, message: "two-player match required"},
 		{name: "min_not_two", ctx: bridgeCtx("player-a"), request: func() *rtapi.Envelope {
@@ -250,15 +308,56 @@ func TestMatchmakerAddRequiresAuthenticatedExactTwoPlayerProfileAndPreservesEnve
 				if err != nil || response != tc.request || !proto.Equal(original, response) {
 					t.Fatalf("valid envelope was not passed through unchanged: response=%v err=%v", response, err)
 				}
+				validSearchCalls++
+				if len(backend.searchStatusArgs) != validSearchCalls {
+					t.Fatalf("valid queue request did not check exactly one owned search: %+v", backend.searchStatusArgs)
+				}
+				if got := backend.searchStatusArgs[validSearchCalls-1]; got != (bridgeSearchCall{searchID: "search_player-a", user: "player-a"}) {
+					t.Fatalf("admission did not check the authenticated user's exact search: %+v", got)
+				}
 				return
 			}
 			assertBridgeError(t, err, tc.code, tc.message)
 			if response != nil {
 				t.Fatal("rejected matchmaker request continued to admission")
 			}
+			if len(backend.searchStatusArgs) != validSearchCalls {
+				t.Fatalf("invalid request called search status: %+v", backend.searchStatusArgs)
+			}
 		})
 	}
-	assertNoBackendCalls(t, backend)
+	if len(backend.searchStatusArgs) != 2 || !reflect.DeepEqual(backend.calls, []string{"search_status", "search_status"}) {
+		t.Fatalf("only the two valid requests should check owned search state: calls=%v args=%v", backend.calls, backend.searchStatusArgs)
+	}
+}
+
+func TestMatchmakerAdmissionRequiresOwnedPendingCompatibleSearch(t *testing.T) {
+	cfg := bridgeTestConfig()
+	for _, tc := range []struct {
+		name   string
+		search Search
+	}{
+		{name: "foreign_search", search: Search{ID: "search_someone_else", State: "pending", Region: cfg.Region, Compatibility: cfg.Compatibility}},
+		{name: "already_bound", search: Search{ID: "search_player-a", State: "bound", Region: cfg.Region, Compatibility: cfg.Compatibility}},
+		{name: "wrong_region", search: Search{ID: "search_player-a", State: "pending", Region: "other", Compatibility: cfg.Compatibility}},
+		{name: "wrong_compatibility", search: Search{ID: "search_player-a", State: "pending", Region: cfg.Region, Compatibility: "other"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			backend := &bridgeBackend{searchStatusFn: func(_ context.Context, id, user string) (SearchStatus, error) {
+				if id != "search_player-a" || user != "player-a" {
+					t.Fatalf("search authorization inputs changed: id=%q user=%q", id, user)
+				}
+				return SearchStatus{Search: tc.search}, nil
+			}}
+			i, _ := bridgeHooks(t, backend)
+			request := matchmakerEnvelope(RoomVersion, cfg.Compatibility, cfg.Region, nil)
+			response, err := i.before(bridgeCtx("player-a"), nil, nil, nil, request)
+			assertBridgeError(t, err, 9, "search unavailable")
+			if response != nil || !reflect.DeepEqual(backend.calls, []string{"search_status"}) || !reflect.DeepEqual(backend.searchStatusArgs, []bridgeSearchCall{{searchID: "search_player-a", user: "player-a"}}) {
+				t.Fatalf("non-owned or non-pending search reached queue: response=%v calls=%v args=%v", response, backend.calls, backend.searchStatusArgs)
+			}
+		})
+	}
 }
 
 type bridgePresence struct {
@@ -282,34 +381,35 @@ func (e bridgeEntry) GetProperties() map[string]any { return e.properties }
 func bridgeMatchEntry(user, ticket string, cfg Config) runtime.MatchmakerEntry {
 	return bridgeEntry{
 		presence: bridgePresence{user: user}, ticket: ticket,
-		properties: map[string]any{"gamefleet_protocol": RoomVersion, "build_hash": cfg.Compatibility, "region": cfg.Region},
+		properties: map[string]any{"gamefleet_protocol": RoomVersion, "build_hash": cfg.Compatibility, "region": cfg.Region, "gamefleet_search_id": "search_" + strings.ReplaceAll(user, "-", "_")},
 	}
 }
 
-func TestMatchedReservesOnlyDistinctTrustedPresenceUsersWithCanonicalKey(t *testing.T) {
+func TestMatchedUsesCanonicalOwnedSearchAndTicketSet(t *testing.T) {
 	backend := &bridgeBackend{}
 	i, cfg := bridgeHooks(t, backend)
 	valid := []runtime.MatchmakerEntry{bridgeMatchEntry("player-b", "ticket-b", cfg), bridgeMatchEntry("player-a", "ticket-a", cfg)}
 	if _, err := i.matched(context.Background(), nil, nil, nil, valid); err != nil {
 		t.Fatalf("valid pair failed: %v", err)
 	}
-	if len(backend.reserveKeys) != 1 || !reflect.DeepEqual(backend.reserveUsers[0], []string{"player-a", "player-b"}) {
-		t.Fatalf("reservation must use trusted presence IDs in canonical order: users=%v keys=%v", backend.reserveUsers, backend.reserveKeys)
+	wantMembers := []SearchMatchMember{{ParticipantID: "player-a", SearchID: "search_player_a", NakamaTicket: "ticket-a"}, {ParticipantID: "player-b", SearchID: "search_player_b", NakamaTicket: "ticket-b"}}
+	if len(backend.matchKeys) != 1 || !reflect.DeepEqual(backend.matchMembers[0], wantMembers) {
+		t.Fatalf("match must use trusted users, search IDs and tickets in canonical order: members=%v keys=%v", backend.matchMembers, backend.matchKeys)
 	}
-	key := backend.reserveKeys[0]
-	if !strings.HasPrefix(key, "matchmaker_") || len(key) != len("matchmaker_")+64 {
+	key := backend.matchKeys[0]
+	if !strings.HasPrefix(key, "matchmaker_search_") || len(key) != len("matchmaker_search_")+64 {
 		t.Fatalf("unexpected match idempotency key format %q", key)
 	}
 	_, err := i.matched(context.Background(), nil, nil, nil, []runtime.MatchmakerEntry{valid[1], valid[0]})
 	if err != nil {
 		t.Fatalf("reversed pair failed: %v", err)
 	}
-	if len(backend.reserveKeys) != 2 || backend.reserveKeys[1] != key || !reflect.DeepEqual(backend.reserveUsers[1], []string{"player-a", "player-b"}) {
-		t.Fatalf("reversing Nakama entries must preserve the same reserve request: keys=%v users=%v", backend.reserveKeys, backend.reserveUsers)
+	if len(backend.matchKeys) != 2 || backend.matchKeys[1] != key || !reflect.DeepEqual(backend.matchMembers[1], wantMembers) {
+		t.Fatalf("reversing Nakama entries must preserve the same match request: keys=%v members=%v", backend.matchKeys, backend.matchMembers)
 	}
 }
 
-func TestMatchedRejectsMalformedPairBeforeReserve(t *testing.T) {
+func TestMatchedRejectsMalformedPairBeforeMatchSearches(t *testing.T) {
 	backend := &bridgeBackend{}
 	i, cfg := bridgeHooks(t, backend)
 	wrongProfile := bridgeEntry{presence: bridgePresence{user: "player-b"}, ticket: "ticket-b", properties: map[string]any{"gamefleet_protocol": RoomVersion, "build_hash": "old-build", "region": cfg.Region}}
@@ -329,15 +429,18 @@ func TestMatchedRejectsMalformedPairBeforeReserve(t *testing.T) {
 		{"wrong_profile", []runtime.MatchmakerEntry{wrongProfile, bridgeMatchEntry("player-a", "ticket-a", cfg)}, 9, "fleet_build_mismatch"},
 		{"wrong_property_type", []runtime.MatchmakerEntry{badPropertyType, bridgeMatchEntry("player-a", "ticket-a", cfg)}, 9, "gamefleet_protocol_mismatch"},
 		{"duplicate_presence_user", []runtime.MatchmakerEntry{bridgeMatchEntry("player-a", "ticket-a", cfg), bridgeMatchEntry("player-a", "ticket-b", cfg)}, 3, "distinct players required"},
+		{"duplicate_search", []runtime.MatchmakerEntry{bridgeMatchEntry("player-a", "ticket-a", cfg), bridgeEntry{presence: bridgePresence{user: "player-b"}, ticket: "ticket-b", properties: map[string]any{"gamefleet_protocol": RoomVersion, "build_hash": cfg.Compatibility, "region": cfg.Region, "gamefleet_search_id": "search_player_a"}}}, 3, "distinct players required"},
 		{"invalid_ticket", []runtime.MatchmakerEntry{bridgeMatchEntry("player-a", "", cfg), bridgeMatchEntry("player-b", "ticket-b", cfg)}, 3, "invalid match entry"},
+		{"missing_search", []runtime.MatchmakerEntry{bridgeEntry{presence: bridgePresence{user: "player-a"}, ticket: "ticket-a", properties: map[string]any{"gamefleet_protocol": RoomVersion, "build_hash": cfg.Compatibility, "region": cfg.Region}}, bridgeMatchEntry("player-b", "ticket-b", cfg)}, 3, "invalid match entry"},
+		{"wrong_search_type", []runtime.MatchmakerEntry{bridgeEntry{presence: bridgePresence{user: "player-a"}, ticket: "ticket-a", properties: map[string]any{"gamefleet_protocol": RoomVersion, "build_hash": cfg.Compatibility, "region": cfg.Region, "gamefleet_search_id": 1}}, bridgeMatchEntry("player-b", "ticket-b", cfg)}, 3, "invalid match entry"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := i.matched(context.Background(), nil, nil, nil, tc.entries)
 			assertBridgeError(t, err, tc.code, tc.message)
 		})
 	}
-	if len(backend.reserveKeys) != 0 {
-		t.Fatalf("invalid matched callback reached reserve: %v", backend.reserveKeys)
+	if len(backend.matchKeys) != 0 {
+		t.Fatalf("invalid matched callback reached search match: %v", backend.matchKeys)
 	}
 }
 
@@ -391,11 +494,14 @@ func TestPlayerRPCAuthenticationPayloadAndProfilesPreflightWithoutBackendCalls(t
 	backend := &bridgeBackend{}
 	i, cfg := bridgeHooks(t, backend)
 	for route, payload := range map[string]string{
-		CurrentRPC:    bridgeProfilePayload(),
-		StatusRPC:     bridgeStatusPayload("alloc_123"),
-		CancelRPC:     fmt.Sprintf(`{"version":%q,"compatibility":%q,"region":%q,"allocationId":"alloc_123"}`, RoomVersion, cfg.Compatibility, cfg.Region),
-		AssignmentRPC: bridgeTicketPayload("alloc_123", "attempt_123", 0),
-		ResumeRPC:     bridgeTicketPayload("alloc_123", "attempt_123", 1),
+		CurrentRPC:      bridgeProfilePayload(),
+		StatusRPC:       bridgeStatusPayload("alloc_123"),
+		CancelRPC:       fmt.Sprintf(`{"version":%q,"compatibility":%q,"region":%q,"allocationId":"alloc_123"}`, RoomVersion, cfg.Compatibility, cfg.Region),
+		AssignmentRPC:   bridgeTicketPayload("alloc_123", "attempt_123", 0),
+		ResumeRPC:       bridgeTicketPayload("alloc_123", "attempt_123", 1),
+		SearchBeginRPC:  bridgeSearchBeginPayload("attempt_123"),
+		SearchStatusRPC: bridgeSearchParticipantPayload("search_123"),
+		SearchCancelRPC: bridgeSearchParticipantPayload("search_123"),
 	} {
 		if _, err := i.rpcs[route](context.Background(), nil, nil, nil, payload); err == nil {
 			t.Fatalf("%s accepted an unauthenticated request", route)
@@ -425,9 +531,21 @@ func TestPlayerRPCAuthenticationPayloadAndProfilesPreflightWithoutBackendCalls(t
 		{ResumeRPC, `{"version":"gamefleet.player-room.v1","compatibility":"build-2026-09","region":"local-west","allocationId":"alloc_123","requestId":"attempt_123","previousConnectionGeneration":null}`},
 		{CancelRPC, fmt.Sprintf(`{"version":%q,"compatibility":%q,"region":%q,"allocationId":"bad/id"}`, RoomVersion, cfg.Compatibility, cfg.Region)},
 		{StatusRPC, bridgeStatusPayload("bad/id")},
+		{SearchBeginRPC, bridgeSearchBeginPayload("short")},
+		{SearchStatusRPC, bridgeSearchParticipantPayload("short")},
+		{SearchCancelRPC, bridgeSearchParticipantPayload("short")},
 	} {
 		_, err := i.rpcs[tc.route](bridgeCtx("player-a"), nil, nil, nil, tc.payload)
 		assertBridgeError(t, err, 3, "invalid payload")
+	}
+	for _, route := range []string{SearchBeginRPC, SearchStatusRPC, SearchCancelRPC} {
+		payload := bridgeSearchBeginPayload("attempt_123")
+		if route != SearchBeginRPC {
+			payload = bridgeSearchParticipantPayload("search_123")
+		}
+		wrongVersion := strings.Replace(payload, SearchVersion, RoomVersion, 1)
+		_, err := i.rpcs[route](bridgeCtx("player-a"), nil, nil, nil, wrongVersion)
+		assertBridgeError(t, err, 9, "gamefleet_protocol_mismatch")
 	}
 	assertNoBackendCalls(t, backend)
 }

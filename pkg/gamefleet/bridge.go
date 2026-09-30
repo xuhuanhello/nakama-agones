@@ -14,11 +14,14 @@ import (
 )
 
 const (
-	CurrentRPC    = "gamefleet_current_v1"
-	StatusRPC     = "gamefleet_status_v1"
-	AssignmentRPC = "gamefleet_assignment_v1"
-	ResumeRPC     = "gamefleet_resume_v1"
-	CancelRPC     = "gamefleet_cancel_v1"
+	CurrentRPC      = "gamefleet_current_v1"
+	StatusRPC       = "gamefleet_status_v1"
+	AssignmentRPC   = "gamefleet_assignment_v1"
+	ResumeRPC       = "gamefleet_resume_v1"
+	CancelRPC       = "gamefleet_cancel_v1"
+	SearchBeginRPC  = "gamefleet_search_begin_v1"
+	SearchStatusRPC = "gamefleet_search_status_v1"
+	SearchCancelRPC = "gamefleet_search_cancel_v1"
 )
 
 // Register owns the single matched hook, but never registers FleetManager,
@@ -34,7 +37,7 @@ func Register(initializer runtime.Initializer, backend Backend, cfg Config) erro
 	if err := initializer.RegisterMatchmakerMatched(b.matched); err != nil {
 		return err
 	}
-	for _, route := range []string{CurrentRPC, StatusRPC, AssignmentRPC, ResumeRPC, CancelRPC} {
+	for _, route := range []string{CurrentRPC, StatusRPC, AssignmentRPC, ResumeRPC, CancelRPC, SearchBeginRPC, SearchStatusRPC, SearchCancelRPC} {
 		name := route
 		if err := initializer.RegisterRpc(name, func(ctx context.Context, _ runtime.Logger, _ *sql.DB, _ runtime.NakamaModule, payload string) (string, error) {
 			return b.rpc(ctx, name, payload)
@@ -72,7 +75,8 @@ func (b bridge) profile(version, compatibility, region string) error {
 }
 
 func (b bridge) before(ctx context.Context, _ runtime.Logger, _ *sql.DB, _ runtime.NakamaModule, in *rtapi.Envelope) (*rtapi.Envelope, error) {
-	if _, err := authenticatedUser(ctx); err != nil {
+	user, err := authenticatedUser(ctx)
+	if err != nil {
 		return nil, err
 	}
 	r := in.GetMatchmakerAdd()
@@ -83,6 +87,17 @@ func (b bridge) before(ctx context.Context, _ runtime.Logger, _ *sql.DB, _ runti
 	if err := b.profile(p["gamefleet_protocol"], p["build_hash"], p["region"]); err != nil {
 		return nil, err
 	}
+	id := p["gamefleet_search_id"]
+	if !attemptID.MatchString(id) {
+		return nil, runtime.NewError("owned search required", 3)
+	}
+	search, err := b.backend.SearchStatus(ctx, id, user)
+	if err != nil {
+		return nil, playerSearchError(err)
+	}
+	if search.Search.ID != id || search.Search.State != "pending" || search.Search.Region != b.config.Region || search.Search.Compatibility != b.config.Compatibility {
+		return nil, runtime.NewError("search unavailable", 9)
+	}
 	return in, nil
 }
 
@@ -90,11 +105,7 @@ func (b bridge) matched(ctx context.Context, _ runtime.Logger, _ *sql.DB, _ runt
 	if len(entries) != 2 {
 		return "", runtime.NewError("two-player match required", 3)
 	}
-	type member struct {
-		User   string `json:"user"`
-		Ticket string `json:"ticket"`
-	}
-	members := make([]member, 0, 2)
+	members := make([]SearchMatchMember, 0, 2)
 	for _, entry := range entries {
 		if entry == nil || entry.GetPresence() == nil {
 			return "", runtime.NewError("invalid match entry", 3)
@@ -107,20 +118,21 @@ func (b bridge) matched(ctx context.Context, _ runtime.Logger, _ *sql.DB, _ runt
 			return "", err
 		}
 		user, ticket := entry.GetPresence().GetUserId(), entry.GetTicket()
-		if !exactText(user, 256) || !exactText(ticket, 256) {
+		search, _ := p["gamefleet_search_id"].(string)
+		if !exactText(user, 256) || !exactText(ticket, 256) || !attemptID.MatchString(search) {
 			return "", runtime.NewError("invalid match entry", 3)
 		}
-		members = append(members, member{user, ticket})
+		members = append(members, SearchMatchMember{ParticipantID: user, SearchID: search, NakamaTicket: ticket})
 	}
-	if members[0].User == members[1].User {
+	if members[0].ParticipantID == members[1].ParticipantID || members[0].SearchID == members[1].SearchID || members[0].NakamaTicket == members[1].NakamaTicket {
 		return "", runtime.NewError("distinct players required", 3)
 	}
-	sort.Slice(members, func(i, j int) bool { return members[i].User < members[j].User })
-	key := stableKey("matchmaker_", []any{RoomVersion, b.config.Region, b.config.Compatibility, members})
-	_, err := b.backend.Reserve(ctx, key, []string{members[0].User, members[1].User})
-	// Nakama emits its ordinary matched signal. Clients recover via CurrentRPC,
-	// including if that signal or this HTTP response is lost after commit.
-	return "", playerError(err)
+	sort.Slice(members, func(i, j int) bool { return members[i].ParticipantID < members[j].ParticipantID })
+	key := stableKey("matchmaker_search_", []any{SearchVersion, b.config.Region, b.config.Compatibility, members})
+	_, err := b.backend.MatchSearches(ctx, key, members)
+	// Nakama emits its ordinary matched signal. Clients recover the exact bound
+	// search if that signal or this HTTP response is lost after commit.
+	return "", playerSearchError(err)
 }
 
 type profileRequest struct {
@@ -141,6 +153,23 @@ type cancelRequest struct {
 type statusRequest struct {
 	profileRequest
 	AllocationID string `json:"allocationId"`
+}
+
+type searchBeginRequest struct {
+	profileRequest
+	RequestID string `json:"requestId"`
+}
+
+type searchParticipantRequest struct {
+	profileRequest
+	SearchID string `json:"searchId"`
+}
+
+func (b bridge) searchProfile(version, compatibility, region string) error {
+	if version != SearchVersion {
+		return runtime.NewError("gamefleet_protocol_mismatch", 9)
+	}
+	return b.profile(RoomVersion, compatibility, region)
 }
 
 func decodePlayer(payload string, out any) error {
@@ -168,6 +197,35 @@ func (b bridge) rpc(ctx context.Context, route, payload string) (string, error) 
 	}
 	var result any
 	switch route {
+	case SearchBeginRPC:
+		var req searchBeginRequest
+		if err = decodePlayer(payload, &req); err != nil {
+			return "", err
+		}
+		if err = b.searchProfile(req.Version, req.Compatibility, req.Region); err != nil {
+			return "", err
+		}
+		if !attemptID.MatchString(req.RequestID) {
+			return "", runtime.NewError("invalid payload", 3)
+		}
+		key := stableKey("search_begin_", []string{user, req.RequestID})
+		result, err = b.backend.BeginSearch(ctx, user, key)
+	case SearchStatusRPC, SearchCancelRPC:
+		var req searchParticipantRequest
+		if err = decodePlayer(payload, &req); err != nil {
+			return "", err
+		}
+		if err = b.searchProfile(req.Version, req.Compatibility, req.Region); err != nil {
+			return "", err
+		}
+		if !attemptID.MatchString(req.SearchID) {
+			return "", runtime.NewError("invalid payload", 3)
+		}
+		if route == SearchStatusRPC {
+			result, err = b.backend.SearchStatus(ctx, req.SearchID, user)
+		} else {
+			result, err = b.backend.CancelSearch(ctx, req.SearchID, user)
+		}
 	case CurrentRPC:
 		var req profileRequest
 		if err = decodePlayer(payload, &req); err != nil {
@@ -229,6 +287,9 @@ func (b bridge) rpc(ctx context.Context, route, payload string) (string, error) 
 		return "", runtime.NewError("unknown operation", 3)
 	}
 	if err != nil {
+		if route == SearchBeginRPC || route == SearchStatusRPC || route == SearchCancelRPC {
+			return "", playerSearchError(err)
+		}
 		return "", playerError(err)
 	}
 	raw, err := json.Marshal(result)
@@ -242,6 +303,16 @@ func stableKey(prefix string, value any) string {
 	raw, _ := json.Marshal(value)
 	sum := sha256.Sum256(raw)
 	return prefix + hex.EncodeToString(sum[:])
+}
+
+func playerSearchError(err error) error {
+	var upstream *Error
+	if errors.As(err, &upstream) && upstream.Status == 409 {
+		// Current cannot determine whether an exact search is still pending,
+		// cancelled or bound. Preserve correlation in the recovery instruction.
+		return runtime.NewError("gamefleet search conflict; query the same search", 9)
+	}
+	return playerError(err)
 }
 
 func playerError(err error) error {

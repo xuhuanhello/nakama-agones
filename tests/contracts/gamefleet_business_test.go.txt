@@ -33,9 +33,126 @@ func TestNakamaGameFleetClientContract(t *testing.T) {
 	if err != nil || current.Current == nil || current.Current.Reservation.AllocationID != x.command.AllocationID || current.Current.ConnectionGeneration != 0 {
 		t.Fatal("current", err)
 	}
-	replay, err := c.Reserve(ctx, "ticket-http-reservation", []string{"player-one", "player-two"})
-	if err != nil || !replay.Replay || replay.Reservation.AllocationID != x.command.AllocationID {
-		t.Fatal("reservation replay", err)
+	if res := x.b.request(http.MethodPost, "/business/v1/reservations", `{}`, x.b.bearer(x.b.key)); res.Code != http.StatusNotFound {
+		t.Fatal("legacy direct reservation route remained available", res.Code, res.Body.String())
+	}
+
+	// Search lifecycle uses a separate capable fixture with no pre-existing
+	// held room. The ticket fixture above continues to exercise Current, issue,
+	// consume, resume and caller-key revocation against its real prepared room.
+	searchBusiness := newCapableSearchHTTPFixture(t)
+	var searchApp, searchPlacement, searchRevision, searchRegion string
+	if err = searchBusiness.f.s.DB.QueryRow(`SELECT d.application_id,p.id,p.revision_id,c.region FROM capacity_placements p JOIN catalog_deployments d ON d.id=p.deployment_id JOIN clusters c ON c.id=p.cluster_id WHERE p.id=(SELECT placement_id FROM business_player_callers WHERE id=?)`, searchBusiness.caller).Scan(&searchApp, &searchPlacement, &searchRevision, &searchRegion); err != nil {
+		t.Fatal(err)
+	}
+	searchServer := httptest.NewServer(searchBusiness.handler)
+	defer searchServer.Close()
+	searchClient, err := nakamabridge.NewClient(nakamabridge.Config{
+		URL: searchServer.URL, Key: searchBusiness.key, ApplicationID: searchApp,
+		PlacementID: searchPlacement, RevisionID: searchRevision, Region: searchRegion, Compatibility: "game-v1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer searchClient.Close()
+
+	// Cancellation commits first. Replaying that exact terminal operation is
+	// idempotent, and a delayed matched callback cannot create a room.
+	cancelFirst, err := searchClient.BeginSearch(ctx, "player-one", "contract-cancel-a")
+	if err != nil || cancelFirst.Search.State != "pending" || cancelFirst.Replay {
+		t.Fatal("begin cancel-first search", err)
+	}
+	cancelWaiter, err := searchClient.BeginSearch(ctx, "player-two", "contract-cancel-b")
+	if err != nil || cancelWaiter.Search.State != "pending" || cancelWaiter.Replay {
+		t.Fatal("begin cancel peer search", err)
+	}
+	status, err := searchClient.SearchStatus(ctx, cancelFirst.Search.ID, "player-one")
+	if err != nil || status.Search.State != "pending" {
+		t.Fatal("pending search status", err)
+	}
+	cancelled, err := searchClient.CancelSearch(ctx, cancelFirst.Search.ID, "player-one")
+	if err != nil || cancelled.Search.State != "cancelled" || cancelled.Replay {
+		t.Fatal("cancel pending search", err)
+	}
+	cancelReplay, err := searchClient.CancelSearch(ctx, cancelFirst.Search.ID, "player-one")
+	if err != nil || !cancelReplay.Replay || cancelReplay.Search.State != "cancelled" {
+		t.Fatal("cancel replay", err)
+	}
+	if _, err = searchClient.SearchStatus(ctx, cancelFirst.Search.ID, "player-two"); err == nil {
+		t.Fatal("cross-participant search status was accepted")
+	}
+	latePair := []nakamabridge.SearchMatchMember{
+		{ParticipantID: "player-one", SearchID: cancelFirst.Search.ID, NakamaTicket: "late-ticket-player-one"},
+		{ParticipantID: "player-two", SearchID: cancelWaiter.Search.ID, NakamaTicket: "late-ticket-player-two"},
+	}
+	if _, err = searchClient.MatchSearches(ctx, "contract-late-match", latePair); err == nil {
+		t.Fatal("late matched callback reserved a cancelled search")
+	}
+	stillPending, err := searchClient.SearchStatus(ctx, cancelWaiter.Search.ID, "player-two")
+	if err != nil || stillPending.Search.State != "pending" {
+		t.Fatal("rejected late match changed the other search", err)
+	}
+	waiterCancelled, err := searchClient.CancelSearch(ctx, cancelWaiter.Search.ID, "player-two")
+	if err != nil || waiterCancelled.Search.State != "cancelled" || waiterCancelled.Replay {
+		t.Fatal("cancel unmatched peer search", err)
+	}
+	if current, err = searchClient.Current(ctx, "player-one"); err != nil || current.Current != nil {
+		t.Fatal("cancel-first late match created a room", err)
+	}
+
+	// Exact begin and matched retries recover the same search/allocation. A
+	// bound search cancellation reports the existing room and leaves both held
+	// seats visible through the original Current/reservation ledger.
+	searchOne, err := searchClient.BeginSearch(ctx, "player-one", "contract-match-a")
+	if err != nil || searchOne.Search.State != "pending" || searchOne.Replay {
+		t.Fatal("begin match search one", err)
+	}
+	searchOneReplay, err := searchClient.BeginSearch(ctx, "player-one", "contract-match-a")
+	if err != nil || !searchOneReplay.Replay || searchOneReplay.Search.ID != searchOne.Search.ID {
+		t.Fatal("begin search replay changed identity", err)
+	}
+	searchTwo, err := searchClient.BeginSearch(ctx, "player-two", "contract-match-b")
+	if err != nil || searchTwo.Search.State != "pending" || searchTwo.Replay {
+		t.Fatal("begin match search two", err)
+	}
+	matchMembers := []nakamabridge.SearchMatchMember{
+		{ParticipantID: "player-one", SearchID: searchOne.Search.ID, NakamaTicket: "match-ticket-player-one"},
+		{ParticipantID: "player-two", SearchID: searchTwo.Search.ID, NakamaTicket: "match-ticket-player-two"},
+	}
+	matched, err := searchClient.MatchSearches(ctx, "contract-match-commit", matchMembers)
+	if err != nil || matched.Replay || matched.Reservation.State != "reserved" {
+		if err != nil {
+			members := []map[string]string{
+				{"participantId": matchMembers[0].ParticipantID, "searchId": matchMembers[0].SearchID, "nakamaTicket": matchMembers[0].NakamaTicket},
+				{"participantId": matchMembers[1].ParticipantID, "searchId": matchMembers[1].SearchID, "nakamaTicket": matchMembers[1].NakamaTicket},
+			}
+			response := searchBusiness.request(http.MethodPost, "/business/v1/searches/match", js(map[string]any{
+				"version": "gamefleet.player-search.v1", "idempotencyKey": "contract-match-commit",
+				"compatibility": "game-v1", "members": members,
+			}), searchBusiness.bearer(searchBusiness.key))
+			t.Fatalf("match searches failed with HTTP %d: %s", response.Code, response.Body.String())
+		}
+		t.Fatal("match searches", err)
+	}
+	matchedReplay, err := searchClient.MatchSearches(ctx, "contract-match-commit", matchMembers)
+	if err != nil || !matchedReplay.Replay || matchedReplay.Reservation.AllocationID != matched.Reservation.AllocationID {
+		t.Fatal("matched replay changed allocation", err)
+	}
+	for _, member := range matchMembers {
+		bound, err := searchClient.SearchStatus(ctx, member.SearchID, member.ParticipantID)
+		if err != nil || bound.Search.State != "bound" || bound.Search.AllocationID != matched.Reservation.AllocationID {
+			t.Fatal("matched search did not bind exact room", member.ParticipantID, err)
+		}
+	}
+	boundCancel, err := searchClient.CancelSearch(ctx, searchOne.Search.ID, "player-one")
+	if err != nil || !boundCancel.Replay || boundCancel.Search.State != "bound" || boundCancel.Search.AllocationID != matched.Reservation.AllocationID {
+		t.Fatal("bound cancel hid or released its room", err)
+	}
+	for _, participant := range []string{"player-one", "player-two"} {
+		current, err = searchClient.Current(ctx, participant)
+		if err != nil || current.Current == nil || current.Current.Reservation.AllocationID != matched.Reservation.AllocationID || current.Current.Reservation.CancellationRequested {
+			t.Fatal("bound search cancel changed held room", participant, err)
+		}
 	}
 	_, err = c.Current(ctx, "not-allowlisted")
 	if err == nil {
@@ -79,8 +196,8 @@ func TestNakamaGameFleetClientContract(t *testing.T) {
 	if _, err = c.Issue(ctx, x.command.AllocationID, "player-one", "contract-resume-attempt", 1, true); err != nil {
 		t.Fatal("same attempt not recoverable", err)
 	}
-	cancelled, err := c.Cancel(ctx, x.command.AllocationID)
-	if err != nil || !cancelled.Reservation.CancellationRequested {
+	roomCancelled, err := c.Cancel(ctx, x.command.AllocationID)
+	if err != nil || !roomCancelled.Reservation.CancellationRequested {
 		t.Fatal("cancel intent", err)
 	}
 	current, err = c.Current(ctx, "player-two")

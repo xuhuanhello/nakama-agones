@@ -102,9 +102,16 @@ func TestClientHTTPContractAndExactReplay(t *testing.T) {
 				t.Errorf("status request: method=%s payload=%v", r.Method, payload)
 			}
 			respond(w, ReservationStatus{Reservation: testReservation()})
-		case "/business/v1/reservations":
-			if payload["version"] != RoomVersion || payload["compatibility"] != "dm-v1" || payload["idempotencyKey"] != "request-1234" {
-				t.Errorf("reserve payload: %v", payload)
+		case "/business/v1/searches/match":
+			expected := map[string]any{
+				"version": SearchVersion, "compatibility": "dm-v1", "idempotencyKey": "request-1234",
+				"members": []any{
+					map[string]any{"participantId": "player-one", "searchId": "search-player-one", "nakamaTicket": "ticket-one"},
+					map[string]any{"participantId": "player-two", "searchId": "search-player-two", "nakamaTicket": "ticket-two"},
+				},
+			}
+			if !reflect.DeepEqual(payload, expected) {
+				t.Errorf("search match payload: %v", payload)
 			}
 			respond(w, ReservationResult{Reservation: testReservation()})
 		case "/business/v1/reservations/allocation-one/resume":
@@ -141,7 +148,11 @@ func TestClientHTTPContractAndExactReplay(t *testing.T) {
 	if err != nil || status.Reservation.State != "prepared" {
 		t.Fatalf("status: %+v %v", status, err)
 	}
-	if _, err = c.Reserve(ctx, "request-1234", []string{"player-one", "player-two"}); err != nil {
+	members := []SearchMatchMember{
+		{ParticipantID: "player-one", SearchID: "search-player-one", NakamaTicket: "ticket-one"},
+		{ParticipantID: "player-two", SearchID: "search-player-two", NakamaTicket: "ticket-two"},
+	}
+	if _, err = c.MatchSearches(ctx, "request-1234", members); err != nil {
 		t.Fatal(err)
 	}
 	for range 2 {
@@ -294,9 +305,14 @@ func TestClientRejectsInvalidRequestsBeforeHTTP(t *testing.T) {
 	ctx := context.Background()
 	_, e := c.Current(ctx, " player-one")
 	statusError(t, e, 422)
-	_, e = c.Reserve(ctx, "bad:key", []string{"one", "two"})
+	members := []SearchMatchMember{{ParticipantID: "player-one", SearchID: "search-player-one", NakamaTicket: "ticket-one"}, {ParticipantID: "player-two", SearchID: "search-player-two", NakamaTicket: "ticket-two"}}
+	_, e = c.MatchSearches(ctx, "bad:key", members)
 	statusError(t, e, 422)
-	_, e = c.Reserve(ctx, "request-1234", []string{"one", "one"})
+	_, e = c.MatchSearches(ctx, "request-1234", members[:1])
+	statusError(t, e, 422)
+	duplicate := append([]SearchMatchMember(nil), members...)
+	duplicate[1].ParticipantID = duplicate[0].ParticipantID
+	_, e = c.MatchSearches(ctx, "request-1234", duplicate)
 	statusError(t, e, 422)
 	_, e = c.Cancel(ctx, "../other")
 	statusError(t, e, 422)
