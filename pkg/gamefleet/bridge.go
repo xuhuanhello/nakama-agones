@@ -15,6 +15,7 @@ import (
 
 const (
 	CurrentRPC    = "gamefleet_current_v1"
+	StatusRPC     = "gamefleet_status_v1"
 	AssignmentRPC = "gamefleet_assignment_v1"
 	ResumeRPC     = "gamefleet_resume_v1"
 	CancelRPC     = "gamefleet_cancel_v1"
@@ -33,7 +34,7 @@ func Register(initializer runtime.Initializer, backend Backend, cfg Config) erro
 	if err := initializer.RegisterMatchmakerMatched(b.matched); err != nil {
 		return err
 	}
-	for _, route := range []string{CurrentRPC, AssignmentRPC, ResumeRPC, CancelRPC} {
+	for _, route := range []string{CurrentRPC, StatusRPC, AssignmentRPC, ResumeRPC, CancelRPC} {
 		name := route
 		if err := initializer.RegisterRpc(name, func(ctx context.Context, _ runtime.Logger, _ *sql.DB, _ runtime.NakamaModule, payload string) (string, error) {
 			return b.rpc(ctx, name, payload)
@@ -137,6 +138,10 @@ type cancelRequest struct {
 	profileRequest
 	AllocationID string `json:"allocationId"`
 }
+type statusRequest struct {
+	profileRequest
+	AllocationID string `json:"allocationId"`
+}
 
 func decodePlayer(payload string, out any) error {
 	if len(payload) > 8192 || strictObject([]byte(payload), out) != nil {
@@ -172,6 +177,20 @@ func (b bridge) rpc(ctx context.Context, route, payload string) (string, error) 
 			return "", err
 		}
 		result, err = b.backend.Current(ctx, user)
+	case StatusRPC:
+		var req statusRequest
+		if err = decodePlayer(payload, &req); err != nil {
+			return "", err
+		}
+		if err = b.profile(req.Version, req.Compatibility, req.Region); err != nil {
+			return "", err
+		}
+		if !opaqueID.MatchString(req.AllocationID) {
+			return "", runtime.NewError("invalid payload", 3)
+		}
+		// Status is authorized from historical seat ownership by the business
+		// API, so it remains readable after the current reservation is released.
+		result, err = b.backend.Status(ctx, req.AllocationID, user)
 	case CancelRPC:
 		var req cancelRequest
 		if err = decodePlayer(payload, &req); err != nil {

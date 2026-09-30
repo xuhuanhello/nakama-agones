@@ -51,11 +51,13 @@ type bridgeBackend struct {
 	calls []string
 
 	currentFn func(context.Context, string) (CurrentResult, error)
+	statusFn  func(context.Context, string, string) (ReservationStatus, error)
 	reserveFn func(context.Context, string, []string) (ReservationResult, error)
 	issueFn   func(context.Context, string, string, string, int64, bool) (AssignmentResult, error)
 	cancelFn  func(context.Context, string) (ReservationResult, error)
 
 	currentUsers []string
+	statusArgs   []bridgeStatusCall
 	reserveKeys  []string
 	reserveUsers [][]string
 	issueArgs    []bridgeIssueCall
@@ -70,6 +72,11 @@ type bridgeIssueCall struct {
 	resume       bool
 }
 
+type bridgeStatusCall struct {
+	allocationID string
+	user         string
+}
+
 func (f *bridgeBackend) Current(ctx context.Context, user string) (CurrentResult, error) {
 	f.calls = append(f.calls, "current")
 	f.currentUsers = append(f.currentUsers, user)
@@ -77,6 +84,14 @@ func (f *bridgeBackend) Current(ctx context.Context, user string) (CurrentResult
 		return f.currentFn(ctx, user)
 	}
 	return CurrentResult{}, nil
+}
+func (f *bridgeBackend) Status(ctx context.Context, allocationID, user string) (ReservationStatus, error) {
+	f.calls = append(f.calls, "status")
+	f.statusArgs = append(f.statusArgs, bridgeStatusCall{allocationID, user})
+	if f.statusFn != nil {
+		return f.statusFn(ctx, allocationID, user)
+	}
+	return ReservationStatus{}, nil
 }
 func (f *bridgeBackend) Reserve(ctx context.Context, key string, users []string) (ReservationResult, error) {
 	f.calls = append(f.calls, "reserve")
@@ -118,7 +133,7 @@ func bridgeHooks(t *testing.T, backend Backend) (*bridgeInitializer, Config) {
 	if i.beforeName != "MatchmakerAdd" || i.before == nil || i.matched == nil {
 		t.Fatal("bridge must register queue admission and matchmaker matched hooks")
 	}
-	wantRPCs := []string{CurrentRPC, AssignmentRPC, ResumeRPC, CancelRPC}
+	wantRPCs := []string{CurrentRPC, StatusRPC, AssignmentRPC, ResumeRPC, CancelRPC}
 	if len(i.rpcs) != len(wantRPCs) {
 		t.Fatalf("registered RPCs = %v, want exactly %v", mapKeys(i.rpcs), wantRPCs)
 	}
@@ -127,7 +142,7 @@ func bridgeHooks(t *testing.T, backend Backend) (*bridgeInitializer, Config) {
 			t.Fatalf("missing RPC %q", name)
 		}
 	}
-	if len(i.registered) != 6 {
+	if len(i.registered) != 7 {
 		t.Fatalf("registration touched unexpected runtime surfaces: %v", i.registered)
 	}
 	return i, cfg
@@ -148,6 +163,11 @@ func bridgeCtx(user string) context.Context {
 func bridgeProfilePayload() string {
 	cfg := bridgeTestConfig()
 	return fmt.Sprintf(`{"version":%q,"compatibility":%q,"region":%q}`, RoomVersion, cfg.Compatibility, cfg.Region)
+}
+
+func bridgeStatusPayload(allocationID string) string {
+	cfg := bridgeTestConfig()
+	return fmt.Sprintf(`{"version":%q,"compatibility":%q,"region":%q,"allocationId":%q}`, RoomVersion, cfg.Compatibility, cfg.Region, allocationID)
 }
 
 func bridgeTicketPayload(allocationID, requestID string, previous int64) string {
@@ -174,7 +194,7 @@ func assertNoBackendCalls(t *testing.T, backend *bridgeBackend) {
 func TestRegisterInstallsOnlyPlayerBridgeHooksAndRPCs(t *testing.T) {
 	backend := &bridgeBackend{}
 	i, _ := bridgeHooks(t, backend)
-	if !reflect.DeepEqual(i.registered, []string{"before:MatchmakerAdd", "matched", "rpc:" + CurrentRPC, "rpc:" + AssignmentRPC, "rpc:" + ResumeRPC, "rpc:" + CancelRPC}) {
+	if !reflect.DeepEqual(i.registered, []string{"before:MatchmakerAdd", "matched", "rpc:" + CurrentRPC, "rpc:" + StatusRPC, "rpc:" + AssignmentRPC, "rpc:" + ResumeRPC, "rpc:" + CancelRPC}) {
 		t.Fatalf("unexpected registrations: %v", i.registered)
 	}
 	assertNoBackendCalls(t, backend)
@@ -342,11 +362,37 @@ func TestCurrentRPCUsesAuthenticatedContextUserAndRejectsCallerParticipantField(
 	}
 }
 
+func TestStatusRPCUsesAuthenticatedUserWithoutCurrentReservationCheck(t *testing.T) {
+	backend := &bridgeBackend{statusFn: func(_ context.Context, allocationID, user string) (ReservationStatus, error) {
+		if allocationID != "alloc_123" || user != "authenticated-player" {
+			t.Fatalf("status request used caller data: allocation=%q user=%q", allocationID, user)
+		}
+		r := Reservation{AllocationID: allocationID, State: "technical_aborted", FailureCode: "host_process_terminated"}
+		return ReservationStatus{Reservation: r}, nil
+	}}
+	i, _ := bridgeHooks(t, backend)
+	result, err := i.rpcs[StatusRPC](bridgeCtx("authenticated-player"), nil, nil, nil, bridgeStatusPayload("alloc_123"))
+	if err != nil || !strings.Contains(result, `"technical_aborted"`) || !strings.Contains(result, `"host_process_terminated"`) {
+		t.Fatalf("technical status lookup failed: result=%q err=%v", result, err)
+	}
+	if !reflect.DeepEqual(backend.calls, []string{"status"}) || !reflect.DeepEqual(backend.statusArgs, []bridgeStatusCall{{"alloc_123", "authenticated-player"}}) || len(backend.currentUsers) != 0 {
+		t.Fatalf("status must call the history endpoint directly with the authenticated user: calls=%v args=%v current=%v", backend.calls, backend.statusArgs, backend.currentUsers)
+	}
+
+	forged := strings.TrimSuffix(bridgeStatusPayload("alloc_123"), "}") + `,"participantId":"victim-player"}`
+	_, err = i.rpcs[StatusRPC](bridgeCtx("authenticated-player"), nil, nil, nil, forged)
+	assertBridgeError(t, err, 3, "invalid payload")
+	if len(backend.statusArgs) != 1 {
+		t.Fatal("caller-supplied participantId reached status endpoint")
+	}
+}
+
 func TestPlayerRPCAuthenticationPayloadAndProfilesPreflightWithoutBackendCalls(t *testing.T) {
 	backend := &bridgeBackend{}
 	i, cfg := bridgeHooks(t, backend)
 	for route, payload := range map[string]string{
 		CurrentRPC:    bridgeProfilePayload(),
+		StatusRPC:     bridgeStatusPayload("alloc_123"),
 		CancelRPC:     fmt.Sprintf(`{"version":%q,"compatibility":%q,"region":%q,"allocationId":"alloc_123"}`, RoomVersion, cfg.Compatibility, cfg.Region),
 		AssignmentRPC: bridgeTicketPayload("alloc_123", "attempt_123", 0),
 		ResumeRPC:     bridgeTicketPayload("alloc_123", "attempt_123", 1),
@@ -378,6 +424,7 @@ func TestPlayerRPCAuthenticationPayloadAndProfilesPreflightWithoutBackendCalls(t
 		{ResumeRPC, bridgeTicketPayload("alloc_123", "attempt_123", 0)},
 		{ResumeRPC, `{"version":"gamefleet.player-room.v1","compatibility":"build-2026-09","region":"local-west","allocationId":"alloc_123","requestId":"attempt_123","previousConnectionGeneration":null}`},
 		{CancelRPC, fmt.Sprintf(`{"version":%q,"compatibility":%q,"region":%q,"allocationId":"bad/id"}`, RoomVersion, cfg.Compatibility, cfg.Region)},
+		{StatusRPC, bridgeStatusPayload("bad/id")},
 	} {
 		_, err := i.rpcs[tc.route](bridgeCtx("player-a"), nil, nil, nil, tc.payload)
 		assertBridgeError(t, err, 3, "invalid payload")

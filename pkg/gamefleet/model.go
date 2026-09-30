@@ -4,6 +4,7 @@ package gamefleet
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"time"
 )
@@ -32,6 +33,7 @@ type Reservation struct {
 	RevisionID            string    `json:"revisionId"`
 	Region                string    `json:"region"`
 	State                 string    `json:"state"`
+	FailureCode           string    `json:"failureCode,omitempty"`
 	CancellationRequested bool      `json:"cancellationRequested"`
 	CreatedAt             time.Time `json:"createdAt"`
 	UpdatedAt             time.Time `json:"updatedAt"`
@@ -47,6 +49,9 @@ type CurrentResult struct {
 type ReservationResult struct {
 	Reservation Reservation `json:"reservation"`
 	Replay      bool        `json:"replay"`
+}
+type ReservationStatus struct {
+	Reservation Reservation `json:"reservation"`
 }
 type Ticket struct {
 	ID         string    `json:"id"`
@@ -77,6 +82,7 @@ type AssignmentResult struct {
 // creation, admission override, database or Kubernetes access.
 type Backend interface {
 	Current(context.Context, string) (CurrentResult, error)
+	Status(context.Context, string, string) (ReservationStatus, error)
 	Reserve(context.Context, string, []string) (ReservationResult, error)
 	Issue(context.Context, string, string, string, int64, bool) (AssignmentResult, error)
 	Cancel(context.Context, string) (ReservationResult, error)
@@ -94,14 +100,23 @@ func (r *Reservation) UnmarshalJSON(raw []byte) error {
 	type plain Reservation
 	var wire struct {
 		*plain
-		Required *bool `json:"cancellationRequested"`
+		Required    *bool           `json:"cancellationRequested"`
+		FailureCode json.RawMessage `json:"failureCode"`
 	}
 	wire.plain = (*plain)(r)
+	r.FailureCode = ""
 	if err := strictObject(raw, &wire); err != nil {
 		return err
 	}
 	if wire.Required == nil {
 		return errors.New("missing cancellationRequested")
+	}
+	if wire.FailureCode != nil {
+		var failureCode *string
+		if err := json.Unmarshal(wire.FailureCode, &failureCode); err != nil || failureCode == nil {
+			return errors.New("invalid failureCode")
+		}
+		r.FailureCode = *failureCode
 	}
 	r.CancellationRequested = *wire.Required
 	return nil

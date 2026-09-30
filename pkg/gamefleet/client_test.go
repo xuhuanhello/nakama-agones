@@ -97,6 +97,11 @@ func TestClientHTTPContractAndExactReplay(t *testing.T) {
 				t.Errorf("current payload: %v", payload)
 			}
 			respond(w, CurrentResult{Current: &Current{Reservation: testReservation(), ConnectionGeneration: 2}})
+		case "/business/v1/reservations/allocation-one/status":
+			if r.Method != http.MethodPost || !reflect.DeepEqual(payload, map[string]any{"version": RoomVersion, "participantId": "player-one"}) {
+				t.Errorf("status request: method=%s payload=%v", r.Method, payload)
+			}
+			respond(w, ReservationStatus{Reservation: testReservation()})
 		case "/business/v1/reservations":
 			if payload["version"] != RoomVersion || payload["compatibility"] != "dm-v1" || payload["idempotencyKey"] != "request-1234" {
 				t.Errorf("reserve payload: %v", payload)
@@ -131,6 +136,10 @@ func TestClientHTTPContractAndExactReplay(t *testing.T) {
 	cur, err := c.Current(ctx, "player-one")
 	if err != nil || cur.Current.ConnectionGeneration != 2 {
 		t.Fatalf("current: %v", err)
+	}
+	status, err := c.Status(ctx, "allocation-one", "player-one")
+	if err != nil || status.Reservation.State != "prepared" {
+		t.Fatalf("status: %+v %v", status, err)
 	}
 	if _, err = c.Reserve(ctx, "request-1234", []string{"player-one", "player-two"}); err != nil {
 		t.Fatal(err)
@@ -183,6 +192,11 @@ func TestClientMalformedResponsesAndScopeChangesFailClosed(t *testing.T) {
 		{name: "foreign revision", mutate: func(r CurrentResult) any { r.Current.Reservation.RevisionID = "other"; return r }},
 		{name: "foreign region", mutate: func(r CurrentResult) any { r.Current.Reservation.Region = "other"; return r }},
 		{name: "completed held", mutate: func(r CurrentResult) any { r.Current.Reservation.State = "completed"; return r }},
+		{name: "technical abort held", mutate: func(r CurrentResult) any {
+			r.Current.Reservation.State = "technical_aborted"
+			r.Current.Reservation.FailureCode = "host_process_terminated"
+			return r
+		}},
 		{name: "missing generation", mutate: func(r CurrentResult) any {
 			return map[string]any{"current": map[string]any{"reservation": r.Current.Reservation}}
 		}},
@@ -286,6 +300,10 @@ func TestClientRejectsInvalidRequestsBeforeHTTP(t *testing.T) {
 	statusError(t, e, 422)
 	_, e = c.Cancel(ctx, "../other")
 	statusError(t, e, 422)
+	_, e = c.Status(ctx, "../other", "player-one")
+	statusError(t, e, 422)
+	_, e = c.Status(ctx, "allocation-one", " player-one")
+	statusError(t, e, 422)
 	for _, v := range []struct {
 		gen    int64
 		resume bool
@@ -295,6 +313,50 @@ func TestClientRejectsInvalidRequestsBeforeHTTP(t *testing.T) {
 	}
 	if calls.Load() != 0 {
 		t.Fatal("invalid request reached HTTP")
+	}
+}
+
+func TestClientStatusValidatesAbortedCodeScopeAllocationAndStrictEnvelope(t *testing.T) {
+	validAborted := testReservation()
+	validAborted.State = "technical_aborted"
+	validAborted.FailureCode = "host_process_terminated"
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		respond(w, ReservationStatus{Reservation: validAborted})
+	}))
+	out, err := mustClient(t, s.URL).Status(context.Background(), "allocation-one", "player-one")
+	s.Close()
+	if err != nil || out.Reservation.State != "technical_aborted" || out.Reservation.FailureCode != "host_process_terminated" {
+		t.Fatalf("valid technical status rejected: %+v %v", out, err)
+	}
+
+	for _, tc := range []struct {
+		name   string
+		mutate func(*ReservationStatus) any
+	}{
+		{name: "wrong allocation", mutate: func(s *ReservationStatus) any { s.Reservation.AllocationID = "another-allocation"; return s }},
+		{name: "foreign application", mutate: func(s *ReservationStatus) any { s.Reservation.ApplicationID = "other"; return s }},
+		{name: "foreign placement", mutate: func(s *ReservationStatus) any { s.Reservation.PlacementID = "other"; return s }},
+		{name: "foreign revision", mutate: func(s *ReservationStatus) any { s.Reservation.RevisionID = "other"; return s }},
+		{name: "foreign region", mutate: func(s *ReservationStatus) any { s.Reservation.Region = "other"; return s }},
+		{name: "unknown state", mutate: func(s *ReservationStatus) any { s.Reservation.State = "aborted"; return s }},
+		{name: "missing aborted code", mutate: func(s *ReservationStatus) any { s.Reservation.State = "technical_aborted"; return s }},
+		{name: "wrong aborted code", mutate: func(s *ReservationStatus) any {
+			s.Reservation.State = "technical_aborted"
+			s.Reservation.FailureCode = "other"
+			return s
+		}},
+		{name: "failure code on normal state", mutate: func(s *ReservationStatus) any { s.Reservation.FailureCode = "host_process_terminated"; return s }},
+		{name: "replay member", mutate: func(s *ReservationStatus) any { return map[string]any{"reservation": s.Reservation, "replay": false} }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				reservation := ReservationStatus{Reservation: testReservation()}
+				respond(w, tc.mutate(&reservation))
+			}))
+			defer server.Close()
+			_, err := mustClient(t, server.URL).Status(context.Background(), "allocation-one", "player-one")
+			statusError(t, err, 502)
+		})
 	}
 }
 
@@ -388,5 +450,37 @@ func TestRequiredLifecycleAndReplayFields(t *testing.T) {
 		_, err := c.Issue(context.Background(), "allocation-one", "player-one", "attempt-1234", 2, true)
 		statusError(t, err, 502)
 		s.Close()
+	}
+}
+
+func TestReservationFailureCodeRejectsNullWireValue(t *testing.T) {
+	fields := map[string]any{}
+	raw, err := json.Marshal(testReservation())
+	if err != nil || json.Unmarshal(raw, &fields) != nil {
+		t.Fatal("marshal reservation fixture", err)
+	}
+	fields["failureCode"] = nil
+	raw, err = json.Marshal(fields)
+	if err != nil {
+		t.Fatal("marshal null failure code", err)
+	}
+	var reservation Reservation
+	if strictObject(raw, &reservation) == nil {
+		t.Fatal("explicit null failureCode silently became an absent value")
+	}
+
+	fields["failureCode"] = "host_process_terminated"
+	raw, err = json.Marshal(fields)
+	if err != nil || strictObject(raw, &reservation) != nil || reservation.FailureCode != "host_process_terminated" {
+		t.Fatalf("string failureCode did not decode: value=%q err=%v", reservation.FailureCode, err)
+	}
+	delete(fields, "failureCode")
+	raw, err = json.Marshal(fields)
+	if err != nil {
+		t.Fatal("marshal absent failure code", err)
+	}
+	reservation.FailureCode = "stale-value"
+	if strictObject(raw, &reservation) != nil || reservation.FailureCode != "" {
+		t.Fatalf("absent failureCode retained a stale decode value: %+v", reservation)
 	}
 }

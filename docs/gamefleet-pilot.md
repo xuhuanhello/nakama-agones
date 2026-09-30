@@ -1,6 +1,8 @@
 # Nakama → GameFleet pilot 接入说明
 
 > 候选代码说明：本阶段未部署 GameFleet，也没有真实 Fixed 联机验收。只在明确切换后启用 pilot。业务 key 是机器凭据，不能发给客户端。
+>
+> 本文描述的是 Nakama 候选适配器与对应 GameFleet 候选 Business API/client 的协调契约；不表示最终生产迁移已执行，也不表示 GameFleet Business API 的生产 HTTPS gate 已完成。普通 Agones backend 未改变。
 
 ## 模式与边界
 
@@ -9,7 +11,7 @@
 | 未设置或 `agones` | 默认旧 Agones/FleetManager 流程 |
 | `gamefleet` | 注册 GameFleet 玩家桥接；不连接旧 fleet DB，不创建 FleetManager、Kubernetes client、迁移、管理 HTTP 路由或 reconciliation worker |
 
-旧模式仍保留。GameFleet 模式只注册下文四个 `gamefleet_*_v1` RPC，不提供旧 `agones_fleet_*` RPC。启动会先校验 loopback Business API 和 caller scope；配置或权限校验失败时启动失败，不自动回退旧模式，也不双写分配。
+旧模式仍保留。GameFleet 模式只注册下文五个 `gamefleet_*_v1` RPC：current、historical status、assignment、resume 和 cancel；不提供旧 `agones_fleet_*` RPC。启动会先校验 loopback Business API 和 caller scope；配置或权限校验失败时启动失败，不自动回退旧模式，也不双写分配。旧 `agones` backend 的注册与行为保持不变。
 
 本 pilot 是单 caller scope。GameFleet owner 配置中的 participant allowlist 必须包含此 Nakama pilot 的**精确 Nakama user ID**。当前实现直接把已认证的 Nakama user ID 作为 `participantId`，没有自定义身份映射。
 
@@ -50,7 +52,7 @@ GameFleet caller scope 必须固定到上述 application、placement、revision�
 
 匹配后客户端仍收到 Nakama 普通 matched 信号。这个信号本身不保证预约成功，也不能拿 Nakama 默认 match token 直接连接游戏服。若信号、通知或服务端响应丢失，客户端重新认证后调用 `gamefleet_current_v1` 恢复，不依赖客户端保存 allocation ID，也不需要 Nakama 维护 user→allocation 第二账本。
 
-如果 current 返回 null，客户端只能显示有界的等待或分配失败状态，由玩家重试匹配；不能把 matched 信号当作已有房间，也不能在客户端自行创建 fallback 房间。null 仅表示当前 caller scope 内没有 held reservation，不是跨 caller 的空闲证明。
+如果 current 返回 null，客户端只能显示有界的等待或分配失败状态，由玩家重试匹配；不能把 matched 信号当作已有房间，也不能在客户端自行创建 fallback 房间。reservation 释放后 current 继续返回 null；null 只表示当前 caller scope 内没有 held reservation，不是跨 caller 的空闲证明。需要展示已释放 reservation 的最终状态时，认证玩家可单独调用 status。
 
 ## RPC 请求
 
@@ -59,6 +61,7 @@ GameFleet caller scope 必须固定到上述 application、placement、revision�
 | RPC | 用途 |
 |---|---|
 | `gamefleet_current_v1` | 查找认证玩家在本 caller scope 持有的 reservation |
+| `gamefleet_status_v1` | 按 allocation ID 读取认证玩家有历史座位的 reservation 状态，包括释放后的终态 |
 | `gamefleet_assignment_v1` | generation 0 的首次 join 票据 |
 | `gamefleet_resume_v1` | 按当前持久化 generation 申请恢复票据 |
 | `gamefleet_cancel_v1` | 为该玩家当前持有的 reservation 记录取消意图 |
@@ -98,6 +101,19 @@ Current 请求：
 
 这是恢复快照，不是在线状态证明。`connectionGeneration: 0` 表示尚无已消费连接代次，可以尝试 assignment；正数是 resume 的期望旧代次，**不表示 socket 在线**。后续票据请求仍由 GameFleet 校验 reservation 和 generation CAS。
 
+Historical status 请求沿用 profile，并增加 allocation ID；RPC 从 Nakama 认证上下文取得玩家身份，payload 不接受 `participantId`：
+
+```json
+{
+  "version": "gamefleet.player-room.v1",
+  "compatibility": "<GAMEFLEET_COMPATIBILITY>",
+  "region": "<GAMEFLEET_REGION>",
+  "allocationId": "<allocation-id-from-current-or-prior-session>"
+}
+```
+
+`gamefleet_status_v1` 不先查 current，因此 reservation 释放后仍可查询。GameFleet 按历史 seat 记录确认该认证玩家属于 reservation，并核对原 caller、application、identity issuer、placement 和 revision scope；其他 caller 或没有该 reservation 历史 seat 的玩家不能据此获知房间信息。成功响应只有 `{"reservation": ...}`，没有 replay、ticket 或 endpoint。普通 reservation 状态为 `reserved`、`prepared`、`completed`；受信任的 host 进程终止会返回 `state: "technical_aborted"` 和 `failureCode: "host_process_terminated"`。该 `failureCode` 只用于 `technical_aborted`；适配器严格校验这一组合。`Current` 不会把 completed 或 technical-aborted 的释放 reservation 当作 held reservation 返回。
+
 Assignment 示例：
 
 ```json
@@ -128,7 +144,7 @@ Cancel 示例：
 }
 ```
 
-桥接会先以认证 user ID 查询 current，并要求 allocation ID 精确匹配后才请求 GameFleet cancel；缺少 current 或 ID 不匹配时拒绝。GameFleet 的 cancel 是持久化意图，不会强制关闭房间或释放座位。只要 reservation 仍 held，后续 current 仍可返回它，并通过 `cancellationRequested` 显示取消意图。当前没有接入游戏房间的取消 callback，因此不能把 cancel 成功描述成玩家已退出或房间已结束。有效 natural-close 生命周期仍负责释放 reservation。
+桥接会先以认证 user ID 查询 current，并要求 allocation ID 精确匹配后才请求 GameFleet cancel；缺少 current 或 ID 不匹配时拒绝。GameFleet 的 cancel 对 held reservation 只记录持久化意图，不会强制关闭房间或释放座位；terminal reservation 的 cancel 是 no-op。只要 reservation 仍 held，后续 current 仍可返回它，并通过 `cancellationRequested` 显示取消意图。当前没有接入游戏房间的取消 callback，因此不能把 cancel 成功描述成玩家已退出或房间已结束。有效 natural-close 生命周期仍负责释放 reservation；释放后 current 为 null，status 用于读取历史终态。
 
 ## 上线前检查
 
@@ -136,14 +152,14 @@ Cancel 示例：
 - [ ] Business key 文件在容器中为普通文件，权限 `0600` 或 `0400`；不要把 key 打入镜像或日志。
 - [ ] GameFleet caller scope 元数据一致，含全部五项权限；participant allowlist 是精确 Nakama user ID。
 - [ ] 客户端请求的 protocol/build/region 与服务端配置完全一致；pilot 新旧客户端与 RPC 不混用。
-- [ ] 用隔离测试凭据验证 current 恢复、同一 `requestId` 重试、resume generation 冲突、cancel 仅记录意图。
+- [ ] 用隔离测试凭据验证 current 恢复、释放后的双人 status 读取、同一 `requestId` 重试、resume generation 冲突、cancel 仅记录意图。
 - [ ] 记录 pilot 仍未部署、未进行真实 Fixed 联机验收；通过本清单不等于生产启用。
 
 本说明依据 `pkg/gamefleet/{setup,bridge,client,model}.go` 和 `pkg/fleetmanager/setup.go` 当前实现编写。
 
 ## 本阶段验证
 
-本候选已通过新旧模式、全部 Go 单元测试、`go vet` 与 race 检查。新增测试覆盖同匹配回调反序重放、认证身份、他人房间取消、同次入场的稳定请求 ID、未授权/缺字段响应、代理/重定向隔离及启动时 scope 校验。
+本候选已通过新旧模式、全部 Go 单元测试、`go vet` 与 race 检查。新增测试覆盖同匹配回调反序重放、认证身份、他人房间取消、同次入场的稳定请求 ID、未授权/缺字段响应、代理/重定向隔离及启动时 scope 校验。协调后的 P4h 隔离 HTTP 验证还确认同一 reservation 的两名历史 seat 玩家都能读取 status，技术终止后 current 为 null 而 status 保留 terminal 状态；这仍是候选隔离验收，不是最终生产迁移或 HTTPS Business API gate 验收。
 
 另外用 GameFleet 候选提交 `3bed77d8fdc8bd68bee71f0c728fdfb3f840bc87` 的真实 `BusinessHandler`、隔离 SQLite、自动生成测试 Key 和签名房间回执完成了跨仓库 HTTP 合约验证：current、reserve replay、join replay、consume 后 superseded、resume、stale endpoint、cancel held 与 key revocation。复现：
 

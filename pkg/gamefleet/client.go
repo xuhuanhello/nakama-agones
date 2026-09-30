@@ -167,9 +167,12 @@ func strictObject(raw []byte, out any) error {
 }
 
 func (c *Client) validReservation(r Reservation) bool {
+	stateValid := r.State == "reserved" || r.State == "prepared" || r.State == "completed" ||
+		(r.State == "technical_aborted" && r.FailureCode == "host_process_terminated")
+	failureCodeValid := r.State == "technical_aborted" || r.FailureCode == ""
 	return opaqueID.MatchString(r.AllocationID) && opaqueID.MatchString(r.ReservationID) && opaqueID.MatchString(r.RoomID) &&
 		r.ApplicationID == c.config.ApplicationID && r.PlacementID == c.config.PlacementID && r.RevisionID == c.config.RevisionID && r.Region == c.config.Region &&
-		(r.State == "reserved" || r.State == "prepared" || r.State == "completed") && !r.CreatedAt.IsZero() && !r.UpdatedAt.Before(r.CreatedAt)
+		stateValid && failureCodeValid && !r.CreatedAt.IsZero() && !r.UpdatedAt.Before(r.CreatedAt)
 }
 
 func (c *Client) Current(ctx context.Context, user string) (CurrentResult, error) {
@@ -192,11 +195,23 @@ func (c *Client) Current(ctx context.Context, user string) (CurrentResult, error
 		Reservation          Reservation `json:"reservation"`
 		ConnectionGeneration *int64      `json:"connectionGeneration"`
 	}
-	if strictObject(wire.Current, &current) != nil || current.ConnectionGeneration == nil || !c.validReservation(current.Reservation) || current.Reservation.State == "completed" || *current.ConnectionGeneration < 0 || *current.ConnectionGeneration > MaxGeneration {
+	if strictObject(wire.Current, &current) != nil || current.ConnectionGeneration == nil || !c.validReservation(current.Reservation) || current.Reservation.State == "completed" || current.Reservation.State == "technical_aborted" || *current.ConnectionGeneration < 0 || *current.ConnectionGeneration > MaxGeneration {
 		return out, &Error{Status: 502}
 	}
 	out.Current = &Current{Reservation: current.Reservation, ConnectionGeneration: *current.ConnectionGeneration}
 	return out, nil
+}
+
+func (c *Client) Status(ctx context.Context, allocationID, user string) (ReservationStatus, error) {
+	var out ReservationStatus
+	if !opaqueID.MatchString(allocationID) || !exactText(user, 256) {
+		return out, &Error{Status: 422}
+	}
+	err := c.call(ctx, "POST", "/business/v1/reservations/"+allocationID+"/status", map[string]string{"version": RoomVersion, "participantId": user}, &out, 200)
+	if err == nil && (!c.validReservation(out.Reservation) || out.Reservation.AllocationID != allocationID) {
+		err = &Error{Status: 502}
+	}
+	return out, err
 }
 
 func (c *Client) Reserve(ctx context.Context, key string, users []string) (ReservationResult, error) {
