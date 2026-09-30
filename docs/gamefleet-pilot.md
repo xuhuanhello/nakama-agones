@@ -51,6 +51,8 @@ GameFleet caller scope 必须固定到上述 application、placement、revision�
 
 `gamefleet_protocol` 使用 `RoomVersion`（`gamefleet.player-room.v1`）；search RPC 与 Business API 使用 `SearchVersion`（`gamefleet.player-search.v1`）。兼容 build 和 region 必须与 Nakama 配置一致。请求 count 为 2。入队前 Nakama 会用认证用户身份检查该 `gamefleet_search_id` 确属本人、仍为 pending 且 profile 匹配；不会改写 Matchmaker query。最终匹配时，它核对两个认证 Presence user ID、search ID 和 Nakama ticket 均有效且互不相同，再按稳定顺序提交这一整对，由 Business API 绑定 searches 并建立 reservation。玩家身份取自 Nakama `Presence` 或 RPC 的认证 `RUNTIME_CTX_USER_ID`，不接受 payload 自报 user ID；同一 matched 回调重试会使用相同幂等身份。
 
+刚提交的新房间占用可能暂时还没出现在 host 的签名库存上报中，紧随其后的另一组匹配因此可能收到 `409`。`MatchSearches` 只对 `409`/`429` 有界重试：最多 20 次请求、总计最多 8 秒，退避从 100 ms 倍增并封顶 500 ms；caller 更短的 deadline 优先。每次重试固定使用相同 idempotency key 和原始双人快照（participant ID、search ID、Nakama ticket），不会换玩家、生成新 search 或改写身份。`401`/`403`/`404`/`422`/`503`、其他非瞬态响应及畸形成功响应都立即返回；上游 `502` 对调用者归一为 `503` 并立即返回。Begin、search cancel、assignment 和 resume 的重试语义不变。以上是候选客户端边界，不表示当前真实验收已经通过。
+
 匹配后客户端仍收到 Nakama 普通 matched 信号。这个信号本身不保证预约成功，也不能拿 Nakama 默认 match token 直接连接游戏服。若 begin 响应不确定，使用原 `requestId` 重试以取得相同 search；若入队或 matched 通知结果不确定，使用 `gamefleet_search_status_v1` 查询已知 `searchId`。`bound` 可恢复已建立的 reservation；`pending`、`cancelled` 或 `expired` 表示仍需按对应状态处理。取得 allocation 后，`gamefleet_current_v1` 仍用于恢复当前 held reservation。
 
 `Current` 返回 null 不能判断 search 是否 pending、cancelled 或 bound；search 状态要查 `gamefleet_search_status_v1`。reservation 释放后 current 也返回 null；null 只表示当前 caller scope 内没有 held reservation，不是跨 caller 的空闲证明。如果 current 为 null 且 search 仍 pending，客户端应按 search 状态继续等待或取消排队；不能把 matched 信号当作已有房间，也不能自行创建 fallback 房间。需要展示已释放 reservation 的最终状态时，认证玩家可单独调用 historical status。
