@@ -42,16 +42,41 @@ func RegisterFromEnv(ctx context.Context, logger runtime.Logger, _ *sql.DB, _ ru
 	if err != nil {
 		return err
 	}
-	if err = client.CheckScope(ctx); err != nil {
+	var archive *TerminalArchiveClient
+	closeClients := func() {
 		client.Close()
+		if archive != nil {
+			archive.Close()
+		}
+	}
+	if err = client.CheckScope(ctx); err != nil {
+		closeClients()
 		return errors.New("GameFleet business scope preflight failed")
 	}
-	if err = Register(initializer, client, cfg); err != nil {
-		client.Close()
+	var backend Backend = client
+	archiveCfg, err := ArchiveConfigFromEnv()
+	if err != nil {
+		closeClients()
 		return err
 	}
-	if err = initializer.RegisterShutdown(func(context.Context, runtime.Logger, *sql.DB, runtime.NakamaModule) { client.Close() }); err != nil {
-		client.Close()
+	if archiveCfg != nil {
+		archive, err = NewTerminalArchiveClient(*archiveCfg)
+		if err != nil {
+			closeClients()
+			return err
+		}
+		if err = archive.CheckScope(ctx); err != nil {
+			closeClients()
+			return errors.New("GameFleet archive scope preflight failed")
+		}
+		backend = &terminalArchiveBackend{Backend: client, archive: archive, archiveScope: *archiveCfg}
+	}
+	if err = Register(initializer, backend, cfg); err != nil {
+		closeClients()
+		return err
+	}
+	if err = initializer.RegisterShutdown(func(context.Context, runtime.Logger, *sql.DB, runtime.NakamaModule) { closeClients() }); err != nil {
+		closeClients()
 		return err
 	}
 	logger.Info("GameFleet pilot bridge registered; allocation and capacity are owned by GameFleet")

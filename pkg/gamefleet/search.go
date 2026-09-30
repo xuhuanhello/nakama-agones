@@ -161,10 +161,36 @@ func (c *Client) MatchSearches(ctx context.Context, key string, members []Search
 		Key           string              `json:"idempotencyKey"`
 		Compatibility string              `json:"compatibility"`
 		Members       []SearchMatchMember `json:"members"`
-	}{SearchVersion, key, c.config.Compatibility, members}
-	err := c.call(ctx, "POST", "/business/v1/searches/match", body, &out, 200, 202)
-	if err == nil && !c.validReservation(out.Reservation) {
-		err = &Error{Status: 502}
+	}{SearchVersion, key, c.config.Compatibility, append([]SearchMatchMember(nil), members...)}
+	// A just-committed room can make the host's previous inventory temporarily
+	// inconsistent until its next signed report. Nakama consumes the matched
+	// queue entries even when the callback fails, so resolve that brief window
+	// here with the exact same immutable match request. A committed replay can
+	// only return its original allocation; no player/search/ticket is replaced.
+	retryCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+	delay := 100 * time.Millisecond
+	for attempt := 0; attempt < 20; attempt++ {
+		out = ReservationResult{}
+		err := c.call(retryCtx, "POST", "/business/v1/searches/match", body, &out, 200, 202)
+		if err == nil {
+			if !c.validReservation(out.Reservation) {
+				return ReservationResult{}, &Error{Status: 502}
+			}
+			return out, nil
+		}
+		var conflict *Error
+		if !errors.As(err, &conflict) || (conflict.Status != 409 && conflict.Status != 429) || attempt == 19 || retryCtx.Err() != nil {
+			return ReservationResult{}, err
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-retryCtx.Done():
+			timer.Stop()
+			return ReservationResult{}, err
+		case <-timer.C:
+		}
+		delay = min(delay*2, 500*time.Millisecond)
 	}
-	return out, err
+	return ReservationResult{}, &Error{Status: 503}
 }
