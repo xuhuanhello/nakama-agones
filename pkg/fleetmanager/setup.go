@@ -56,6 +56,8 @@ func NewFromEnv(ctx context.Context) (manager *Manager, close func(), err error)
 // bridge. It owns the matchmaker-matched hook; compose existing game hooks first.
 func RegisterFromEnv(ctx context.Context, logger runtime.Logger, db *sql.DB, nk runtime.NakamaModule, initializer runtime.Initializer) error {
 	switch os.Getenv("NAKAMA_FLEET_BACKEND") {
+	case "gamefleet-service":
+		return gamefleet.RegisterServiceFromEnv(ctx, logger, db, nk, initializer)
 	case "gamefleet":
 		return gamefleet.RegisterFromEnv(ctx, logger, db, nk, initializer)
 	case "", "agones":

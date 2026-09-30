@@ -79,12 +79,22 @@ jobs:
           python3 scripts/test-gamefleet-runtime.py \
             --image nakama-agones-local:dev \
             --evidence .local/gamefleet-runtime-result.json
+      - name: Validate independent service hooks in the official Nakama runtime
+        run: |
+          python3 scripts/test-gamefleet-runtime.py \
+            --backend gamefleet-service \
+            --image nakama-agones-local:dev \
+            --evidence .local/gamefleet-runtime-service-result.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: safe-integration-result
-          path: .local/smoke-result.json
+          path: |
+            .local/smoke-result.json
+            .local/gamefleet-runtime-result.json
+            .local/gamefleet-runtime-service-result.json
           if-no-files-found: ignore
+          retention-days: 7
       - if: always()
         run: |
           if [ -x .local/tools/k3d ]; then python3 scripts/local_cluster.py reset; fi
