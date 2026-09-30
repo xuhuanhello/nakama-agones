@@ -180,11 +180,11 @@ Cancel 示例：
 
 ## 本阶段验证
 
-I2b 候选桥接含 search RPC 与 Matchmaker 关联；客户端 I3 接入、以及真实 Nakama Matchmaker / 双人游戏流程的 I4 实机验收仍未完成，未部署上线。
-
-当前 I2b 的本地 HTTP/RPC、race 与真实平台跨仓库契约结果见 [I2b 记录](validation/2026-09-30-search-bridge-i2b.md)。下述 P4h 结果保留为前一阶段证据，不能替代新增 search 流程的运行时验收。
+I2b 官方运行时 smoke 已通过：提交 `ca71bfb` 的 [Nakama CI 36668798446](https://github.com/xuhuanhello/nakama-agones/actions/runs/36668798446) 成功，Secret scan 36668798503 也通过。官方 Nakama 3.41.0 加载候选插件，合成玩家通过 WebSocket 执行 search、MatchmakerAdd/Matched、cancel 与越权拒绝；启动 scope 拒绝也按预期失败关闭。详见 [I2b 验收记录](validation/2026-09-30-search-bridge-i2b.md)。它使用临时 PostgreSQL 和 synthetic Business fixture，不是真实 GameFleet allocation、host/ticket/endpoint 或 Fixed 对局；客户端 I3 和真实 Fixed 游戏 I4 仍未完成，生产未部署。
 
 本候选已通过新旧模式、全部 Go 单元测试、`go vet` 与 race 检查。新增测试覆盖同匹配回调反序重放、认证身份、他人房间取消、同次入场的稳定请求 ID、未授权/缺字段响应、代理/重定向隔离及启动时 scope 校验。协调后的 P4h 隔离 HTTP 验证还确认同一 reservation 的两名历史 seat 玩家都能读取 status，技术终止后 current 为 null 而 status 保留 terminal 状态；这仍是候选隔离验收，不是最终生产迁移或 HTTPS Business API gate 验收。
+
+P4h 的 schema 26 双周期 SIGKILL/rematch 是前一阶段的 Fixed 故障验收；本节 I2b 则是官方 Nakama 插件与 search bridge smoke。两项使用的系统边界不同：P4h 不证明 I2b 插件 runtime，I2b 的 synthetic fixture 也不证明真实 Fixed 对局。
 
 另外用 GameFleet 候选提交 `3bed77d8fdc8bd68bee71f0c728fdfb3f840bc87` 的真实 `BusinessHandler`、隔离 SQLite、自动生成测试 Key 和签名房间回执完成了跨仓库 HTTP 合约验证：current、reserve replay、join replay、consume 后 superseded、resume、stale endpoint、cancel held 与 key revocation。复现：
 
@@ -194,4 +194,4 @@ I2b 候选桥接含 search RPC 与 Matchmaker 关联；客户端 I3 接入、以
 
 此脚本要求本机能运行 Go 1.27.1，并可能下载该工具链/模块；只使用临时 modfile 和源码 overlay，不修改任一仓库的 go.mod，不使用部署配置或真实凭据，不登录 VPS。测试 fixture 位于 `tests/contracts/gamefleet_business_test.go.txt`，依赖该 GameFleet 候选中的测试辅助函数。
 
-上述 BusinessHandler 合约测试不等同于进程加载或真实双人对局。P4d 随后已完成[官方 Nakama 3.41.0 进程加载、认证 RPC 与权限失败退出验收](gamefleet-runtime-validation.md)。Fixed Linux 镜像、实际房间分配和 FishNet 双人对局仍待隔离试点验证。
+此前 P4d 的官方 Nakama 加载与认证 RPC 验收见[记录](gamefleet-runtime-validation.md)；本次 I2b 新增 search/matchmaker runtime 检查，证据见上方记录。Fixed Linux 镜像、真实平台 allocation 和 FishNet 双人对局仍待隔离试点验证。
