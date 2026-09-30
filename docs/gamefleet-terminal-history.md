@@ -101,4 +101,8 @@ Prepared/reserved rooms, pending searches, and bound searches whose rooms are st
 
 ## Verification status
 
-The platform M5c terminal-history API passed its isolated real API acceptance. The Nakama M5d candidate's full local Go suite passed. Nakama CI, deployment of this candidate, and actual player `PlayerPrefs` recovery remain pending. These results do not establish a production cutover or complete player recovery.
+The platform M5d candidate at `d409534a` passed CI run `36698867169`; Nakama baseline `76dfbcf` passed run `36698939144`, and the transient match-conflict fix `b0e383a` passed run `36703453913`. The Nakama candidate also passed local full Go, race, and vet checks.
+
+The isolated M5d acceptance exercised exact-ID reads for 32 original searches and 8 terminal allocations while the original caller remained revoked. Cross-user reads, extra participant fields, and terminal cancel/assignment/resume attempts were rejected; all 13 player-ledger tables retained the same row counts and SHA-256 values. Four real clients later completed two four-shot rooms with matching per-pair state hashes. This result and its limits are recorded in [the M5d validation record](validation/2026-09-30-terminal-history-m5d.md).
+
+This slice does not complete M5 or authorize production cutover. Held-room behavior, service-wide pending-search uniqueness, and allowlist publication and rollback remain unaccepted. The final client preferences were not all empty: original IDs were absent, while four new entries were tied to the just-completed terminal follow-up allocations and passed primary status reads after host retirement.
