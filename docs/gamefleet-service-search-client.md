@@ -41,6 +41,10 @@ Other conflicts—including `service_search_match_conflict` and `service_search_
 
 This client has no `Current`, reservation `Status`, search `Cancel`, reservation `Cancel`, assignment, or resume method. A `gfsvc_` key for these routes does not act as an ordinary caller credential or acquire those permissions. `Close` only closes idle HTTP connections.
 
-## Integration status
+## Verification status
 
-This is a standalone candidate client. It is not constructed or registered by the Nakama runtime or `Bridge`, and it does not implement the existing `Backend` interface. No environment configuration, runtime RPC, Matchmaker hook, or deployment was added here. The existing ordinary-caller client and bridge remain unchanged; this file alone is not a complete migration or an enabled service-search flow.
+Candidate source `56bd43539314332bca634629b4f418d130e60135` passed [CI 36722187038](https://github.com/xuhuanhello/nakama-agones/actions/runs/36722187038) for the source and legacy-integration checks. Local `make test` (the full Go suite and vet) and targeted ServiceSearch race tests also passed. These checks do not constitute real-player matchmaking acceptance. The client is not registered in the Nakama runtime or `Bridge`; no environment configuration or deployment has occurred, and the existing ordinary-caller client and bridge remain unchanged.
+
+## Next integration step
+
+Entry, reconnect, room status/current/cancel, and search cancel should continue through the platform's existing gfsvc History API. That requires a separately explicit History source route, independent of the new-search and match grants. Do not switch to a new source automatically because a read succeeds or `Current` is null. A `ServiceHistoryClient` has not been implemented here.
