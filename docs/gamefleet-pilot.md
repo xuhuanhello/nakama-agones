@@ -2,7 +2,7 @@
 
 > 候选代码说明：本阶段未部署 GameFleet，也没有真实 Fixed 联机验收。只在明确切换后启用 pilot。业务 key 是机器凭据，不能发给客户端。
 >
-> 本文描述的是 Nakama 候选适配器与对应 GameFleet 候选 Business API/client 的协调契约；不表示最终生产迁移已执行，也不表示 GameFleet Business API 的生产 HTTPS gate 已完成。普通 Agones backend 未改变。
+> 本文描述的是 Nakama 候选适配器与对应 GameFleet 候选 Business API/client 的协调契约；客户端 I3 接入和实机 I4 验收尚未完成，代码未上线，也不表示最终生产迁移或 GameFleet Business API 的生产 HTTPS gate 已完成。普通 Agones backend 未改变。
 
 ## 模式与边界
 
@@ -11,7 +11,7 @@
 | 未设置或 `agones` | 默认旧 Agones/FleetManager 流程 |
 | `gamefleet` | 注册 GameFleet 玩家桥接；不连接旧 fleet DB，不创建 FleetManager、Kubernetes client、迁移、管理 HTTP 路由或 reconciliation worker |
 
-旧模式仍保留。GameFleet 模式只注册下文五个 `gamefleet_*_v1` RPC：current、historical status、assignment、resume 和 cancel；不提供旧 `agones_fleet_*` RPC。启动会先校验 loopback Business API 和 caller scope；配置或权限校验失败时启动失败，不自动回退旧模式，也不双写分配。旧 `agones` backend 的注册与行为保持不变。
+旧模式仍保留。GameFleet 模式注册八个 `gamefleet_*_v1` RPC：三项 search RPC，以及 current、historical status、assignment、resume 和 reservation cancel；另注册 MatchmakerAdd admission 与 matched callback。不提供旧 `agones_fleet_*` RPC。启动会先校验 loopback Business API 和 caller scope；配置或权限校验失败时启动失败，不自动回退旧模式，也不双写分配。旧 `agones` backend 的注册与行为保持不变。
 
 本 pilot 是单 caller scope。GameFleet owner 配置中的 participant allowlist 必须包含此 Nakama pilot 的**精确 Nakama user ID**。当前实现直接把已认证的 Nakama user ID 作为 `participantId`，没有自定义身份映射。
 
@@ -38,21 +38,24 @@ GameFleet caller scope 必须固定到上述 application、placement、revision�
 
 ## 匹配和恢复
 
-客户端发起双人 Matchmaker 请求时需带三个 string properties：
+客户端必须先调用 `gamefleet_search_begin_v1` 创建持久 search，再用返回的 `search.searchId` 发起双人 Matchmaker 请求。请求需带以下四个 string properties：
 
 ```json
 {
   "gamefleet_protocol": "gamefleet.player-room.v1",
   "build_hash": "<GAMEFLEET_COMPATIBILITY>",
-  "region": "<GAMEFLEET_REGION>"
+  "region": "<GAMEFLEET_REGION>",
+  "gamefleet_search_id": "<search.searchId>"
 }
 ```
 
-请求 count 为 2。Nakama 在入队前及最终匹配后都会核对版本、build 与 region；最终两名玩家的认证 Presence user ID 必须有效且互不相同。玩家身份取自 Nakama `Presence` 或 RPC 的认证 `RUNTIME_CTX_USER_ID`，不接受 payload 自报 user ID。Nakama 用匹配票据和 profile 生成稳定 reservation 幂等键；同一匹配回调重试会重放同一 reservation。
+`gamefleet_protocol` 使用 `RoomVersion`（`gamefleet.player-room.v1`）；search RPC 与 Business API 使用 `SearchVersion`（`gamefleet.player-search.v1`）。兼容 build 和 region 必须与 Nakama 配置一致。请求 count 为 2。入队前 Nakama 会用认证用户身份检查该 `gamefleet_search_id` 确属本人、仍为 pending 且 profile 匹配；不会改写 Matchmaker query。最终匹配时，它核对两个认证 Presence user ID、search ID 和 Nakama ticket 均有效且互不相同，再按稳定顺序提交这一整对，由 Business API 绑定 searches 并建立 reservation。玩家身份取自 Nakama `Presence` 或 RPC 的认证 `RUNTIME_CTX_USER_ID`，不接受 payload 自报 user ID；同一 matched 回调重试会使用相同幂等身份。
 
-匹配后客户端仍收到 Nakama 普通 matched 信号。这个信号本身不保证预约成功，也不能拿 Nakama 默认 match token 直接连接游戏服。若信号、通知或服务端响应丢失，客户端重新认证后调用 `gamefleet_current_v1` 恢复，不依赖客户端保存 allocation ID，也不需要 Nakama 维护 user→allocation 第二账本。
+匹配后客户端仍收到 Nakama 普通 matched 信号。这个信号本身不保证预约成功，也不能拿 Nakama 默认 match token 直接连接游戏服。若 begin 响应不确定，使用原 `requestId` 重试以取得相同 search；若入队或 matched 通知结果不确定，使用 `gamefleet_search_status_v1` 查询已知 `searchId`。`bound` 可恢复已建立的 reservation；`pending`、`cancelled` 或 `expired` 表示仍需按对应状态处理。取得 allocation 后，`gamefleet_current_v1` 仍用于恢复当前 held reservation。
 
-如果 current 返回 null，客户端只能显示有界的等待或分配失败状态，由玩家重试匹配；不能把 matched 信号当作已有房间，也不能在客户端自行创建 fallback 房间。reservation 释放后 current 继续返回 null；null 只表示当前 caller scope 内没有 held reservation，不是跨 caller 的空闲证明。需要展示已释放 reservation 的最终状态时，认证玩家可单独调用 status。
+`Current` 返回 null 不能判断 search 是否 pending、cancelled 或 bound；search 状态要查 `gamefleet_search_status_v1`。reservation 释放后 current 也返回 null；null 只表示当前 caller scope 内没有 held reservation，不是跨 caller 的空闲证明。如果 current 为 null 且 search 仍 pending，客户端应按 search 状态继续等待或取消排队；不能把 matched 信号当作已有房间，也不能自行创建 fallback 房间。需要展示已释放 reservation 的最终状态时，认证玩家可单独调用 historical status。
+
+`gamefleet_search_cancel_v1` 用于撤回仍 pending 的排队意图；它不等于离开已分配房间。若 SearchStatus 已为 `bound`，应按房间连接/退出及其自然关闭生命周期处理；reservation 的 `gamefleet_cancel_v1` 只记录取消意图，不强制关房或释放座位。
 
 ## RPC 请求
 
@@ -60,11 +63,29 @@ GameFleet caller scope 必须固定到上述 application、placement、revision�
 
 | RPC | 用途 |
 |---|---|
+| `gamefleet_search_begin_v1` | 以当前认证用户和 `requestId` 幂等创建 search |
+| `gamefleet_search_status_v1` | 按 search ID 读取 pending、bound、cancelled 或 expired 状态 |
+| `gamefleet_search_cancel_v1` | 取消尚 pending 的 search 排队意图 |
 | `gamefleet_current_v1` | 查找认证玩家在本 caller scope 持有的 reservation |
 | `gamefleet_status_v1` | 按 allocation ID 读取认证玩家有历史座位的 reservation 状态，包括释放后的终态 |
 | `gamefleet_assignment_v1` | generation 0 的首次 join 票据 |
 | `gamefleet_resume_v1` | 按当前持久化 generation 申请恢复票据 |
 | `gamefleet_cancel_v1` | 为该玩家当前持有的 reservation 记录取消意图 |
+
+三个 search RPC 均使用 `SearchVersion`、配置中的 `compatibility` 和 `region`。Begin 还带 8–128 位安全字符组成的 `requestId`；相同逻辑请求重试时保持该 ID。Status 和 Cancel 带 `searchId`。响应含 `search`，Begin/Cancel 另含 `replay`；bound search 可附带 allocation/reservation 信息，不返回 join ticket 或 endpoint。Room lifecycle RPC 继续使用 `RoomVersion`。
+
+Begin 请求示例：
+
+```json
+{
+  "version": "gamefleet.player-search.v1",
+  "compatibility": "<GAMEFLEET_COMPATIBILITY>",
+  "region": "<GAMEFLEET_REGION>",
+  "requestId": "search_01JABCDEF"
+}
+```
+
+Search Status 和 Cancel 的 body 将 `requestId` 换为 `searchId`，其余 profile 字段相同。
 
 Current 请求：
 
@@ -159,7 +180,11 @@ Cancel 示例：
 
 ## 本阶段验证
 
+I2b 官方运行时 smoke 已通过：提交 `ca71bfb` 的 [Nakama CI 36668798446](https://github.com/xuhuanhello/nakama-agones/actions/runs/36668798446) 成功，Secret scan 36668798503 也通过。官方 Nakama 3.41.0 加载候选插件，合成玩家通过 WebSocket 执行 search、MatchmakerAdd/Matched、cancel 与越权拒绝；启动 scope 拒绝也按预期失败关闭。详见 [I2b 验收记录](validation/2026-09-30-search-bridge-i2b.md)。它使用临时 PostgreSQL 和 synthetic Business fixture，不是真实 GameFleet allocation、host/ticket/endpoint 或 Fixed 对局；客户端 I3 和真实 Fixed 游戏 I4 仍未完成，生产未部署。
+
 本候选已通过新旧模式、全部 Go 单元测试、`go vet` 与 race 检查。新增测试覆盖同匹配回调反序重放、认证身份、他人房间取消、同次入场的稳定请求 ID、未授权/缺字段响应、代理/重定向隔离及启动时 scope 校验。协调后的 P4h 隔离 HTTP 验证还确认同一 reservation 的两名历史 seat 玩家都能读取 status，技术终止后 current 为 null 而 status 保留 terminal 状态；这仍是候选隔离验收，不是最终生产迁移或 HTTPS Business API gate 验收。
+
+P4h 的 schema 26 双周期 SIGKILL/rematch 是前一阶段的 Fixed 故障验收；本节 I2b 则是官方 Nakama 插件与 search bridge smoke。两项使用的系统边界不同：P4h 不证明 I2b 插件 runtime，I2b 的 synthetic fixture 也不证明真实 Fixed 对局。
 
 另外用 GameFleet 候选提交 `3bed77d8fdc8bd68bee71f0c728fdfb3f840bc87` 的真实 `BusinessHandler`、隔离 SQLite、自动生成测试 Key 和签名房间回执完成了跨仓库 HTTP 合约验证：current、reserve replay、join replay、consume 后 superseded、resume、stale endpoint、cancel held 与 key revocation。复现：
 
@@ -169,4 +194,4 @@ Cancel 示例：
 
 此脚本要求本机能运行 Go 1.27.1，并可能下载该工具链/模块；只使用临时 modfile 和源码 overlay，不修改任一仓库的 go.mod，不使用部署配置或真实凭据，不登录 VPS。测试 fixture 位于 `tests/contracts/gamefleet_business_test.go.txt`，依赖该 GameFleet 候选中的测试辅助函数。
 
-上述 BusinessHandler 合约测试不等同于进程加载或真实双人对局。P4d 随后已完成[官方 Nakama 3.41.0 进程加载、认证 RPC 与权限失败退出验收](gamefleet-runtime-validation.md)。Fixed Linux 镜像、实际房间分配和 FishNet 双人对局仍待隔离试点验证。
+此前 P4d 的官方 Nakama 加载与认证 RPC 验收见[记录](gamefleet-runtime-validation.md)；本次 I2b 新增 search/matchmaker runtime 检查，证据见上方记录。Fixed Linux 镜像、真实平台 allocation 和 FishNet 双人对局仍待隔离试点验证。

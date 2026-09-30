@@ -1,0 +1,84 @@
+{
+  "status": "passed",
+  "scope": "isolated Nakama plugin, search RPC, matchmaker hook and synthetic binding check; no real GameFleet allocation or Fixed gameplay",
+  "runtime_image": "nakama-gamefleet-p4i:ca71bfb",
+  "prefix": "gf-p4d-00c39e24",
+  "checks": [
+    "built static local-only fixture image from scratch; no base image pull",
+    "temporary PostgreSQL ready on tmpfs; database port is not published",
+    "official Nakama 3.41.0 runtime applied migrations to the isolated nakama database",
+    "live Nakama process loaded agones.so, ran GameFleet scope preflight, and registered the GameFleet bridge",
+    "legacy Agones FleetManager registration log absent; invalid legacy DB URL was bypassed",
+    "two synthetic Nakama devices authenticated and each received current=null through gamefleet_current_v1",
+    "search begin RPC creates owned pending searches and exact request replay recovers the same ID",
+    "two websocket MatchmakerAdd requests passed owned-pending before status and the matched hook bound one exact pair",
+    "bound search status and cancel preserve one reserved room visible through Current",
+    "cross-participant status/cancel and a late MatchmakerAdd for a cancelled search are rejected",
+    "Business scope denial made the Nakama process exit nonzero before readiness",
+    "invalid Business scope failed closed without falling back to Agones"
+  ],
+  "limits": [
+    "Synthetic local Business fixture only; no real GameFleet reservation, host, endpoint, ticket, or allocation was tested.",
+    "Temporary PostgreSQL database contains only this smoke's Nakama auth/state and is deleted at cleanup.",
+    "Loopback fixture and Nakama API are local-only; no production credentials or service were used."
+  ],
+  "runtime_image_facts": {
+    "id": "sha256:e401f7f3c88a929156997a46a396960fbc571987866c2bc4ff2084338e431d5d",
+    "platform": "linux/amd64",
+    "labels": {
+      "contact": "support@heroiclabs.com",
+      "description": "Distributed server for social and realtime games and apps.",
+      "io.nakama.common.version": "1.48.0",
+      "io.nakama.go.version": "1.27.1",
+      "io.nakama.version": "3.41.0",
+      "maintainer": "Heroic Labs",
+      "org.opencontainers.image.created": "2026-09-18T19:51:59.662Z",
+      "org.opencontainers.image.description": "Official Nakama runtime with the Agones FleetManager module",
+      "org.opencontainers.image.licenses": "MIT",
+      "org.opencontainers.image.revision": "ca71bfb08512e2d7e61f53e195b224326922cbec",
+      "org.opencontainers.image.source": "https://github.com/xuhuanhello/nakama-agones",
+      "org.opencontainers.image.title": "Nakama Agones FleetManager",
+      "org.opencontainers.image.url": "https://github.com/heroiclabs/nakama",
+      "org.opencontainers.image.version": "p4i-search",
+      "variant": "nakama",
+      "version": "3.41.0"
+    },
+    "repo_digests": [
+      "nakama-gamefleet-p4i@sha256:e401f7f3c88a929156997a46a396960fbc571987866c2bc4ff2084338e431d5d"
+    ]
+  },
+  "source_revision": "ca71bfb08512e2d7e61f53e195b224326922cbec",
+  "source_worktree_clean": true,
+  "postgres_image_facts": {
+    "id": "sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea",
+    "platform": "linux/arm64",
+    "labels": {},
+    "repo_digests": [
+      "postgres@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea"
+    ]
+  },
+  "fixture_image_facts": {
+    "id": "sha256:2a3e82add98f07234ec7f6c8c44e884af5645ecac3c178a078614876c8cd641c",
+    "platform": "linux/amd64",
+    "labels": {},
+    "repo_digests": [
+      "gf-p4d-00c39e24-fixture@sha256:2a3e82add98f07234ec7f6c8c44e884af5645ecac3c178a078614876c8cd641c"
+    ]
+  },
+  "nakama_api": "127.0.0.1:<ephemeral> (only this temporary container mapping)",
+  "synthetic_devices": 3,
+  "business_fixture_requests": {
+    "caller_scope": 1,
+    "current_null_before_match": 2,
+    "search_begin_calls_including_replay": 4,
+    "search_status_calls": 5,
+    "search_cancel_calls": 2,
+    "search_match_commits": 1,
+    "foreign_search_denials": 2
+  },
+  "scope_failure": {
+    "fixture_status": "HTTP 403",
+    "nakama_container_state": "exited",
+    "exit_code": 1
+  }
+}

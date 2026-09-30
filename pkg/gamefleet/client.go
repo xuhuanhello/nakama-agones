@@ -155,7 +155,7 @@ func (c *Client) call(ctx context.Context, method, path string, body, out any, s
 
 func strictObject(raw []byte, out any) error {
 	raw = bytes.TrimSpace(raw)
-	if len(raw) == 0 || raw[0] != '{' {
+	if len(raw) == 0 || raw[0] != '{' || !uniqueObjectFields(raw) {
 		return errors.New("expected object")
 	}
 	d := json.NewDecoder(bytes.NewReader(raw))
@@ -209,24 +209,6 @@ func (c *Client) Status(ctx context.Context, allocationID, user string) (Reserva
 	}
 	err := c.call(ctx, "POST", "/business/v1/reservations/"+allocationID+"/status", map[string]string{"version": RoomVersion, "participantId": user}, &out, 200)
 	if err == nil && (!c.validReservation(out.Reservation) || out.Reservation.AllocationID != allocationID) {
-		err = &Error{Status: 502}
-	}
-	return out, err
-}
-
-func (c *Client) Reserve(ctx context.Context, key string, users []string) (ReservationResult, error) {
-	var out ReservationResult
-	if !attemptID.MatchString(key) || len(users) != 2 || users[0] == users[1] || !exactText(users[0], 256) || !exactText(users[1], 256) {
-		return out, &Error{Status: 422}
-	}
-	body := struct {
-		Version       string   `json:"version"`
-		Key           string   `json:"idempotencyKey"`
-		Participants  []string `json:"participants"`
-		Compatibility string   `json:"compatibility"`
-	}{RoomVersion, key, users, c.config.Compatibility}
-	err := c.call(ctx, "POST", "/business/v1/reservations", body, &out, 200, 202)
-	if err == nil && !c.validReservation(out.Reservation) {
 		err = &Error{Status: 502}
 	}
 	return out, err

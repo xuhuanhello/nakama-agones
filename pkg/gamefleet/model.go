@@ -11,6 +11,7 @@ import (
 
 const (
 	RoomVersion         = "gamefleet.player-room.v1"
+	SearchVersion       = "gamefleet.player-search.v1"
 	TicketVersion       = "gamefleet.player-ticket.v1"
 	MaxGeneration int64 = 9007199254740991
 )
@@ -83,7 +84,10 @@ type AssignmentResult struct {
 type Backend interface {
 	Current(context.Context, string) (CurrentResult, error)
 	Status(context.Context, string, string) (ReservationStatus, error)
-	Reserve(context.Context, string, []string) (ReservationResult, error)
+	BeginSearch(context.Context, string, string) (SearchResult, error)
+	SearchStatus(context.Context, string, string) (SearchStatus, error)
+	CancelSearch(context.Context, string, string) (SearchResult, error)
+	MatchSearches(context.Context, string, []SearchMatchMember) (ReservationResult, error)
 	Issue(context.Context, string, string, string, int64, bool) (AssignmentResult, error)
 	Cancel(context.Context, string) (ReservationResult, error)
 }

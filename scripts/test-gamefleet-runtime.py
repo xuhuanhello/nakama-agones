@@ -4,18 +4,22 @@ from __future__ import annotations
 
 import base64
 import argparse
+import hashlib
 import http.client
 import json
 import os
 from pathlib import Path
+import select
 import secrets
 import shutil
 import socket
 import subprocess
+import struct
 import tempfile
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import quote, urlsplit
 import uuid
 
 
@@ -29,12 +33,14 @@ REVISION_ID = "revision_p4d_fixture"
 REGION = "p4d-local"
 COMPATIBILITY = "p4d-smoke"
 ROOM_VERSION = "gamefleet.player-room.v1"
+SEARCH_VERSION = "gamefleet.player-search.v1"
 EVIDENCE_PATH = Path(tempfile.gettempdir()) / "gamefleet-runtime-smoke-evidence.json"
 db_password = ""
 
 GO_FIXTURE = r'''package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -42,6 +48,9 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
+	"sync"
+	"time"
 )
 
 const (
@@ -50,7 +59,66 @@ const (
 	revisionID = "revision_p4d_fixture"
 	region = "p4d-local"
 	roomVersion = "gamefleet.player-room.v1"
+	searchVersion = "gamefleet.player-search.v1"
 )
+
+type fixtureSearch struct {
+	ID string
+	ParticipantID string
+	State string
+	CreatedAt time.Time
+	ExpiresAt time.Time
+	ResolvedAt *time.Time
+	AllocationID string
+}
+
+type fixtureReservation struct {
+	ReservationID string `json:"reservationId"`
+	AllocationID string `json:"allocationId"`
+	RoomID string `json:"roomId"`
+	ApplicationID string `json:"applicationId"`
+	PlacementID string `json:"placementId"`
+	RevisionID string `json:"revisionId"`
+	Region string `json:"region"`
+	State string `json:"state"`
+	CancellationRequested bool `json:"cancellationRequested"`
+	CreatedAt time.Time `json:"createdAt"`
+	UpdatedAt time.Time `json:"updatedAt"`
+}
+
+func decodeFixtureJSON(r *http.Request, out any) error {
+	raw, err := io.ReadAll(io.LimitReader(r.Body, 4097))
+	if err != nil || len(raw) > 4096 {
+		return fmt.Errorf("invalid request size")
+	}
+	d := json.NewDecoder(bytes.NewReader(raw))
+	d.DisallowUnknownFields()
+	if err = d.Decode(out); err != nil || d.Decode(new(any)) != io.EOF {
+		return fmt.Errorf("invalid request body")
+	}
+	return nil
+}
+
+func searchObject(s *fixtureSearch, reservation *fixtureReservation) map[string]any {
+	out := map[string]any{
+		"searchId": s.ID, "state": s.State, "region": region, "compatibility": "p4d-smoke",
+		"createdAt": s.CreatedAt, "expiresAt": s.ExpiresAt,
+	}
+	if s.ResolvedAt != nil {
+		out["resolvedAt"] = s.ResolvedAt
+	}
+	if s.AllocationID != "" {
+		out["allocationId"] = s.AllocationID
+	}
+	if reservation != nil {
+		out["reservation"] = reservation
+	}
+	return out
+}
+
+func writeBusiness(w http.ResponseWriter, status int, data any, requestID string) {
+	writeJSON(w, status, map[string]any{"data": data, "requestId": requestID})
+}
 
 func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")
@@ -61,6 +129,13 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 func main() {
 	key := os.Getenv("GF_P4D_FIXTURE_KEY")
 	mode := os.Getenv("GF_P4D_FIXTURE_MODE")
+	var mu sync.Mutex
+	searches := map[string]*fixtureSearch{}
+	requestIDs := map[string]string{}
+	matchHashes := map[string]string{}
+	matchReservations := map[string]*fixtureReservation{}
+	participantRooms := map[string]*fixtureReservation{}
+	searchSequence := 0
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
@@ -110,8 +185,174 @@ func main() {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_fixture_request"})
 			return
 		}
-		log.Printf("p4d_fixture_current_null user=%s", request.ParticipantID)
-		writeJSON(w, http.StatusOK, map[string]any{"data": map[string]any{"current": nil}, "requestId": "p4d-fixture-current"})
+		mu.Lock()
+		reservation := participantRooms[request.ParticipantID]
+		mu.Unlock()
+		if reservation == nil {
+			log.Printf("p4d_fixture_current_null user=%s", request.ParticipantID)
+			writeBusiness(w, http.StatusOK, map[string]any{"current": nil}, "p4d-fixture-current")
+			return
+		}
+		log.Printf("p4d_fixture_current_bound user=%s allocation=%s", request.ParticipantID, reservation.AllocationID)
+		writeBusiness(w, http.StatusOK, map[string]any{"current": map[string]any{"reservation": reservation, "connectionGeneration": 0}}, "p4d-fixture-current")
+	})
+	mux.HandleFunc("/business/v1/searches", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method"})
+			return
+		}
+		if r.Header.Get("Authorization") != "Bearer "+key {
+			log.Print("p4d_fixture_bad_search_auth")
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
+			return
+		}
+		var request struct {
+			Version string `json:"version"`
+			ParticipantID string `json:"participantId"`
+			RequestID string `json:"requestId"`
+			Compatibility string `json:"compatibility"`
+		}
+		if decodeFixtureJSON(r, &request) != nil || request.Version != searchVersion || request.Compatibility != "p4d-smoke" || request.RequestID == "" || request.ParticipantID == "" {
+			log.Print("p4d_fixture_bad_search_begin")
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_fixture_request"})
+			return
+		}
+		mu.Lock()
+		requestKey := request.ParticipantID + "\x00" + request.RequestID
+		id := requestIDs[requestKey]
+		replay := id != ""
+		if !replay {
+			searchSequence++
+			id = fmt.Sprintf("search_p4d_%d", searchSequence)
+			created := time.Now().UTC().Truncate(time.Millisecond)
+			searches[id] = &fixtureSearch{ID: id, ParticipantID: request.ParticipantID, State: "pending", CreatedAt: created, ExpiresAt: created.Add(120 * time.Second)}
+			requestIDs[requestKey] = id
+		}
+		search := searches[id]
+		result := map[string]any{"search": searchObject(search, nil), "replay": replay}
+		mu.Unlock()
+		log.Printf("p4d_fixture_search_begin user=%s state=%s replay=%t", request.ParticipantID, search.State, replay)
+		status := http.StatusCreated
+		if replay {
+			status = http.StatusOK
+		}
+		writeBusiness(w, status, result, "p4d-fixture-search-begin")
+	})
+	mux.HandleFunc("/business/v1/searches/match", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method"})
+			return
+		}
+		if r.Header.Get("Authorization") != "Bearer "+key {
+			log.Print("p4d_fixture_bad_match_auth")
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
+			return
+		}
+		var request struct {
+			Version string `json:"version"`
+			IdempotencyKey string `json:"idempotencyKey"`
+			Compatibility string `json:"compatibility"`
+			Members []struct {
+				ParticipantID string `json:"participantId"`
+				SearchID string `json:"searchId"`
+				NakamaTicket string `json:"nakamaTicket"`
+			} `json:"members"`
+		}
+		if decodeFixtureJSON(r, &request) != nil || request.Version != searchVersion || request.Compatibility != "p4d-smoke" || request.IdempotencyKey == "" || len(request.Members) != 2 {
+			log.Print("p4d_fixture_bad_search_match")
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_fixture_request"})
+			return
+		}
+		hashInput, _ := json.Marshal(request.Members)
+		hash := string(hashInput)
+		mu.Lock()
+		if oldHash, ok := matchHashes[request.IdempotencyKey]; ok {
+			if oldHash != hash {
+				mu.Unlock()
+				writeJSON(w, http.StatusConflict, map[string]any{"error": "idempotency_conflict"})
+				return
+			}
+			reservation := matchReservations[request.IdempotencyKey]
+			mu.Unlock()
+			log.Print("p4d_fixture_search_match replay=true")
+			writeBusiness(w, http.StatusOK, map[string]any{"reservation": reservation, "replay": true}, "p4d-fixture-search-match")
+			return
+		}
+		first, second := searches[request.Members[0].SearchID], searches[request.Members[1].SearchID]
+		if first == nil || second == nil || first.ParticipantID != request.Members[0].ParticipantID || second.ParticipantID != request.Members[1].ParticipantID || first.ID == second.ID || request.Members[0].NakamaTicket == "" || request.Members[1].NakamaTicket == "" || request.Members[0].NakamaTicket == request.Members[1].NakamaTicket || first.State != "pending" || second.State != "pending" {
+			mu.Unlock()
+			log.Print("p4d_fixture_search_match rejected=true")
+			writeJSON(w, http.StatusConflict, map[string]any{"error": "search_unavailable"})
+			return
+		}
+		matchedAt := time.Now().UTC().Truncate(time.Millisecond)
+		reservation := &fixtureReservation{
+			ReservationID: "reservation_p4d_smoke", AllocationID: "allocation_p4d_smoke", RoomID: "room_p4d_smoke",
+			ApplicationID: appID, PlacementID: placementID, RevisionID: revisionID, Region: region,
+			State: "reserved", CreatedAt: matchedAt, UpdatedAt: matchedAt,
+		}
+		for _, search := range []*fixtureSearch{first, second} {
+			search.State = "bound"
+			search.ResolvedAt = &matchedAt
+			search.AllocationID = reservation.AllocationID
+			participantRooms[search.ParticipantID] = reservation
+		}
+		matchHashes[request.IdempotencyKey] = hash
+		matchReservations[request.IdempotencyKey] = reservation
+		mu.Unlock()
+		log.Printf("p4d_fixture_search_match replay=false allocation=%s", reservation.AllocationID)
+		writeBusiness(w, http.StatusAccepted, map[string]any{"reservation": reservation, "replay": false}, "p4d-fixture-search-match")
+	})
+	mux.HandleFunc("/business/v1/searches/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method"})
+			return
+		}
+		if r.Header.Get("Authorization") != "Bearer "+key {
+			log.Print("p4d_fixture_bad_search_auth")
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
+			return
+		}
+		path := strings.TrimPrefix(r.URL.Path, "/business/v1/searches/")
+		parts := strings.Split(path, "/")
+		if len(parts) != 2 || (parts[1] != "status" && parts[1] != "cancel") {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": "not_found"})
+			return
+		}
+		var request struct {
+			Version string `json:"version"`
+			ParticipantID string `json:"participantId"`
+		}
+		if decodeFixtureJSON(r, &request) != nil || request.Version != searchVersion || request.ParticipantID == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_fixture_request"})
+			return
+		}
+		mu.Lock()
+		search := searches[parts[0]]
+		if search == nil || search.ParticipantID != request.ParticipantID {
+			mu.Unlock()
+			log.Printf("p4d_fixture_search_owner_denied participant=%s", request.ParticipantID)
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": "search_not_found"})
+			return
+		}
+		if parts[1] == "cancel" {
+			replay := search.State != "pending"
+			if !replay {
+				now := time.Now().UTC().Truncate(time.Millisecond)
+				search.State = "cancelled"
+				search.ResolvedAt = &now
+			}
+			result := map[string]any{"search": searchObject(search, participantRooms[request.ParticipantID]), "replay": replay}
+			mu.Unlock()
+			log.Printf("p4d_fixture_search_cancel user=%s state=%s replay=%t", request.ParticipantID, search.State, replay)
+			writeBusiness(w, http.StatusOK, result, "p4d-fixture-search-cancel")
+			return
+		}
+		state := search.State
+		statusResult := map[string]any{"search": searchObject(search, participantRooms[request.ParticipantID])}
+		mu.Unlock()
+		log.Printf("p4d_fixture_search_status user=%s state=%s", request.ParticipantID, state)
+		writeBusiness(w, http.StatusOK, statusResult, "p4d-fixture-search-status")
 	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("p4d_fixture_unexpected method=%s path=%s", r.Method, r.URL.Path)
@@ -237,6 +478,204 @@ def post_json(url: str, body: bytes, headers: dict[str, str], timeout: float = 1
         return error.code, payload
 
 
+class NakamaWebSocket:
+    """Small stdlib JSON WebSocket client for the isolated matchmaker smoke."""
+
+    def __init__(self, base_url: str, token: str) -> None:
+        parsed = urlsplit(base_url)
+        if parsed.scheme != "http" or parsed.hostname is None or parsed.port is None:
+            raise SmokeError("smoke WebSocket requires the local HTTP API origin")
+        self.sock = socket.create_connection((parsed.hostname, parsed.port), timeout=10)
+        self.sock.settimeout(10)
+        self.buffer = bytearray()
+        key = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
+        path = "/ws?lang=en&status=true&format=json&token=" + quote(token, safe="")
+        request = (
+            f"GET {path} HTTP/1.1\r\n"
+            f"Host: {parsed.hostname}:{parsed.port}\r\n"
+            "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n"
+            "Origin: http://127.0.0.1\r\n\r\n"
+        ).encode("ascii")
+        self.sock.sendall(request)
+        response = bytearray()
+        while b"\r\n\r\n" not in response and len(response) < 16384:
+            part = self.sock.recv(4096)
+            if not part:
+                self.sock.close()
+                raise SmokeError("Nakama WebSocket closed during handshake")
+            response.extend(part)
+        header, separator, extra = response.partition(b"\r\n\r\n")
+        if not separator or not header.startswith(b"HTTP/1.1 101 "):
+            self.sock.close()
+            raise SmokeError("Nakama WebSocket upgrade was rejected")
+        headers = {}
+        for line in header.decode("latin1").split("\r\n")[1:]:
+            if ":" in line:
+                name, value = line.split(":", 1)
+                headers[name.strip().lower()] = value.strip()
+        expected = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")).digest()).decode("ascii")
+        if headers.get("sec-websocket-accept") != expected:
+            self.sock.close()
+            raise SmokeError("Nakama WebSocket handshake accept did not match")
+        self.buffer.extend(extra)
+
+    def _read_exact(self, length: int) -> bytes:
+        while len(self.buffer) < length:
+            part = self.sock.recv(max(4096, length - len(self.buffer)))
+            if not part:
+                raise SmokeError("Nakama WebSocket closed unexpectedly")
+            self.buffer.extend(part)
+        out = bytes(self.buffer[:length])
+        del self.buffer[:length]
+        return out
+
+    def _send_frame(self, opcode: int, payload: bytes) -> None:
+        mask = secrets.token_bytes(4)
+        length = len(payload)
+        if length < 126:
+            header = bytes((0x80 | opcode, 0x80 | length))
+        elif length <= 0xFFFF:
+            header = bytes((0x80 | opcode, 0x80 | 126)) + struct.pack("!H", length)
+        else:
+            header = bytes((0x80 | opcode, 0x80 | 127)) + struct.pack("!Q", length)
+        masked = bytes(value ^ mask[index % 4] for index, value in enumerate(payload))
+        self.sock.sendall(header + mask + masked)
+
+    def send_json(self, value: dict[str, object]) -> None:
+        self._send_frame(1, json.dumps(value, separators=(",", ":")).encode("utf-8"))
+
+    def recv_json(self, timeout: float = 1.0) -> dict[str, object] | None:
+        deadline = time.monotonic() + timeout
+        fragments = bytearray()
+        message_opcode = 0
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            if len(self.buffer) < 2 and not select.select([self.sock], [], [], remaining)[0]:
+                return None
+            first, second = self._read_exact(2)
+            opcode = first & 0x0F
+            final = bool(first & 0x80)
+            masked = bool(second & 0x80)
+            length = second & 0x7F
+            if length == 126:
+                length = struct.unpack("!H", self._read_exact(2))[0]
+            elif length == 127:
+                length = struct.unpack("!Q", self._read_exact(8))[0]
+            mask = self._read_exact(4) if masked else b""
+            payload = self._read_exact(length)
+            if masked:
+                payload = bytes(value ^ mask[index % 4] for index, value in enumerate(payload))
+            if opcode == 8:
+                return None
+            if opcode == 9:
+                self._send_frame(10, payload)
+                continue
+            if opcode == 10:
+                continue
+            if opcode in (1, 2):
+                message_opcode = opcode
+                fragments = bytearray(payload)
+            elif opcode == 0 and message_opcode:
+                fragments.extend(payload)
+            else:
+                continue
+            if final:
+                if message_opcode != 1:
+                    return None
+                value = json.loads(fragments.decode("utf-8"))
+                return value if isinstance(value, dict) else None
+
+    def close(self) -> None:
+        try:
+            self._send_frame(8, b"")
+        except OSError:
+            pass
+        self.sock.close()
+
+
+def rpc_call(base_url: str, token: str, name: str, payload: dict[str, object]) -> tuple[int, dict[str, object]]:
+    # Nakama's HTTP RPC API takes the plugin payload as a JSON string.
+    wire = json.dumps(json.dumps(payload, separators=(",", ":")), separators=(",", ":")).encode("utf-8")
+    return post_json(
+        base_url + "/v2/rpc/" + name,
+        wire,
+        {"Authorization": "Bearer " + token},
+    )
+
+
+def rpc_payload(base_url: str, token: str, name: str, payload: dict[str, object]) -> dict[str, object]:
+    status, response = rpc_call(base_url, token, name, payload)
+    if status != 200 or not isinstance(response.get("payload"), str):
+        raise SmokeError(f"GameFleet {name} RPC failed with HTTP {status}")
+    try:
+        result = json.loads(response["payload"])
+    except Exception as exc:
+        raise SmokeError(f"GameFleet {name} RPC returned a non-JSON payload") from exc
+    if not isinstance(result, dict):
+        raise SmokeError(f"GameFleet {name} RPC returned a non-object payload")
+    return result
+
+
+def search_begin_rpc(base_url: str, token: str, request_id: str) -> dict[str, object]:
+    result = rpc_payload(base_url, token, "gamefleet_search_begin_v1", {
+        "version": SEARCH_VERSION, "compatibility": COMPATIBILITY, "region": REGION, "requestId": request_id,
+    })
+    search = result.get("search")
+    if not isinstance(search, dict) or search.get("state") != "pending" or not isinstance(search.get("searchId"), str):
+        raise SmokeError("search begin did not return a pending exact search")
+    return search
+
+
+def search_participant_rpc(base_url: str, token: str, rpc_name: str, search_id: str) -> dict[str, object]:
+    return rpc_payload(base_url, token, rpc_name, {
+        "version": SEARCH_VERSION, "compatibility": COMPATIBILITY, "region": REGION, "searchId": search_id,
+    })
+
+
+def expect_rpc_denied(base_url: str, token: str, name: str, payload: dict[str, object]) -> None:
+    status, response = rpc_call(base_url, token, name, payload)
+    if status != 200:
+        return
+    if "error" in response:
+        return
+    raw = response.get("payload")
+    if not isinstance(raw, str):
+        return
+    try:
+        result = json.loads(raw)
+    except Exception:
+        return
+    if not isinstance(result, dict) or not isinstance(result.get("search"), dict):
+        return
+    raise SmokeError(f"GameFleet {name} unexpectedly authorized the request")
+
+
+def wait_matchmaker_result(sockets: list[NakamaWebSocket], *, matched: bool, timeout: float = 30.0) -> None:
+    pending = set(sockets)
+    deadline = time.monotonic() + timeout
+    while pending and time.monotonic() < deadline:
+        ready, _, _ = select.select([ws.sock for ws in pending], [], [], min(0.5, deadline - time.monotonic()))
+        for sock in ready:
+            ws = next(candidate for candidate in pending if candidate.sock is sock)
+            message = ws.recv_json(0.1)
+            if message is None:
+                continue
+            if "error" in message:
+                if matched:
+                    raise SmokeError("Nakama rejected a pending owned search in MatchmakerAdd")
+                pending.remove(ws)
+                continue
+            if "matchmaker_matched" in message:
+                if not matched:
+                    raise SmokeError("cancelled search unexpectedly reached matched callback")
+                pending.remove(ws)
+    if pending:
+        raise SmokeError("timed out waiting for Nakama matchmaker result")
+
+
 def authenticate(base_url: str, device_id: str) -> str:
     basic = base64.b64encode(b"local-server-key:").decode("ascii")
     status, response = post_json(
@@ -250,15 +689,9 @@ def authenticate(base_url: str, device_id: str) -> str:
     return token
 
 
-def current_rpc(base_url: str, token: str, *, expect_success: bool) -> tuple[int, dict[str, object]]:
+def current_rpc(base_url: str, token: str, *, expect_success: bool, expected_allocation: str | None = None) -> tuple[int, dict[str, object]]:
     payload = {"version": ROOM_VERSION, "compatibility": COMPATIBILITY, "region": REGION}
-    # Nakama's HTTP RPC API takes the plugin payload as a JSON string.
-    wire = json.dumps(json.dumps(payload, separators=(",", ":")), separators=(",", ":")).encode("utf-8")
-    status, response = post_json(
-        base_url + "/v2/rpc/gamefleet_current_v1",
-        wire,
-        {"Authorization": "Bearer " + token},
-    )
+    status, response = rpc_call(base_url, token, "gamefleet_current_v1", payload)
     if expect_success:
         if status != 200 or not isinstance(response.get("payload"), str):
             raise SmokeError(f"GameFleet current RPC failed with HTTP {status}")
@@ -266,8 +699,14 @@ def current_rpc(base_url: str, token: str, *, expect_success: bool) -> tuple[int
             current = json.loads(response["payload"])
         except Exception as exc:
             raise SmokeError("GameFleet current RPC returned a non-JSON payload") from exc
-        if current != {"current": None}:
-            raise SmokeError("current RPC did not return the fixture's expected empty state")
+        if expected_allocation is None:
+            if current != {"current": None}:
+                raise SmokeError("current RPC did not return the fixture's expected empty state")
+        else:
+            state = current.get("current") if isinstance(current, dict) else None
+            reservation = state.get("reservation") if isinstance(state, dict) else None
+            if not isinstance(reservation, dict) or reservation.get("allocationId") != expected_allocation or reservation.get("cancellationRequested") is not False:
+                raise SmokeError("current RPC lost or cancelled the search-bound room")
     return status, response
 
 
@@ -334,6 +773,7 @@ def main() -> None:
     fail_nakama_container = prefix + "-nakama-deny"
     migration_container = prefix + "-migrate"
     owned_containers = [migration_container, nakama_container, fail_nakama_container, fixture_container, fail_fixture_container, db_container]
+    owned_websockets: list[NakamaWebSocket] = []
     temp_root = Path(tempfile.mkdtemp(prefix=prefix + "-", dir=args.temp_root))
     key_path = temp_root / "business.key"
     config_path = temp_root / "nakama.local.yml"
@@ -342,7 +782,7 @@ def main() -> None:
     dockerfile = temp_root / "Dockerfile"
     evidence: dict[str, object] = {
         "status": "running",
-        "scope": "isolated Nakama process load and player RPC check; no GameFleet allocation or Fixed gameplay",
+        "scope": "isolated Nakama plugin, search RPC, matchmaker hook and synthetic binding check; no real GameFleet allocation or Fixed gameplay",
         "runtime_image": RUNTIME_IMAGE,
         "prefix": prefix,
         "checks": [],
@@ -423,8 +863,10 @@ def main() -> None:
         evidence["checks"].append("legacy Agones FleetManager registration log absent; invalid legacy DB URL was bypassed")
 
         device_ids = ["gf-p4d-a-" + uuid.uuid4().hex, "gf-p4d-b-" + uuid.uuid4().hex]
+        tokens = []
         for device_id in device_ids:
             token = authenticate(api_url, device_id)
+            tokens.append(token)
             status, _ = current_rpc(api_url, token, expect_success=True)
             if status != 200:
                 raise SmokeError("synthetic authenticated current RPC did not return HTTP 200")
@@ -432,9 +874,100 @@ def main() -> None:
         if ok_fixture_logs.count("p4d_fixture_scope_ok") != 1 or ok_fixture_logs.count("p4d_fixture_current_null user=") != 2:
             raise SmokeError("fixture did not observe one scope preflight and current-null for both synthetic devices")
         evidence["checks"].append("two synthetic Nakama devices authenticated and each received current=null through gamefleet_current_v1")
-        evidence["synthetic_devices"] = 2
-        evidence["business_fixture_requests"] = {"caller_scope": 1, "current_null": 2}
-        print("LIVE POSITIVE CHECK COMPLETE: plugin registered; two authenticated current-null RPCs passed", flush=True)
+
+        searches = [
+            search_begin_rpc(api_url, tokens[0], "smoke-search-begin-a"),
+            search_begin_rpc(api_url, tokens[1], "smoke-search-begin-b"),
+        ]
+        begin_replay = rpc_payload(api_url, tokens[0], "gamefleet_search_begin_v1", {
+            "version": SEARCH_VERSION, "compatibility": COMPATIBILITY, "region": REGION,
+            "requestId": "smoke-search-begin-a",
+        })
+        if begin_replay.get("replay") is not True or not isinstance(begin_replay.get("search"), dict) or begin_replay["search"].get("searchId") != searches[0]["searchId"]:
+            raise SmokeError("lost-reply begin replay did not recover the same search")
+        evidence["checks"].append("search begin RPC creates owned pending searches and exact request replay recovers the same ID")
+
+        ws_a = NakamaWebSocket(api_url, tokens[0])
+        ws_b = NakamaWebSocket(api_url, tokens[1])
+        owned_websockets.extend([ws_a, ws_b])
+        smoke_group = "p4d" + uuid.uuid4().hex
+        for ws, search in zip((ws_a, ws_b), searches, strict=True):
+            ws.send_json({"cid": "gamefleet-search", "matchmaker_add": {
+                "min_count": 2, "max_count": 2, "query": "+properties.smoke_group:" + smoke_group,
+                "string_properties": {
+                    "smoke_group": smoke_group, "gamefleet_protocol": ROOM_VERSION,
+                    "build_hash": COMPATIBILITY, "region": REGION,
+                    "gamefleet_search_id": search["searchId"],
+                },
+            }})
+        wait_matchmaker_result([ws_a, ws_b], matched=True)
+        fixture_deadline = time.monotonic() + 15
+        while time.monotonic() < fixture_deadline and "p4d_fixture_search_match replay=false" not in logs(fixture_container):
+            time.sleep(0.25)
+        ok_fixture_logs = logs(fixture_container)
+        if ok_fixture_logs.count("p4d_fixture_search_status user=") < 2 or "p4d_fixture_search_match replay=false" not in ok_fixture_logs:
+            raise SmokeError("MatchmakerAdd did not check owned pending searches and bind the matched pair")
+        evidence["checks"].append("two websocket MatchmakerAdd requests passed owned-pending before status and the matched hook bound one exact pair")
+
+        bound_searches = [
+            search_participant_rpc(api_url, tokens[0], "gamefleet_search_status_v1", searches[0]["searchId"]),
+            search_participant_rpc(api_url, tokens[1], "gamefleet_search_status_v1", searches[1]["searchId"]),
+        ]
+        allocation_id = bound_searches[0].get("search", {}).get("allocationId") if isinstance(bound_searches[0].get("search"), dict) else None
+        if not isinstance(allocation_id, str) or not allocation_id or any(
+            not isinstance(result.get("search"), dict) or result["search"].get("state") != "bound" or result["search"].get("allocationId") != allocation_id
+            for result in bound_searches
+        ):
+            raise SmokeError("search status did not recover the exact matched binding for both users")
+        bound_cancel = search_participant_rpc(api_url, tokens[0], "gamefleet_search_cancel_v1", searches[0]["searchId"])
+        if not isinstance(bound_cancel.get("search"), dict) or bound_cancel["search"].get("state") != "bound" or bound_cancel["search"].get("allocationId") != allocation_id:
+            raise SmokeError("cancel of a bound search hid its existing room")
+        for token in tokens:
+            status, _ = current_rpc(api_url, token, expect_success=True, expected_allocation=allocation_id)
+            if status != 200:
+                raise SmokeError("bound room was not retained by the original Current endpoint")
+        evidence["checks"].append("bound search status and cancel preserve one reserved room visible through Current")
+
+        expect_rpc_denied(api_url, tokens[1], "gamefleet_search_status_v1", {
+            "version": SEARCH_VERSION, "compatibility": COMPATIBILITY, "region": REGION,
+            "searchId": searches[0]["searchId"],
+        })
+        token_c = authenticate(api_url, "gf-p4d-c-" + uuid.uuid4().hex)
+        third_search = search_begin_rpc(api_url, token_c, "smoke-search-cancel-c")
+        expect_rpc_denied(api_url, tokens[1], "gamefleet_search_cancel_v1", {
+            "version": SEARCH_VERSION, "compatibility": COMPATIBILITY, "region": REGION,
+            "searchId": third_search["searchId"],
+        })
+        cancelled = search_participant_rpc(api_url, token_c, "gamefleet_search_cancel_v1", third_search["searchId"])
+        if not isinstance(cancelled.get("search"), dict) or cancelled["search"].get("state") != "cancelled":
+            raise SmokeError("search cancel RPC did not persist its terminal state")
+        ws_c = NakamaWebSocket(api_url, token_c)
+        owned_websockets.append(ws_c)
+        cancelled_group = "p4d" + uuid.uuid4().hex
+        ws_c.send_json({"cid": "gamefleet-cancelled-search", "matchmaker_add": {
+            "min_count": 2, "max_count": 2, "query": "+properties.smoke_group:" + cancelled_group,
+            "string_properties": {
+                "smoke_group": cancelled_group, "gamefleet_protocol": ROOM_VERSION,
+                "build_hash": COMPATIBILITY, "region": REGION,
+                "gamefleet_search_id": third_search["searchId"],
+            },
+        }})
+        wait_matchmaker_result([ws_c], matched=False)
+        ok_fixture_logs = logs(fixture_container)
+        if "p4d_fixture_search_owner_denied" not in ok_fixture_logs or "p4d_fixture_search_status user=" not in ok_fixture_logs or "state=cancelled" not in ok_fixture_logs:
+            raise SmokeError("cross-user search access or queueing a cancelled search was not rejected")
+        evidence["checks"].append("cross-participant status/cancel and a late MatchmakerAdd for a cancelled search are rejected")
+        evidence["synthetic_devices"] = 3
+        evidence["business_fixture_requests"] = {
+            "caller_scope": 1,
+            "current_null_before_match": 2,
+            "search_begin_calls_including_replay": ok_fixture_logs.count("p4d_fixture_search_begin user="),
+            "search_status_calls": ok_fixture_logs.count("p4d_fixture_search_status user="),
+            "search_cancel_calls": ok_fixture_logs.count("p4d_fixture_search_cancel user="),
+            "search_match_commits": ok_fixture_logs.count("p4d_fixture_search_match replay=false"),
+            "foreign_search_denials": ok_fixture_logs.count("p4d_fixture_search_owner_denied"),
+        }
+        print("LIVE POSITIVE CHECK COMPLETE: plugin registered; authenticated searches, matchmaker admission, matched binding, and cancellation fences passed", flush=True)
         if args.positive_only:
             evidence["status"] = "passed-positive-only"
             evidence["scope_failure"] = "not run (--positive-only)"
@@ -474,6 +1007,8 @@ def main() -> None:
         evidence["failure"] = str(exc)
         raise
     finally:
+        for ws in owned_websockets:
+            ws.close()
         for name in owned_containers:
             docker(["rm", "--force", name], check=False, timeout=20)
         if network_created:
