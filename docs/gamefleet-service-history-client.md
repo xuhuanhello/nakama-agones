@@ -34,3 +34,9 @@ Historical placement and revision IDs are validated without requiring them to eq
 ## Integration boundary
 
 This candidate is not registered in the Nakama runtime, configured from environment variables, or deployed. The ordinary caller client, existing Bridge and terminal archive adapter remain unchanged. Runtime composition must explicitly separate mapped searches eligible for new matching from retained searches that may only be inspected or cancelled. A not-found response must not trigger caller rebinding or replacement work.
+
+## Verification status
+
+Candidate source `69769814931cd2f69f9fdcf47955c753243eff3b` passed [CI 36727718241](https://github.com/xuhuanhello/nakama-agones/actions/runs/36727718241). Both source and integration jobs passed, including the full Go tests, vet and race suite, the existing cluster integration, and the ordinary GameFleet bridge in the official Nakama runtime. Local `make test` and focused ServiceHistory race checks also passed. Completed CI logs were checked; they contained no error markers.
+
+The runtime integration in that CI still exercises the existing ordinary-caller backend. It does not activate this new service client or establish real GameFleet/Fixed player acceptance. Independent service runtime composition, scope preflight and mapped-search eligibility are the next gate.
