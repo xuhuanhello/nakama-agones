@@ -502,7 +502,7 @@ class SmokeError(RuntimeError):
     pass
 
 
-def docker(args: list[str], *, check: bool = True, timeout: int = 120) -> subprocess.CompletedProcess[str]:
+def docker(args: list[str], *, check: bool = True, timeout: float = 120) -> subprocess.CompletedProcess[str]:
     result = subprocess.run(["docker", *args], text=True, capture_output=True, timeout=timeout)
     if check and result.returncode:
         stderr, stdout = result.stderr, result.stdout
@@ -535,9 +535,57 @@ def container_state(name: str) -> tuple[str, int]:
     return status, int(code)
 
 
-def logs(name: str) -> str:
-    result = docker(["logs", name], check=False, timeout=15)
+def logs(name: str, timeout: float = 15) -> str:
+    result = docker(["logs", name], check=False, timeout=timeout)
     return result.stdout + result.stderr
+
+
+def wait_for_exact_fixture_preflights(
+    name: str,
+    expected_scopes: int,
+    *,
+    timeout_seconds: float = 5.0,
+    poll_interval: float = 0.1,
+    log_reader=None,
+    monotonic_fn=None,
+    sleep_fn=None,
+) -> tuple[int, int]:
+    """Wait briefly for Docker's log transport, while keeping exact counts fail-closed."""
+    read_logs = log_reader or logs
+    monotonic = monotonic_fn or time.monotonic
+    sleep = sleep_fn or time.sleep
+    deadline = monotonic() + timeout_seconds
+    scope_count = current_null_count = 0
+
+    while True:
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            break
+        try:
+            fixture_logs = read_logs(name, timeout=remaining)
+        except subprocess.TimeoutExpired:
+            break
+        scope_count = fixture_logs.count("p4d_fixture_scope_ok")
+        current_null_count = fixture_logs.count("p4d_fixture_current_null user=")
+        if scope_count > expected_scopes or current_null_count > 2:
+            raise SmokeError(
+                "fixture preflight overcount "
+                f"(scope_ok={scope_count}/{expected_scopes}, current_null={current_null_count}/2)"
+            )
+        if scope_count == expected_scopes and current_null_count == 2:
+            if monotonic() <= deadline:
+                return scope_count, current_null_count
+            break
+
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            break
+        sleep(min(poll_interval, remaining))
+
+    raise SmokeError(
+        "fixture preflight count deadline exceeded "
+        f"(scope_ok={scope_count}/{expected_scopes}, current_null={current_null_count}/2)"
+    )
 
 
 def wait_for_db(name: str, deadline: float) -> None:
@@ -1175,10 +1223,8 @@ def main() -> None:
             status, _ = current_rpc(api_url, token, expect_success=True)
             if status != 200:
                 raise SmokeError("synthetic authenticated current RPC did not return HTTP 200")
-        ok_fixture_logs = logs(fixture_container)
         expected_scopes = 2 if BACKEND == "gamefleet-service" else 1
-        if ok_fixture_logs.count("p4d_fixture_scope_ok") != expected_scopes or ok_fixture_logs.count("p4d_fixture_current_null user=") != 2:
-            raise SmokeError("fixture did not observe the exact scope preflights and current-null for both synthetic devices")
+        wait_for_exact_fixture_preflights(fixture_container, expected_scopes)
         evidence["checks"].append("two synthetic Nakama devices authenticated and each received current=null through gamefleet_current_v1")
 
         searches = [

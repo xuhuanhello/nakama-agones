@@ -1,6 +1,6 @@
 # M5r routed Nakama match pools validation
 
-Local date: 2026-09-30; execution: 2026-10-01 UTC. This records a local candidate, not an online cutover. The three runtime reports are retained in [the evidence file](2026-09-30-nakama-m5r-runtime-evidence.json).
+Local date: 2026-09-30; execution: 2026-10-01 UTC. This records a local candidate, not an online cutover. The three original runtime reports and one routed rerun are retained in [the evidence file](2026-09-30-nakama-m5r-runtime-evidence.json).
 
 ## Result and scope
 
@@ -10,7 +10,7 @@ The opt-in `GAMEFLEET_SERVICE_SEARCH_PROTOCOL=v2` adapter passed the official Na
 | --- | --- |
 | Go tests and static checks | Full `go test ./...` and `go vet ./...` passed with the cached Go 1.27.1 toolchain. All new Go files passed formatting checks. |
 | Concurrency | Full `go test -mod=readonly -race ./...` passed, including the routed client, hooks, setup and backend. |
-| Python | All 146 tests passed, including the five new harness contracts and embedded Go fixture compilation; `py_compile` and `git diff --check` passed. |
+| Python | All 149 tests passed, including eight new harness contracts and embedded Go fixture compilation; `py_compile` and `git diff --check` passed. |
 | Service v2 runtime | Fourteen checks passed: module loading, separate scope preflights, authenticated searches, exact Begin replay, admission and matched binding, History recovery, cancellation, cross-user denial and negative startup modes. |
 | Pool separation | A1 and B1 waited through two one-second matchmaker intervals without matching. After A2 and B2 joined, authenticated users formed A1–A2 and B1–B2. Each pair's History search was bound to the same allocation; A and B had different allocations in the fixture. |
 | Untrusted input | The live WebSocket requests carried a broadened client query, forged string pool/queue values and numeric shadows of all six routing fields. Successful same-pool matching required the Before hook's replacement query and authoritative properties. |
@@ -47,6 +47,8 @@ The runtime harness creates uniquely named local containers and a temporary Post
 The local image was `nakama-gamefleet-m5r-local:20261001062957`, OCI index digest `sha256:4b3f020f594694aca6ab64f7738bf69b1b012e362586797f831c82ede4ca6871`. Its labels record Nakama 3.41.0, Go 1.27.1 and nakama-common 1.48.0. It was built from the uncommitted M5r worktree based on `b6f4065ac46a984b19d0a667fc0b984b00a9da70`, with `VCS_REF=uncommitted`. It is not evidence of a build from the eventual exact commit. The updated CI builds the submitted source and runs all three runtime modes; its exact-head result must be checked separately.
 
 Two fixture/assertion corrections are retained as review history: cohort selection initially tried to infer labels from a device prefix although the adapter correctly supplies authenticated Nakama UUIDs; it now uses controlled creation slots, preserves exact retries and verifies each player's final binding. A no-fallback test initially expected four requests while invoking two; the corrected request count covers only the two attempted v2 paths, with no production fallback added. The first live run reached health but failed its old registration-log assertion; the harness now checks the full selected service protocol in the actual registration log. Subsequent runtime runs passed. The first full Python run was blocked on six existing localhost binds by the filesystem/network sandbox; the authorized local rerun passed all 146 tests.
+
+Submitted source `3d379b160a1875e5ef645e5e6378bb21ede9514c` passed the source job and both existing runtime flows in [CI 36827045835](https://github.com/xuhuanhello/nakama-agones/actions/runs/36827045835), but the routed step failed its single fixture-log snapshot after both Current RPCs returned HTTP 200. That run did not reach the pool checks and is not a routed CI pass. The follow-up harness waits at most five seconds for Docker log delivery, keeps the exact scope/current counts, rejects excess counts immediately and reports safe counts on timeout. Three mock tests cover delayed delivery, overcount and deadline failure. The local routed runtime rerun and all 149 Python tests passed after that harness-only correction; the submitted correction still requires its own exact-head CI result.
 
 ## Remaining gates
 

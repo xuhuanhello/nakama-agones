@@ -97,6 +97,70 @@ class RuntimeHarnessContracts(unittest.TestCase):
         finally:
             smoke.SEARCH_PROTOCOL = old_protocol
 
+    def test_fixture_preflight_waits_for_delayed_log_delivery(self) -> None:
+        clock = {"now": 0.0}
+        delivered = iter((
+            "",
+            "p4d_fixture_scope_ok",
+            "p4d_fixture_scope_ok\n"
+            "p4d_fixture_scope_ok\n"
+            "p4d_fixture_current_null user=a\n"
+            "p4d_fixture_current_null user=b\n",
+        ))
+        reads = []
+
+        def read_logs(name: str, *, timeout: float) -> str:
+            reads.append((name, timeout))
+            return next(delivered)
+
+        result = smoke.wait_for_exact_fixture_preflights(
+            "fixture",
+            2,
+            log_reader=read_logs,
+            monotonic_fn=lambda: clock["now"],
+            sleep_fn=lambda delay: clock.__setitem__("now", clock["now"] + delay),
+        )
+        self.assertEqual(result, (2, 2))
+        self.assertEqual(len(reads), 3)
+        self.assertGreater(clock["now"], 0)
+
+    def test_fixture_preflight_rejects_overcount_immediately(self) -> None:
+        reads = []
+
+        def read_logs(name: str, *, timeout: float) -> str:
+            reads.append(name)
+            return "\n".join(
+                ["p4d_fixture_scope_ok"] * 3 + ["p4d_fixture_current_null user=x"] * 2
+            )
+
+        with self.assertRaisesRegex(
+            smoke.SmokeError,
+            r"overcount .*scope_ok=3/2, current_null=2/2",
+        ):
+            smoke.wait_for_exact_fixture_preflights("fixture", 2, log_reader=read_logs)
+        self.assertEqual(reads, ["fixture"])
+
+    def test_fixture_preflight_fails_at_deadline_with_safe_counts(self) -> None:
+        clock = {"now": 0.0}
+
+        def advance(delay: float) -> None:
+            clock["now"] += delay
+
+        with self.assertRaisesRegex(
+            smoke.SmokeError,
+            r"deadline exceeded .*scope_ok=1/2, current_null=1/2",
+        ):
+            smoke.wait_for_exact_fixture_preflights(
+                "fixture",
+                2,
+                timeout_seconds=1.0,
+                poll_interval=0.25,
+                log_reader=lambda name, *, timeout: "p4d_fixture_scope_ok\np4d_fixture_current_null user=a",
+                monotonic_fn=lambda: clock["now"],
+                sleep_fn=advance,
+            )
+        self.assertEqual(clock["now"], 1.0)
+
 
 if __name__ == "__main__":
     unittest.main()

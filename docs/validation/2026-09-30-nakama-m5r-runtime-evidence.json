@@ -303,6 +303,120 @@
           "exit_code": 1
         }
       ]
+    },
+    {
+      "status": "passed",
+      "scope": "isolated Nakama plugin, search RPC, matchmaker hook and synthetic binding check; no real GameFleet allocation or Fixed gameplay",
+      "runtime_image": "nakama-gamefleet-m5r-local:20261001062957",
+      "backend": "gamefleet-service",
+      "search_protocol": "v2",
+      "prefix": "gf-p4d-e2bb383e",
+      "checks": [
+        "built static local-only fixture image from scratch; no base image pull",
+        "temporary PostgreSQL ready on tmpfs; database port is not published",
+        "official Nakama 3.41.0 runtime applied migrations to the isolated nakama database",
+        "live Nakama process loaded agones.so, ran GameFleet scope preflight, and registered the GameFleet bridge",
+        "legacy Agones FleetManager registration log absent; invalid legacy DB URL was bypassed",
+        "two synthetic Nakama devices authenticated and each received current=null through gamefleet_current_v1",
+        "search begin RPC creates owned pending searches and exact request replay recovers the same ID",
+        "two websocket MatchmakerAdd requests passed owned-pending before status and the matched hook bound one exact pair",
+        "bound search status and cancel preserve one reserved room visible through Current",
+        "v2 routed pool metadata stayed out of player search RPCs; hostile query/string/numeric routing fields were replaced, and a two-interval A/B/A/B cohort matched only A-A and B-B in the simulated fixture",
+        "cross-participant status/cancel and a late MatchmakerAdd for a cancelled search are rejected",
+        "independent gfsvc mode uses v2 mapped search admission, v1 Match, and separate v1 History status/cancel; no ordinary caller routes",
+        "deny scope made Nakama exit nonzero before readiness, without backend fallback",
+        "history-read-only scope made Nakama exit nonzero before readiness, without backend fallback"
+      ],
+      "limits": [
+        "Synthetic local Business fixture only; no real GameFleet reservation, host, endpoint, ticket, or allocation was tested.",
+        "Temporary PostgreSQL database contains only this smoke's Nakama auth/state and is deleted at cleanup.",
+        "Loopback fixture and Nakama API are local-only; no production credentials or service were used."
+      ],
+      "runtime_image_facts": {
+        "id": "sha256:4b3f020f594694aca6ab64f7738bf69b1b012e362586797f831c82ede4ca6871",
+        "platform": "linux/amd64",
+        "labels": {
+          "contact": "support@heroiclabs.com",
+          "description": "Distributed server for social and realtime games and apps.",
+          "io.nakama.common.version": "1.48.0",
+          "io.nakama.go.version": "1.27.1",
+          "io.nakama.version": "3.41.0",
+          "maintainer": "Heroic Labs",
+          "org.opencontainers.image.created": "2026-09-18T19:51:59.662Z",
+          "org.opencontainers.image.description": "Official Nakama runtime with the Agones FleetManager module",
+          "org.opencontainers.image.licenses": "MIT",
+          "org.opencontainers.image.revision": "uncommitted",
+          "org.opencontainers.image.source": "https://github.com/xuhuanhello/nakama-agones",
+          "org.opencontainers.image.title": "Nakama Agones FleetManager",
+          "org.opencontainers.image.url": "https://github.com/heroiclabs/nakama",
+          "org.opencontainers.image.version": "m5r-local-20261001062957",
+          "variant": "nakama",
+          "version": "3.41.0"
+        },
+        "repo_digests": [
+          "nakama-gamefleet-m5r-local@sha256:4b3f020f594694aca6ab64f7738bf69b1b012e362586797f831c82ede4ca6871"
+        ]
+      },
+      "source_revision": "3d379b160a1875e5ef645e5e6378bb21ede9514c",
+      "source_worktree_clean": false,
+      "postgres_image_facts": {
+        "id": "sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea",
+        "platform": "linux/arm64",
+        "labels": {},
+        "repo_digests": [
+          "postgres@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea"
+        ]
+      },
+      "matchmaker_interval_seconds": 1,
+      "fixture_image_facts": {
+        "id": "sha256:a71ae9349f758c736174414225ef05146f48ebb15851d9cf3c26b8ac9388ccc6",
+        "platform": "linux/amd64",
+        "labels": {},
+        "repo_digests": [
+          "gf-p4d-e2bb383e-fixture@sha256:a71ae9349f758c736174414225ef05146f48ebb15851d9cf3c26b8ac9388ccc6"
+        ]
+      },
+      "nakama_api": "127.0.0.1:<ephemeral> (only this temporary container mapping)",
+      "service_route_counts": {
+        "history_status": 6,
+        "history_cancel": 2,
+        "mapped_v2_status": 13
+      },
+      "service_route_protocols": {
+        "begin_status": "v2",
+        "match": "v1",
+        "history": "v1"
+      },
+      "synthetic_devices": 7,
+      "business_fixture_requests": {
+        "scope_preflights": 2,
+        "current_null_before_match": 2,
+        "search_begin_calls_including_replay": 9,
+        "search_status_calls": 19,
+        "search_cancel_calls": 2,
+        "search_match_commits": 3,
+        "foreign_search_denials": 2
+      },
+      "scope_failures": [
+        {
+          "mode": "deny",
+          "fixture_status": "HTTP 403",
+          "nakama_container_state": "exited",
+          "exit_code": 1
+        },
+        {
+          "mode": "history-read-only",
+          "fixture_status": "HTTP 200; required History operations absent",
+          "nakama_container_state": "exited",
+          "exit_code": 1
+        }
+      ]
     }
-  ]
+  ],
+  "failed_ci": {
+    "run": 36827045835,
+    "source_revision": "3d379b160a1875e5ef645e5e6378bb21ede9514c",
+    "status": "failed",
+    "boundary": "routed runtime stopped at the one-shot preflight/current-null log count; no routed queue CI pass"
+  }
 }
