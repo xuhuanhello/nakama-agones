@@ -85,6 +85,13 @@ jobs:
             --backend gamefleet-service \
             --image nakama-agones-local:dev \
             --evidence .local/gamefleet-runtime-service-result.json
+      - name: Validate routed service pools in the official Nakama runtime
+        run: |
+          python3 scripts/test-gamefleet-runtime.py \
+            --backend gamefleet-service \
+            --search-protocol v2 \
+            --image nakama-agones-local:dev \
+            --evidence .local/gamefleet-runtime-routed-result.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -93,6 +100,7 @@ jobs:
             .local/smoke-result.json
             .local/gamefleet-runtime-result.json
             .local/gamefleet-runtime-service-result.json
+            .local/gamefleet-runtime-routed-result.json
           if-no-files-found: ignore
           retention-days: 7
       - if: always()

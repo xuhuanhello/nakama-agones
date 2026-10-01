@@ -28,6 +28,7 @@ RUNTIME_IMAGE = os.environ.get("GF_P4D_RUNTIME_IMAGE", "nakama-gamefleet-p4d:924
 POSTGRES_IMAGE = "postgres:16-alpine"
 SYNTHETIC_KEY = "gfbiz_p4d_synthetic_only_0123456789abcdef"
 BACKEND = "gamefleet"
+SEARCH_PROTOCOL = "v1"
 SERVICE_ID = "service_p4d_fixture"
 IDENTITY_ISSUER = "issuer_p4d_fixture"
 APP_ID = "app_p4d_fixture"
@@ -37,6 +38,9 @@ REGION = "p4d-local"
 COMPATIBILITY = "p4d-smoke"
 ROOM_VERSION = "gamefleet.player-room.v1"
 SEARCH_VERSION = "gamefleet.player-search.v1"
+ROUTED_SEARCH_VERSION = "gamefleet.service-player-search.v2"
+ROUTED_QUEUE_PROTOCOL = "gamefleet-service-search-v2"
+MATCHMAKER_INTERVAL_SECONDS = 1
 EVIDENCE_PATH = Path(tempfile.gettempdir()) / "gamefleet-runtime-smoke-evidence.json"
 db_password = ""
 
@@ -64,6 +68,8 @@ const (
 	roomVersion = "gamefleet.player-room.v1"
 	searchVersion = "gamefleet.player-search.v1"
 	serviceSearchVersion = "gamefleet.service-player-search.v1"
+	routedServiceSearchVersion = "gamefleet.service-player-search.v2"
+	routedQueueProtocol = "gamefleet-service-search-v2"
 )
 
 type fixtureSearch struct {
@@ -74,6 +80,9 @@ type fixtureSearch struct {
 	ExpiresAt time.Time
 	ResolvedAt *time.Time
 	AllocationID string
+	MatchPoolID string
+	CohortSlot string
+	Sequence int
 }
 
 type fixtureReservation struct {
@@ -130,15 +139,42 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 	_ = json.NewEncoder(w).Encode(value)
 }
 
+func routedPoolFamily(poolID string) string {
+	if strings.HasPrefix(poolID, "gfsp_aaaaaaaa") {
+		return "a"
+	}
+	if strings.HasPrefix(poolID, "gfsp_bbbbbbbb") {
+		return "b"
+	}
+	return "other"
+}
+
 func main() {
 	key := os.Getenv("GF_P4D_FIXTURE_KEY")
 	mode := os.Getenv("GF_P4D_FIXTURE_MODE")
 	service := os.Getenv("GF_P4D_FIXTURE_BACKEND") == "gamefleet-service"
-	scopePath, currentPath, beginPath := "/business/v1/caller", "/business/v1/reservations/current", "/business/v1/searches"
+	searchProtocol := os.Getenv("GF_P4D_FIXTURE_SEARCH_PROTOCOL")
+	if searchProtocol == "" {
+		searchProtocol = "v1"
+	}
+	if searchProtocol != "v1" && searchProtocol != "v2" {
+		log.Fatal("invalid fixture search protocol")
+	}
+	if searchProtocol == "v2" && !service {
+		log.Fatal("routed search fixture requires gamefleet-service")
+	}
+	scopePath, currentPath, beginPath, matchPath := "/business/v1/caller", "/business/v1/reservations/current", "/business/v1/searches", "/business/v1/searches/match"
 	beginVersion := searchVersion
+	matchVersion := searchVersion
+	routed := service && searchProtocol == "v2"
 	if service {
-		scopePath, currentPath, beginPath = "/business/v1/history/service", "/business/v1/history/reservations/current", "/business/v1/service-searches"
+		scopePath, currentPath, beginPath, matchPath = "/business/v1/history/service", "/business/v1/history/reservations/current", "/business/v1/service-searches", "/business/v1/service-searches/match"
 		beginVersion = serviceSearchVersion
+		matchVersion = serviceSearchVersion
+		if routed {
+			beginPath = "/business/v2/service-searches"
+			beginVersion = routedServiceSearchVersion
+		}
 	}
 	var mu sync.Mutex
 	searches := map[string]*fixtureSearch{}
@@ -147,6 +183,11 @@ func main() {
 	matchReservations := map[string]*fixtureReservation{}
 	participantRooms := map[string]*fixtureReservation{}
 	searchSequence := 0
+	routedCohortOrder := []string{"a1", "b1", "a2", "b2"}
+	routedCohortPools := map[string]string{
+		"a": "gfsp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		"b": "gfsp_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
@@ -246,23 +287,42 @@ func main() {
 		id := requestIDs[requestKey]
 		replay := id != ""
 		if !replay {
-			searchSequence++
+			sequence := searchSequence + 1
+			poolID := ""
+			cohortSlot := ""
+			if routed {
+				poolID = routedCohortPools["a"]
+				if sequence >= 3 && sequence <= 2+len(routedCohortOrder) {
+					cohortSlot = routedCohortOrder[sequence-3]
+					if cohortSlot == "b1" || cohortSlot == "b2" {
+						poolID = routedCohortPools["b"]
+					}
+				}
+			}
+			searchSequence = sequence
 			id = fmt.Sprintf("search_p4d_%d", searchSequence)
 			created := time.Now().UTC().Truncate(time.Millisecond)
-			searches[id] = &fixtureSearch{ID: id, ParticipantID: request.ParticipantID, State: "pending", CreatedAt: created, ExpiresAt: created.Add(120 * time.Second)}
+			searches[id] = &fixtureSearch{ID: id, ParticipantID: request.ParticipantID, State: "pending", CreatedAt: created, ExpiresAt: created.Add(120 * time.Second), MatchPoolID: poolID, CohortSlot: cohortSlot, Sequence: sequence}
 			requestIDs[requestKey] = id
 		}
 		search := searches[id]
 		result := map[string]any{"search": searchObject(search, nil), "replay": replay}
+		if routed {
+			result["version"] = routedServiceSearchVersion
+			result["matchPoolId"] = search.MatchPoolID
+		}
 		mu.Unlock()
-		log.Printf("p4d_fixture_search_begin user=%s state=%s replay=%t", request.ParticipantID, search.State, replay)
+		log.Printf("p4d_fixture_search_begin user=synthetic state=%s replay=%t", search.State, replay)
+		if routed {
+			log.Printf("p4d_fixture_search_begin routed_sequence=%d cohort_slot=%s pool_family=%s replay=%t", search.Sequence, search.CohortSlot, routedPoolFamily(search.MatchPoolID), replay)
+		}
 		status := http.StatusCreated
 		if replay {
 			status = http.StatusOK
 		}
 		writeBusiness(w, status, result, "p4d-fixture-search-begin")
 	})
-	mux.HandleFunc(beginPath+"/match", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(matchPath, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method"})
 			return
@@ -283,7 +343,7 @@ func main() {
 				NakamaTicket string `json:"nakamaTicket"`
 			} `json:"members"`
 		}
-		if decodeFixtureJSON(r, &request) != nil || request.Version != beginVersion || request.Compatibility != "p4d-smoke" || request.IdempotencyKey == "" || len(request.Members) != 2 || (service && request.Region != region) || (!service && request.Region != "") {
+		if decodeFixtureJSON(r, &request) != nil || request.Version != matchVersion || request.Compatibility != "p4d-smoke" || request.IdempotencyKey == "" || len(request.Members) != 2 || (service && request.Region != region) || (!service && request.Region != "") {
 			log.Print("p4d_fixture_bad_search_match")
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_fixture_request"})
 			return
@@ -304,15 +364,34 @@ func main() {
 			return
 		}
 		first, second := searches[request.Members[0].SearchID], searches[request.Members[1].SearchID]
-		if first == nil || second == nil || first.ParticipantID != request.Members[0].ParticipantID || second.ParticipantID != request.Members[1].ParticipantID || first.ID == second.ID || request.Members[0].NakamaTicket == "" || request.Members[1].NakamaTicket == "" || request.Members[0].NakamaTicket == request.Members[1].NakamaTicket || first.State != "pending" || second.State != "pending" {
+		if routed && first != nil && second != nil && first.CohortSlot != "" && second.CohortSlot != "" && first.MatchPoolID != second.MatchPoolID {
+			labels := []string{first.CohortSlot, second.CohortSlot}
+			if labels[0] > labels[1] { labels[0], labels[1] = labels[1], labels[0] }
+			log.Printf("p4d_fixture_routed_match_rejected cohort_pair=%s", labels[0]+"+"+labels[1])
+		}
+		if first == nil || second == nil || first.ParticipantID != request.Members[0].ParticipantID || second.ParticipantID != request.Members[1].ParticipantID || first.ID == second.ID || request.Members[0].NakamaTicket == "" || request.Members[1].NakamaTicket == "" || request.Members[0].NakamaTicket == request.Members[1].NakamaTicket || first.State != "pending" || second.State != "pending" || (routed && first.MatchPoolID != second.MatchPoolID) {
 			mu.Unlock()
 			log.Print("p4d_fixture_search_match rejected=true")
 			writeJSON(w, http.StatusConflict, map[string]any{"error": "search_unavailable"})
 			return
 		}
+		cohortPair := ""
+		if routed {
+			firstLabel, secondLabel := first.CohortSlot, second.CohortSlot
+			if firstLabel != "" && secondLabel != "" {
+				labels := []string{firstLabel, secondLabel}
+				if labels[0] > labels[1] { labels[0], labels[1] = labels[1], labels[0] }
+				cohortPair = labels[0] + "+" + labels[1]
+			}
+		}
 		matchedAt := time.Now().UTC().Truncate(time.Millisecond)
+		reservationID, allocationID, roomID := "reservation_p4d_smoke", "allocation_p4d_smoke", "room_p4d_smoke"
+		if routed {
+			pair := first.ID + "_" + second.ID
+			reservationID, allocationID, roomID = "reservation_p4d_"+pair, "allocation_p4d_"+pair, "room_p4d_"+pair
+		}
 		reservation := &fixtureReservation{
-			ReservationID: "reservation_p4d_smoke", AllocationID: "allocation_p4d_smoke", RoomID: "room_p4d_smoke",
+			ReservationID: reservationID, AllocationID: allocationID, RoomID: roomID,
 			ApplicationID: appID, PlacementID: placementID, RevisionID: revisionID, Region: region,
 			State: "reserved", CreatedAt: matchedAt, UpdatedAt: matchedAt,
 		}
@@ -326,6 +405,9 @@ func main() {
 		matchReservations[request.IdempotencyKey] = reservation
 		mu.Unlock()
 		log.Printf("p4d_fixture_search_match replay=false allocation=%s", reservation.AllocationID)
+		if routed && cohortPair != "" {
+			log.Printf("p4d_fixture_routed_match cohort_pair=%s pool_family=%s", cohortPair, routedPoolFamily(first.MatchPoolID))
+		}
 		writeBusiness(w, http.StatusAccepted, map[string]any{"reservation": reservation, "replay": false}, "p4d-fixture-search-match")
 	})
 	searchHandler := func(prefix, expectedVersion, use string) http.HandlerFunc { return func(w http.ResponseWriter, r *http.Request) {
@@ -340,7 +422,7 @@ func main() {
 		}
 		path := strings.TrimPrefix(r.URL.Path, prefix)
 		parts := strings.Split(path, "/")
-		if len(parts) != 2 || (parts[1] != "status" && parts[1] != "cancel") || (use == "mapped" && parts[1] == "cancel") {
+		if len(parts) != 2 || (parts[1] != "status" && parts[1] != "cancel") || (strings.HasPrefix(use, "mapped") && parts[1] == "cancel") {
 			writeJSON(w, http.StatusNotFound, map[string]any{"error": "not_found"})
 			return
 		}
@@ -376,13 +458,24 @@ func main() {
 		}
 		state := search.State
 		statusResult := map[string]any{"search": searchObject(search, participantRooms[request.ParticipantID])}
+		if use == "mapped_v2" {
+			statusResult = map[string]any{
+				"version": routedServiceSearchVersion,
+				"search": searchObject(search, participantRooms[request.ParticipantID]),
+				"matchPoolId": search.MatchPoolID,
+			}
+		}
 		mu.Unlock()
 		log.Printf("p4d_fixture_search_status user=%s state=%s", request.ParticipantID, state)
 		log.Printf("p4d_fixture_search_route use=%s operation=status", use)
 		writeBusiness(w, http.StatusOK, statusResult, "p4d-fixture-search-status")
 	} }
 	if service {
-		mux.HandleFunc(beginPath+"/", searchHandler(beginPath+"/", serviceSearchVersion, "mapped"))
+		mappedVersion, mappedUse := serviceSearchVersion, "mapped"
+		if routed {
+			mappedVersion, mappedUse = routedServiceSearchVersion, "mapped_v2"
+		}
+		mux.HandleFunc(beginPath+"/", searchHandler(beginPath+"/", mappedVersion, mappedUse))
 		mux.HandleFunc("/business/v1/history/searches/", searchHandler("/business/v1/history/searches/", searchVersion, "history"))
 	} else {
 		mux.HandleFunc(beginPath+"/", searchHandler(beginPath+"/", searchVersion, "ordinary"))
@@ -391,11 +484,15 @@ func main() {
 		log.Printf("p4d_fixture_unexpected method=%s path=%s", r.Method, r.URL.Path)
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "not_found"})
 	})
-	listener, err := net.Listen("tcp", "127.0.0.1:17682")
+	listenAddress := os.Getenv("GF_P4D_FIXTURE_LISTEN")
+	if listenAddress == "" {
+		listenAddress = "127.0.0.1:17682"
+	}
+	listener, err := net.Listen("tcp", listenAddress)
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Println("p4d_fixture_ready")
+	fmt.Printf("p4d_fixture_ready addr=%s\n", listener.Addr().String())
 	log.Fatal(http.Serve(listener, mux))
 }
 '''
@@ -652,10 +749,20 @@ def rpc_payload(base_url: str, token: str, name: str, payload: dict[str, object]
     return result
 
 
+def assert_player_search_dto(result: dict[str, object]) -> None:
+    if SEARCH_PROTOCOL != "v2":
+        return
+    search = result.get("search")
+    routed_keys = {"version", "matchPoolId", "matchPoolID", "match_pool_id"}
+    if routed_keys.intersection(result) or (isinstance(search, dict) and routed_keys.intersection(search)):
+        raise SmokeError("player search RPC leaked routed protocol or pool metadata")
+
+
 def search_begin_rpc(base_url: str, token: str, request_id: str) -> dict[str, object]:
     result = rpc_payload(base_url, token, "gamefleet_search_begin_v1", {
         "version": SEARCH_VERSION, "compatibility": COMPATIBILITY, "region": REGION, "requestId": request_id,
     })
+    assert_player_search_dto(result)
     search = result.get("search")
     if not isinstance(search, dict) or search.get("state") != "pending" or not isinstance(search.get("searchId"), str):
         raise SmokeError("search begin did not return a pending exact search")
@@ -663,9 +770,51 @@ def search_begin_rpc(base_url: str, token: str, request_id: str) -> dict[str, ob
 
 
 def search_participant_rpc(base_url: str, token: str, rpc_name: str, search_id: str) -> dict[str, object]:
-    return rpc_payload(base_url, token, rpc_name, {
+    result = rpc_payload(base_url, token, rpc_name, {
         "version": SEARCH_VERSION, "compatibility": COMPATIBILITY, "region": REGION, "searchId": search_id,
     })
+    assert_player_search_dto(result)
+    return result
+
+
+def matchmaker_add_payload(search: dict[str, object], smoke_group: str) -> dict[str, object]:
+    properties: dict[str, object] = {
+        "smoke_group": smoke_group,
+        "gamefleet_protocol": ROOM_VERSION,
+        "build_hash": COMPATIBILITY,
+        "region": REGION,
+        "gamefleet_search_id": search["searchId"],
+    }
+    result: dict[str, object] = {
+        "min_count": 2,
+        "max_count": 2,
+        "query": "+properties.smoke_group:" + smoke_group,
+        "string_properties": properties,
+    }
+    if SEARCH_PROTOCOL == "v2":
+        # These values are intentionally hostile. The v2 Before hook must
+        # replace the query and server-owned string properties, and delete
+        # numeric shadows before Nakama evaluates this request.
+        properties["gamefleet_match_pool"] = "client-forged-pool"
+        properties["gamefleet_queue_protocol"] = "client-forged-protocol"
+        result["query"] = "* OR +properties.smoke_group:" + smoke_group
+        result["numeric_properties"] = {
+            "gamefleet_protocol": 7.0,
+            "build_hash": 7.0,
+            "region": 7.0,
+            "gamefleet_search_id": 7.0,
+            "gamefleet_match_pool": 7.0,
+            "gamefleet_queue_protocol": 7.0,
+        }
+    return result
+
+
+def routed_pool_family(pool_id: str) -> str:
+    if pool_id.startswith("gfsp_" + "a" * 12):
+        return "a"
+    if pool_id.startswith("gfsp_" + "b" * 12):
+        return "b"
+    return "other"
 
 
 def expect_rpc_denied(base_url: str, token: str, name: str, payload: dict[str, object]) -> None:
@@ -709,6 +858,21 @@ def wait_matchmaker_result(sockets: list[NakamaWebSocket], *, matched: bool, tim
         raise SmokeError("timed out waiting for Nakama matchmaker result")
 
 
+def assert_no_matchmaker_result(sockets: list[NakamaWebSocket], duration: float) -> None:
+    deadline = time.monotonic() + duration
+    while time.monotonic() < deadline:
+        ready, _, _ = select.select([ws.sock for ws in sockets], [], [], min(0.25, deadline - time.monotonic()))
+        for sock in ready:
+            ws = next(candidate for candidate in sockets if candidate.sock is sock)
+            message = ws.recv_json(0.1)
+            if message is None:
+                continue
+            if "matchmaker_matched" in message:
+                raise SmokeError("different routed pools matched before same-pool partners joined")
+            if "error" in message:
+                raise SmokeError("Nakama rejected a valid routed pool cohort entry")
+
+
 def authenticate(base_url: str, device_id: str) -> str:
     basic = base64.b64encode(b"local-server-key:").decode("ascii")
     status, response = post_json(
@@ -743,6 +907,68 @@ def current_rpc(base_url: str, token: str, *, expect_success: bool, expected_all
     return status, response
 
 
+def run_routed_pool_cohort(base_url: str, fixture_container: str, owned_websockets: list[NakamaWebSocket]) -> None:
+    labels = ("a1", "b1", "a2", "b2")
+    tokens: list[str] = []
+    for _ in labels:
+        tokens.append(authenticate(base_url, "gf-p4d-routed-cohort-device-" + uuid.uuid4().hex))
+    searches: list[dict[str, object]] = []
+    for token, label in zip(tokens, labels, strict=True):
+        search = search_begin_rpc(base_url, token, "routed-cohort-begin-" + label)
+        searches.append(search)
+        if label == "a1":
+            a1_replay = rpc_payload(base_url, token, "gamefleet_search_begin_v1", {
+                "version": SEARCH_VERSION, "compatibility": COMPATIBILITY, "region": REGION,
+                "requestId": "routed-cohort-begin-a1",
+            })
+            assert_player_search_dto(a1_replay)
+            if a1_replay.get("replay") is not True or not isinstance(a1_replay.get("search"), dict) or \
+                    a1_replay["search"].get("searchId") != search.get("searchId"):
+                raise SmokeError("cohort exact replay changed its original routed search")
+    sockets = [NakamaWebSocket(base_url, token) for token in tokens]
+    owned_websockets.extend(sockets)
+    for ws, search, label in zip(sockets[:2], searches[:2], labels[:2], strict=True):
+        ws.send_json({"cid": "routed-pool-cohort-" + label, "matchmaker_add": matchmaker_add_payload(search, "cohort" + label)})
+    assert_no_matchmaker_result(sockets[:2], MATCHMAKER_INTERVAL_SECONDS * 2)
+
+    fixture_logs = logs(fixture_container)
+    expected_assignment = (
+        "routed_sequence=1 cohort_slot= pool_family=a replay=false",
+        "routed_sequence=1 cohort_slot= pool_family=a replay=true",
+        "routed_sequence=2 cohort_slot= pool_family=a replay=false",
+        "routed_sequence=3 cohort_slot=a1 pool_family=a replay=false",
+        "routed_sequence=3 cohort_slot=a1 pool_family=a replay=true",
+        "routed_sequence=4 cohort_slot=b1 pool_family=b replay=false",
+        "routed_sequence=5 cohort_slot=a2 pool_family=a replay=false",
+        "routed_sequence=6 cohort_slot=b2 pool_family=b replay=false",
+    )
+    if any(marker not in fixture_logs for marker in expected_assignment):
+        raise SmokeError("the fixture did not preserve two normal searches and assign new-search slots A/B/A/B with exact replay")
+
+    for ws, search, label in zip(sockets[2:], searches[2:], labels[2:], strict=True):
+        ws.send_json({"cid": "routed-pool-cohort-" + label, "matchmaker_add": matchmaker_add_payload(search, "cohort" + label)})
+    wait_matchmaker_result(sockets, matched=True, timeout=20)
+
+    fixture_logs = logs(fixture_container)
+    if "p4d_fixture_routed_match cohort_pair=a1+a2 pool_family=a" not in fixture_logs or \
+            "p4d_fixture_routed_match cohort_pair=b1+b2 pool_family=b" not in fixture_logs:
+        raise SmokeError("the live Nakama engine did not bind the two expected same-pool cohort pairs")
+    if "p4d_fixture_routed_match cohort_pair=a1+b1" in fixture_logs or "p4d_fixture_routed_match cohort_pair=a2+b2" in fixture_logs:
+        raise SmokeError("the live Nakama engine matched across routed pools")
+    if "p4d_fixture_routed_match_rejected" in fixture_logs:
+        raise SmokeError("a cross-pool cohort reached the platform Match route before being rejected")
+    bound = [
+        search_participant_rpc(base_url, token, "gamefleet_search_status_v1", str(search["searchId"]))
+        for token, search in zip(tokens, searches, strict=True)
+    ]
+    allocations = [result.get("search", {}).get("allocationId") if isinstance(result.get("search"), dict) else None
+                   for result in bound]
+    if any(not isinstance(result.get("search"), dict) or result["search"].get("state") != "bound"
+           for result in bound) or any(not isinstance(value, str) or not value for value in allocations) or \
+            allocations[0] != allocations[2] or allocations[1] != allocations[3] or allocations[0] == allocations[1]:
+        raise SmokeError("History did not confirm two distinct bound allocations for the A-A and B-B routed cohort pairs")
+
+
 def start_fixture(name: str, image: str, mode: str) -> None:
     docker([
         "run", "--detach", "--pull=never", "--platform", "linux/amd64", "--name", name,
@@ -750,6 +976,7 @@ def start_fixture(name: str, image: str, mode: str) -> None:
         "--env", "GF_P4D_FIXTURE_KEY=" + SYNTHETIC_KEY,
         "--env", "GF_P4D_FIXTURE_MODE=" + mode,
         "--env", "GF_P4D_FIXTURE_BACKEND=" + BACKEND,
+        "--env", "GF_P4D_FIXTURE_SEARCH_PROTOCOL=" + SEARCH_PROTOCOL,
         image,
     ])
     wait_for_fixture(name, time.monotonic() + 15)
@@ -783,6 +1010,8 @@ def start_nakama(name: str, config_path: Path, key_path: Path) -> None:
             "GAMEFLEET_BUSINESS_URL": "not-an-origin",
             "GAMEFLEET_BUSINESS_KEY_FILE": "/ordinary-key-must-not-be-read",
         })
+        if SEARCH_PROTOCOL == "v2":
+            env["GAMEFLEET_SERVICE_SEARCH_PROTOCOL"] = "v2"
     args = [
         "run", "--detach", "--pull=never", "--platform", "linux/amd64", "--name", name,
         "--network", "container:" + db_container,
@@ -796,20 +1025,34 @@ def start_nakama(name: str, config_path: Path, key_path: Path) -> None:
     docker(args)
 
 
-def main() -> None:
-    global db_container, db_password, REPO, RUNTIME_IMAGE, EVIDENCE_PATH, BACKEND, SYNTHETIC_KEY
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", type=Path, default=Path.cwd(), help="Nakama Agones checkout (default: current directory)")
     parser.add_argument("--image", default=RUNTIME_IMAGE, help="already-built linux/amd64 runtime image tag")
     parser.add_argument("--evidence", type=Path, default=EVIDENCE_PATH, help="evidence JSON output path (contains no bearer credentials)")
     parser.add_argument("--temp-root", type=Path, default=Path(tempfile.gettempdir()), help="temporary build/configuration directory parent")
     parser.add_argument("--backend", choices=("gamefleet", "gamefleet-service"), default="gamefleet", help="explicit isolated bridge mode")
+    parser.add_argument("--search-protocol", choices=("v1", "v2"), default="v1", help="service search wire protocol (v2 is opt-in and service-only)")
     parser.add_argument("--positive-only", action="store_true", help="run the positive search/match flow and omit startup-denial checks")
-    args = parser.parse_args()
+    return parser
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.search_protocol == "v2" and args.backend != "gamefleet-service":
+        parser.error("--search-protocol v2 requires --backend gamefleet-service")
+    return args
+
+
+def main() -> None:
+    global db_container, db_password, REPO, RUNTIME_IMAGE, EVIDENCE_PATH, BACKEND, SEARCH_PROTOCOL, SYNTHETIC_KEY
+    args = parse_args()
     REPO = args.repo.resolve()
     RUNTIME_IMAGE = args.image
     EVIDENCE_PATH = args.evidence
     BACKEND = args.backend
+    SEARCH_PROTOCOL = args.search_protocol
     if BACKEND == "gamefleet-service":
         # Public, deterministic fixture bytes, never a real service credential.
         SYNTHETIC_KEY = "gfsvc_" + base64.urlsafe_b64encode(bytes(range(32))).decode("ascii").rstrip("=")
@@ -838,6 +1081,7 @@ def main() -> None:
         "scope": "isolated Nakama plugin, search RPC, matchmaker hook and synthetic binding check; no real GameFleet allocation or Fixed gameplay",
         "runtime_image": RUNTIME_IMAGE,
         "backend": BACKEND,
+        "search_protocol": SEARCH_PROTOCOL,
         "prefix": prefix,
         "checks": [],
         "limits": [
@@ -863,6 +1107,10 @@ def main() -> None:
         key_path.write_text(SYNTHETIC_KEY, encoding="ascii")
         key_path.chmod(0o400)
         config_path.write_bytes((REPO / "deploy/nakama.local.yml").read_bytes())
+        if SEARCH_PROTOCOL == "v2":
+            with config_path.open("ab") as config_file:
+                config_file.write(b"\nmatchmaker:\n  interval_sec: 1\n")
+            evidence["matchmaker_interval_seconds"] = MATCHMAKER_INTERVAL_SECONDS
         fixture_source.write_text(GO_FIXTURE, encoding="utf-8")
         dockerfile.write_text(
             "FROM scratch\nCOPY gf-p4d-fixture /gf-p4d-fixture\nENTRYPOINT [\"/gf-p4d-fixture\"]\n",
@@ -908,7 +1156,8 @@ def main() -> None:
             evidence["nakama_startup_log_excerpt"] = safe_log_excerpt(logs(nakama_container))
             raise SmokeError("Nakama did not reach /healthcheck after GameFleet initialization")
         ok_logs = logs(nakama_container)
-        marker = ("GameFleet service bridge registered; allocation and capacity are owned by GameFleet"
+        service_search_version = ROUTED_SEARCH_VERSION if SEARCH_PROTOCOL == "v2" else "gamefleet.service-player-search.v1"
+        marker = (f"GameFleet service bridge registered with {service_search_version}; allocation and capacity are owned by GameFleet"
                   if BACKEND == "gamefleet-service" else
                   "GameFleet pilot bridge registered; allocation and capacity are owned by GameFleet")
         if marker not in ok_logs:
@@ -940,6 +1189,7 @@ def main() -> None:
             "version": SEARCH_VERSION, "compatibility": COMPATIBILITY, "region": REGION,
             "requestId": "smoke-search-begin-a",
         })
+        assert_player_search_dto(begin_replay)
         if begin_replay.get("replay") is not True or not isinstance(begin_replay.get("search"), dict) or begin_replay["search"].get("searchId") != searches[0]["searchId"]:
             raise SmokeError("lost-reply begin replay did not recover the same search")
         evidence["checks"].append("search begin RPC creates owned pending searches and exact request replay recovers the same ID")
@@ -949,14 +1199,7 @@ def main() -> None:
         owned_websockets.extend([ws_a, ws_b])
         smoke_group = "p4d" + uuid.uuid4().hex
         for ws, search in zip((ws_a, ws_b), searches, strict=True):
-            ws.send_json({"cid": "gamefleet-search", "matchmaker_add": {
-                "min_count": 2, "max_count": 2, "query": "+properties.smoke_group:" + smoke_group,
-                "string_properties": {
-                    "smoke_group": smoke_group, "gamefleet_protocol": ROOM_VERSION,
-                    "build_hash": COMPATIBILITY, "region": REGION,
-                    "gamefleet_search_id": search["searchId"],
-                },
-            }})
+            ws.send_json({"cid": "gamefleet-search", "matchmaker_add": matchmaker_add_payload(search, smoke_group)})
         wait_matchmaker_result([ws_a, ws_b], matched=True)
         fixture_deadline = time.monotonic() + 15
         while time.monotonic() < fixture_deadline and "p4d_fixture_search_match replay=false" not in logs(fixture_container):
@@ -984,6 +1227,9 @@ def main() -> None:
             if status != 200:
                 raise SmokeError("bound room was not retained by the original Current endpoint")
         evidence["checks"].append("bound search status and cancel preserve one reserved room visible through Current")
+        if BACKEND == "gamefleet-service" and SEARCH_PROTOCOL == "v2":
+            run_routed_pool_cohort(api_url, fixture_container, owned_websockets)
+            evidence["checks"].append("v2 routed pool metadata stayed out of player search RPCs; hostile query/string/numeric routing fields were replaced, and a two-interval A/B/A/B cohort matched only A-A and B-B in the simulated fixture")
 
         expect_rpc_denied(api_url, tokens[1], "gamefleet_search_status_v1", {
             "version": SEARCH_VERSION, "compatibility": COMPATIBILITY, "region": REGION,
@@ -991,6 +1237,9 @@ def main() -> None:
         })
         token_c = authenticate(api_url, "gf-p4d-c-" + uuid.uuid4().hex)
         third_search = search_begin_rpc(api_url, token_c, "smoke-search-cancel-c")
+        if BACKEND == "gamefleet-service" and SEARCH_PROTOCOL == "v2" and \
+                "routed_sequence=7 cohort_slot= pool_family=a replay=false" not in logs(fixture_container):
+            raise SmokeError("a new search after the routed cohort did not return to the default synthetic pool")
         expect_rpc_denied(api_url, tokens[1], "gamefleet_search_cancel_v1", {
             "version": SEARCH_VERSION, "compatibility": COMPATIBILITY, "region": REGION,
             "searchId": third_search["searchId"],
@@ -1001,14 +1250,7 @@ def main() -> None:
         ws_c = NakamaWebSocket(api_url, token_c)
         owned_websockets.append(ws_c)
         cancelled_group = "p4d" + uuid.uuid4().hex
-        ws_c.send_json({"cid": "gamefleet-cancelled-search", "matchmaker_add": {
-            "min_count": 2, "max_count": 2, "query": "+properties.smoke_group:" + cancelled_group,
-            "string_properties": {
-                "smoke_group": cancelled_group, "gamefleet_protocol": ROOM_VERSION,
-                "build_hash": COMPATIBILITY, "region": REGION,
-                "gamefleet_search_id": third_search["searchId"],
-            },
-        }})
+        ws_c.send_json({"cid": "gamefleet-cancelled-search", "matchmaker_add": matchmaker_add_payload(third_search, cancelled_group)})
         wait_matchmaker_result([ws_c], matched=False)
         ok_fixture_logs = logs(fixture_container)
         if "p4d_fixture_search_owner_denied" not in ok_fixture_logs or "p4d_fixture_search_status user=" not in ok_fixture_logs or "state=cancelled" not in ok_fixture_logs:
@@ -1017,20 +1259,30 @@ def main() -> None:
         if "p4d_fixture_unexpected" in ok_fixture_logs:
             raise SmokeError("bridge called a route outside its selected backend")
         if BACKEND == "gamefleet-service":
+            mapped_use = "mapped_v2" if SEARCH_PROTOCOL == "v2" else "mapped"
+            mapped_status_count = ok_fixture_logs.count("p4d_fixture_search_route use=" + mapped_use + " operation=status")
             route_counts = {
-                "mapped_status": ok_fixture_logs.count("p4d_fixture_search_route use=mapped operation=status"),
                 "history_status": ok_fixture_logs.count("p4d_fixture_search_route use=history operation=status"),
                 "history_cancel": ok_fixture_logs.count("p4d_fixture_search_route use=history operation=cancel"),
             }
+            route_counts["mapped_v2_status" if SEARCH_PROTOCOL == "v2" else "mapped_status"] = mapped_status_count
             if min(route_counts.values()) < 2 or "p4d_fixture_search_route use=ordinary" in ok_fixture_logs:
                 raise SmokeError("service matching and player History did not use distinct routes and protocols")
             evidence["service_route_counts"] = route_counts
-            evidence["checks"].append("independent gfsvc mode uses mapped search admission and separate History status/cancel; no ordinary caller routes")
-        evidence["synthetic_devices"] = 3
+            evidence["service_route_protocols"] = {
+                "begin_status": SEARCH_PROTOCOL,
+                "match": "v1",
+                "history": "v1",
+            }
+            evidence["checks"].append("independent gfsvc mode uses " + SEARCH_PROTOCOL + " mapped search admission, v1 Match, and separate v1 History status/cancel; no ordinary caller routes")
+        search_begin_count = ok_fixture_logs.count("p4d_fixture_search_begin user=")
+        if BACKEND == "gamefleet-service" and SEARCH_PROTOCOL == "v2" and search_begin_count != 9:
+            raise SmokeError("v2 fixture observed an unexpected number of new/exact-replay Begin calls")
+        evidence["synthetic_devices"] = 7 if BACKEND == "gamefleet-service" and SEARCH_PROTOCOL == "v2" else 3
         evidence["business_fixture_requests"] = {
             "scope_preflights": expected_scopes,
             "current_null_before_match": 2,
-            "search_begin_calls_including_replay": ok_fixture_logs.count("p4d_fixture_search_begin user="),
+            "search_begin_calls_including_replay": search_begin_count,
             "search_status_calls": ok_fixture_logs.count("p4d_fixture_search_status user="),
             "search_cancel_calls": ok_fixture_logs.count("p4d_fixture_search_cancel user="),
             "search_match_commits": ok_fixture_logs.count("p4d_fixture_search_match replay=false"),

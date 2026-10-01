@@ -1,6 +1,8 @@
 # Documentation
 
 - [GameFleet 候选薄适配与 pilot 配置](gamefleet-pilot.md)：新平台接入、RPC 与隔离验证；默认仍保留旧模式。
+- [GameFleet service runtime](gamefleet-service-runtime.md)：独立服务身份、History 权限与 v1/v2 配置。
+- [Routed match pools](gamefleet-routed-match-pools.md)：显式 v2 队列隔离与切换门槛；[M5r 本机验收](validation/2026-09-30-nakama-m5r-routed-match-pools.md)记录官方 runtime 与模拟 API 的验证范围。
 
 Start with the workflow below. The README describes scope; this index separates installation, daily operation and reference material. Example addresses and credentials are never production configuration.
 

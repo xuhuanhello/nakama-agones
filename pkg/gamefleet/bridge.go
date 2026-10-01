@@ -34,6 +34,9 @@ func registerBridge(initializer runtime.Initializer, b bridge) error {
 	if initializer == nil || b.backend == nil || !exactText(b.config.Region, 128) || !exactText(b.config.Compatibility, 128) {
 		return errors.New("invalid GameFleet bridge configuration")
 	}
+	if b.matchingRoutedSearchStatus != nil && (b.matchingSearchStatus != nil || len(b.config.Region) > 64 || len(b.config.Compatibility) > 64) {
+		return errors.New("invalid routed GameFleet bridge configuration")
+	}
 	if err := initializer.RegisterBeforeRt("MatchmakerAdd", b.before); err != nil {
 		return err
 	}
@@ -57,6 +60,9 @@ type bridge struct {
 	// Existing records may be readable through History without being mapped to
 	// this matching service. Admission to Matchmaker uses this separate check.
 	matchingSearchStatus func(context.Context, string, string) (SearchStatus, error)
+	// Explicit v2 mode separates pool metadata from player recovery DTOs;
+	// recovery continues using its independent History authority.
+	matchingRoutedSearchStatus func(context.Context, string, string) (RoutedSearchStatus, error)
 }
 
 func authenticatedUser(ctx context.Context) (string, error) {
@@ -97,6 +103,9 @@ func (b bridge) before(ctx context.Context, _ runtime.Logger, _ *sql.DB, _ runti
 	if !attemptID.MatchString(id) {
 		return nil, runtime.NewError("owned search required", 3)
 	}
+	if b.matchingRoutedSearchStatus != nil {
+		return b.beforeRouted(ctx, in, id, user)
+	}
 	status := b.backend.SearchStatus
 	if b.matchingSearchStatus != nil {
 		status = b.matchingSearchStatus
@@ -136,6 +145,11 @@ func (b bridge) matched(ctx context.Context, _ runtime.Logger, _ *sql.DB, _ runt
 	}
 	if members[0].ParticipantID == members[1].ParticipantID || members[0].SearchID == members[1].SearchID || members[0].NakamaTicket == members[1].NakamaTicket {
 		return "", runtime.NewError("distinct players required", 3)
+	}
+	if b.matchingRoutedSearchStatus != nil {
+		if err := b.checkRoutedMatch(ctx, entries, members); err != nil {
+			return "", err
+		}
 	}
 	sort.Slice(members, func(i, j int) bool { return members[i].ParticipantID < members[j].ParticipantID })
 	key := stableKey("matchmaker_search_", []any{SearchVersion, b.config.Region, b.config.Compatibility, members})
