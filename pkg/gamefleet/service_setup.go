@@ -75,11 +75,28 @@ func privateServiceKeyFile(info os.FileInfo) bool {
 	return mode == 0400 || mode == 0600
 }
 
+// Protocol selection is separate from service identity. Changing the wire
+// protocol must not change the identity compared by the History transport.
+func serviceSearchProtocolFromEnv() (string, error) {
+	switch os.Getenv("GAMEFLEET_SERVICE_SEARCH_PROTOCOL") {
+	case "", "v1":
+		return ServiceSearchVersion, nil
+	case "v2":
+		return ServiceSearchRoutedVersion, nil
+	default:
+		return "", errors.New("GAMEFLEET_SERVICE_SEARCH_PROTOCOL must be v1 or v2")
+	}
+}
+
 // RegisterServiceFromEnv configures the service-backed player bridge without
 // constructing or migrating any fleet manager, database, or reconciler.
 func RegisterServiceFromEnv(ctx context.Context, logger runtime.Logger, _ *sql.DB, _ runtime.NakamaModule, initializer runtime.Initializer) error {
 	if initializer == nil {
 		return errors.New("GameFleet service bridge requires an initializer")
+	}
+	protocol, err := serviceSearchProtocolFromEnv()
+	if err != nil {
+		return err
 	}
 	cfg, err := ServiceConfigFromEnv()
 	if err != nil {
@@ -89,17 +106,27 @@ func RegisterServiceFromEnv(ctx context.Context, logger runtime.Logger, _ *sql.D
 	if err != nil {
 		return err
 	}
+	var routed *RoutedServiceSearchClient
+	if protocol == ServiceSearchRoutedVersion {
+		routed, err = NewRoutedServiceSearchClient(cfg)
+		if err != nil {
+			search.Close()
+			return err
+		}
+	}
 	history, err := NewServiceHistoryClient(ServiceHistoryConfig{
 		URL: cfg.URL, Key: cfg.Key, ServiceID: cfg.ServiceID, ApplicationID: cfg.ApplicationID,
 		IdentityIssuer: cfg.IdentityIssuer, Region: cfg.Region, Compatibility: cfg.Compatibility,
 	})
 	if err != nil {
 		search.Close()
+		routed.Close()
 		return err
 	}
 	var archive *TerminalArchiveClient
 	closeClients := func() {
 		search.Close()
+		routed.Close()
 		history.Close()
 		if archive != nil {
 			archive.Close()
@@ -131,7 +158,11 @@ func RegisterServiceFromEnv(ctx context.Context, logger runtime.Logger, _ *sql.D
 			return errors.New("GameFleet archive scope preflight failed")
 		}
 	}
-	baseBackend, err := newServiceBackend(search, history)
+	var routeClients []*RoutedServiceSearchClient
+	if routed != nil {
+		routeClients = append(routeClients, routed)
+	}
+	baseBackend, err := newServiceBackend(search, history, routeClients...)
 	if err != nil {
 		closeClients()
 		return err
@@ -140,7 +171,7 @@ func RegisterServiceFromEnv(ctx context.Context, logger runtime.Logger, _ *sql.D
 	if archive != nil {
 		backend = &terminalArchiveBackend{Backend: backend, archive: archive, archiveScope: *archiveCfg}
 	}
-	if err = registerServiceBridge(initializer, backend, search); err != nil {
+	if err = registerServiceBridge(initializer, backend, search, routeClients...); err != nil {
 		closeClients()
 		return err
 	}
@@ -151,7 +182,7 @@ func RegisterServiceFromEnv(ctx context.Context, logger runtime.Logger, _ *sql.D
 		return err
 	}
 	if logger != nil {
-		logger.Info("GameFleet service bridge registered; allocation and capacity are owned by GameFleet")
+		logger.Info("GameFleet service bridge registered with %s; allocation and capacity are owned by GameFleet", protocol)
 	}
 	return nil
 }
