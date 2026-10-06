@@ -2,6 +2,7 @@
 # unit. See deploy/compatibility.env and docs/compatibility.md before updating.
 ARG NAKAMA_IMAGE=docker.io/heroiclabs/nakama:3.41.0@sha256:ca9f3fe65c90f56860fe5d7cd024868a395cb1a001abb9912bf87ef47d605349
 ARG PLUGIN_BUILDER_IMAGE=docker.io/heroiclabs/nakama-pluginbuilder:3.41.0@sha256:eb506121ec2e67f39febee3a4252ae05598a0b39d3517b713ec1577714a9e5b5
+ARG APPLICATION_RUNTIME_IMAGE=${NAKAMA_IMAGE}
 FROM ${PLUGIN_BUILDER_IMAGE} AS dependencies
 WORKDIR /backend
 ENV GOTOOLCHAIN=local CGO_ENABLED=1
@@ -48,6 +49,23 @@ LABEL org.opencontainers.image.title="Nakama Agones FleetManager" \
       org.opencontainers.image.revision="${VCS_REF}" \
       org.opencontainers.image.licenses="MIT" \
       org.opencontainers.image.description="Official Nakama runtime with the Agones FleetManager module" \
+      io.nakama.version="3.41.0" \
+      io.nakama.go.version="1.27.1" \
+      io.nakama.common.version="1.48.0"
+COPY --from=builder /out/agones.so /nakama/data/modules/agones.so
+
+# Service-mode image composition: use the complete application runtime as the
+# base, then replace only this adapter module. This keeps application modules
+# (for example Fixed's account.so) already present in the supplied image.
+FROM ${APPLICATION_RUNTIME_IMAGE} AS service-runtime
+ARG PLUGIN_VERSION=0.1.0-dev
+ARG VCS_REF=uncommitted
+LABEL org.opencontainers.image.title="Nakama GameFleet service runtime" \
+      org.opencontainers.image.version="${PLUGIN_VERSION}" \
+      org.opencontainers.image.source="https://github.com/xuhuanhello/nakama-agones" \
+      org.opencontainers.image.revision="${VCS_REF}" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.description="Application Nakama runtime extended with the GameFleet service adapter" \
       io.nakama.version="3.41.0" \
       io.nakama.go.version="1.27.1" \
       io.nakama.common.version="1.48.0"

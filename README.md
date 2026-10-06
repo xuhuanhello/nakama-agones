@@ -1,44 +1,31 @@
-# Nakama Agones FleetManager
+# Nakama GameFleet 适配
 
-Self-hosted, multi-room game server orchestration for **Nakama Community 3.41.0 + K3s + Agones**. The companion [Unity package](https://github.com/xuhuanhello/agones-server-nakama-plugin-unity) integrates a Linux authoritative game process. This is an independent project; it does not load or modify the PlayFlow plugins.
+将 Nakama 的认证玩家、Matchmaker 配对与恢复请求接入独立 [Self-hosted GameFleet](https://github.com/xuhuanhello/selfhosted-gamefleet)。Nakama 负责身份与配对，平台负责唯一资源/房间账本，游戏进程负责玩法；不需要修改 Nakama 或官方 Unity SDK 源码。
 
-GameFleet migration candidate: [Nakama thin adapter and pilot configuration](docs/gamefleet-pilot.md). It is explicit opt-in; the default Agones backend remains unchanged. The player pilot is not deployed yet.
+当前 Fixed 集成使用 `gamefleet-service` 模式。仓库仍保留早期 Agones 直管和普通 caller 模式，安装时必须显式选择一种，不能同时注册多个 FleetManager / matched hook。
 
-The separate [`gamefleet-service` runtime candidate](docs/gamefleet-service-runtime.md) uses an independent `gfsvc_` identity and explicit search, match, and History authorization. It is not deployed; see its [environment template](deploy/gamefleet-service.env.example) before preparing a candidate runtime.
+## 使用入口
 
-An optional [terminal history reader](docs/gamefleet-terminal-history.md) preserves exact old reservation/search recovery across business-key changes. Its independent service credential grants only explicitly authorized terminal reads.
+1. [架构](docs/architecture.md)：组件与权限边界、匹配和恢复时序。
+2. [service 配置与协议](docs/gamefleet-service-runtime.md)：当前接入的参数、身份、授权和 RPC。
+3. [环境模板](deploy/gamefleet-service.env.example)：填写非秘密标识，密钥通过只读文件挂载。
+4. [编译兼容性](docs/compatibility.md)：插件必须匹配 Nakama 运行时/编译器/依赖组合。
+5. [部署说明](docs/deployment.md)：旧 Agones 直管部署仅用于该明确模式，不能用它安装新 GameFleet 平台。
 
-## Implements
+快速路径：先部署 GameFleet 并配置 service 的身份/issuer、search/match/history 授权和发布路由；再按 service 文档构建与启动 Nakama 插件组合。配置 `NAKAMA_FLEET_BACKEND=gamefleet-service`，挂载独立 `gfsvc_` key 文件并检查启动 preflight，最后接入匹配客户端。数据库、邮箱等应用插件由应用仓库维护。
 
-- Nakama FleetManager registration, two-player matchmaking, room/seat allocation, signed admission and reconnect tickets.
-- Persistent PostgreSQL state, reconciled Agones GameServer creation, ownership/UID checks and namespace-scoped RBAC.
-- Multiple rooms per process, bounded scaling, readiness/health gates and graceful drain before deletion.
-- Independent Unity lifecycle package; no changes to Nakama source or its official Unity SDK.
-- Optional [SSH-only Fleet console](docs/console.md): rooms, player IDs, node/instance metrics and seven-day [archived logs](docs/console-logs.md).
+基础模板不是完整业务安装器；`GAMEFLEET_SERVICE_URL` 必须从 Nakama 进程网络空间可达。主机 loopback 不自动等于容器 loopback，不能通过公开管理端口来绕过转发配置。
 
-Based on the official [Nakama FleetManager API](https://heroiclabs.com/docs/nakama/server-framework/fleet-manager/), [Agones GameServer](https://agones.dev/site/docs/reference/gameserver/) lifecycle and [K3s](https://docs.k3s.io/) deployment model. Code provenance is in [UPSTREAM.md](UPSTREAM.md).
+本仓库提供本地 `init`、`validate`、`plan`、`build`、`render` 与 `status` 命令用于准备 Nakama service 配置；`render` 只生成供 Fixed 现有 Compose 项目审阅的覆盖片段，不会安装平台或部署服务。详见 [本地准备步骤](docs/gamefleet-service-runtime.md#local-self-service-preparation)。
 
-## Use
+## 协议与运行原则
 
-Local prerequisites: Docker, kubectl, Python 3.10+, Node 22+, and approximately 8 GB available to Docker.
+认证身份来自 Nakama 上下文；玩家不能自报 user ID、caller、placement 或 revision。搜索/匹配幂等键与连接代次由协议约束；响应超时按原请求查询/重试，不创建 fallback 房间。历史查询与新匹配授权分开，发布切换不能破坏旧分配恢复。
 
-```sh
-./scripts/bootstrap-tools.sh
-python3 scripts/local_cluster.py up
-node scripts/smoke.mjs
-python3 scripts/local_cluster.py stop
-```
+GameFleet 是分配唯一写入者，新模式不把 Kubernetes 管理凭据、节点 SSH 或第二套占用账本交给 Nakama。完整总游戏设计由 [Fixed](https://github.com/xuhuanhello/Fixed-Point-Physics-C-Sharp)维护，平台安装由 [GameFleet](https://github.com/xuhuanhello/selfhosted-gamefleet/blob/codex/production-nakama-admission/docs/bootstrap-console.md)维护。
 
-The local stack creates a separate `agones-nakama` k3d cluster, uses loopback ports 17443/17850/17851 and UDP 17770–17789, and never changes your default kubeconfig. It runs real Nakama, PostgreSQL, Kubernetes and Agones with a **protocol fixture**, not Unity gameplay. Configuration and credentials stay in ignored `.local/`. Start with the [documentation index](docs/README.md). See the [executed validation](docs/validation-2026-09-21.md), [local testing](docs/local-testing.md), [deployment](docs/deployment.md) and the [implementation plan](docs/IMPLEMENTATION.md).
+## 验证与许可
 
-For your game, install the companion Unity package, implement its room host, publish a Linux image, then configure the pool with its immutable image digest. Use the authenticated `agones_fleet_*` RPCs described in [protocol v1](docs/protocol-v1.md).
+源码测试、隔离运行时和已部署游戏的证据必须区分。此 service 候选有运行时验证，Fixed v6 的生产链路另有游戏验收；新机器上的完整重建尚在进行，不能据此前结果宣布空机验收通过。
 
-## Constraints
-
-This release uses independently managed Agones GameServers; Nakama owns process scaling. Do not attach a FleetAutoscaler to the same processes. One configured pool has one game image, region and manual compatibility version. It does not purchase or remove VPS nodes. Capacity must be measured on your hardware; example room/CPU values are not performance guarantees.
-
-A Nakama runtime supports one registered FleetManager and one matched hook: do not install this standalone module beside another standalone fleet module. The libraries can be composed explicitly. The Go plugin must match the exact [runtime/compiler dependency set](docs/compatibility.md). The optional Fleet console runs separately from Nakama; its deployment needs no player-database access. The optional local action broker enables graceful instance drain without giving the web process the Fleet administrator secret.
-
-## License
-
-MIT. Agones, K3s, Nakama and Unity retain their respective licenses. No Tencent Cloud, PlayFlow or Heroic Labs affiliation is implied.
+[MIT](LICENSE)，来源见 [UPSTREAM](UPSTREAM.md)。同一套架构和安装文档原地更新；阶段验收记录保留其版本边界，不作为新安装入口。

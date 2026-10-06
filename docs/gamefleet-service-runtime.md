@@ -1,6 +1,6 @@
 # GameFleet service runtime candidate
 
-The `gamefleet-service` candidate passed isolated M5i acceptance, but formal service cutover has not happened. It is an explicit Nakama runtime mode backed by a private GameFleet service credential (`gfsvc_`). The existing Agones default and ordinary `gamefleet` caller mode remain separate.
+`gamefleet-service` is an explicit Nakama runtime mode backed by a private GameFleet service credential (`gfsvc_`). This document is the maintained configuration/protocol reference. Fixed has recorded a v6 live integration; a fresh-machine deployment and each new game release require separate acceptance. The existing Agones and ordinary `gamefleet` caller modes remain separate. See [architecture](architecture.md) for ownership and bootstrap order.
 
 Start from [`deploy/gamefleet-service.env.example`](../deploy/gamefleet-service.env.example). The adapter requires all seven `GAMEFLEET_SERVICE_*` values below; it does not inherit ordinary business key, application, placement, revision, region, or compatibility settings.
 
@@ -52,6 +52,81 @@ History cancellation records an intent or cancels a pending search according to 
 The optional `GAMEFLEET_ARCHIVE_*` settings in the example are a separate client and key. Leave all seven empty to disable it; a partial archive configuration fails startup. Configure an independent owner-issued `gfsvc_` credential, service ID, application, issuer, region, and compatibility for the retained profile.
 
 The archive supports only exact participant-bound terminal reservation and search status reads. It cannot answer Current, begin or match searches, cancel searches or rooms, issue tickets, resume connections, release seats, or make a historical room joinable. It does not restore the original caller's revoked authority. See [`gamefleet-terminal-history.md`](gamefleet-terminal-history.md) for its narrow fallback behavior.
+
+## Local self-service preparation
+
+The helper below prepares Nakama-side inputs only. It does not create the GameFleet identity or grants, publish an image, update a Compose project, or contact a remote host. It reads the environment file as plain `KEY=VALUE` data and checks key-file type and mode with filesystem metadata; it never reads the key contents.
+
+```sh
+PROJECT_DIR=/opt/nakama
+SERVICE_ENV="$PROJECT_DIR/.local/gamefleet-service/gamefleet-service.env"
+SERVICE_KEY="$PROJECT_DIR/secrets/gamefleet-service-key"
+
+# Run the helper from this repository checkout on the Compose/key-file host.
+python3 scripts/gamefleet_service.py init --output "$SERVICE_ENV"
+# Fill SERVICE_ENV with the exact seven settings. Store the owner-issued key privately; never paste its value into a command.
+chmod 0400 "$SERVICE_KEY"
+
+python3 scripts/gamefleet_service.py validate \
+  --env "$SERVICE_ENV" \
+  --key-source "$SERVICE_KEY"
+
+python3 scripts/gamefleet_service.py plan \
+  --env "$SERVICE_ENV" \
+  --key-source "$SERVICE_KEY" \
+  --application-image 'registry.example/nakama-fixed@sha256:<64-hex-digest>'
+
+python3 scripts/gamefleet_service.py build \
+  --env "$SERVICE_ENV" \
+  --key-source "$SERVICE_KEY" \
+  --application-image 'registry.example/nakama-fixed@sha256:<64-hex-digest>' \
+  --output-image nakama-gamefleet-service:local \
+  --output-dir "$PROJECT_DIR/.local/gamefleet-service"
+```
+
+The build uses the pinned Nakama/plugin-builder images, Nakama 3.41.0, Go 1.27.1, the shared module versions in `deploy/compatibility.env`, and `linux/amd64`. Its base must be the complete Fixed/application runtime image pinned by digest. The `service-runtime` target replaces only `agones.so`, so application modules already in that image, including Fixed's account/email module, remain part of the resulting image. The build records the base, toolchain, source revision and dirty state in `.local/gamefleet-service/build-inputs.json`; a local build tag is not a publishable immutable digest.
+
+After publishing the built image through your normal private-registry process, use that published digest to render the overlay. The key source path is separate from `GAMEFLEET_SERVICE_KEY_FILE`, which is its in-container mount target:
+
+```sh
+python3 scripts/gamefleet_service.py render \
+  --env /opt/nakama/.local/gamefleet-service/gamefleet-service.env \
+  --key-source /opt/nakama/secrets/gamefleet-service-key \
+  --runtime-image 'registry.example/nakama-fixed-service@sha256:<64-hex-digest>' \
+  --output-dir /opt/nakama/.local/gamefleet-service
+```
+
+Review `.local/gamefleet-service/compose.override.yaml`, then merge it with the existing Fixed/application Compose project and inspect the resolved config before applying it in your deployment environment. It only updates the existing `nakama` service's image, service environment and read-only key bind. It adds no published ports and changes no network mode. `status` reports only local build/render files and explicitly does not probe deployment state. The actual URL and both service scopes are checked by the plugin during Nakama startup, from Nakama's own network namespace; host-side loopback success is not sufficient. An optional archive reader also needs its separate key file passed with `--archive-key-source` to `validate`, `plan`, `build` and `render`.
+
+For the Fixed Compose project at `/opt/nakama`, run the following **on the machine that owns that Compose project and key-file bind path**. The helper has no SSH/transfer feature; the env file, private key file, rendered fragment and Docker daemon must share this host path:
+
+```sh
+PROJECT_DIR=/opt/nakama
+COMPOSE_FILE="$PROJECT_DIR/docker-compose.yml"
+OVERRIDE_FILE="$PROJECT_DIR/.local/gamefleet-service/compose.override.yaml"
+RUNTIME_IMAGE='registry.example/nakama-fixed-service@sha256:<64-hex-digest>'
+
+# Check the pulled image still contains both the GameFleet and Fixed account modules.
+docker run --pull=never --rm --network none --entrypoint sh "$RUNTIME_IMAGE" -c \
+  'test -s /nakama/data/modules/agones.so && test -s /nakama/data/modules/account.so'
+
+# Validate the merged Compose model without printing resolved environment values.
+docker compose -p nakama --project-directory "$PROJECT_DIR" \
+  -f "$COMPOSE_FILE" -f "$OVERRIDE_FILE" config --quiet
+
+# This next command is the actual Nakama rollout; the helper itself never runs it.
+docker compose -p nakama --project-directory "$PROJECT_DIR" \
+  -f "$COMPOSE_FILE" -f "$OVERRIDE_FILE" up -d --no-deps --force-recreate nakama
+
+docker compose -p nakama --project-directory "$PROJECT_DIR" \
+  -f "$COMPOSE_FILE" -f "$OVERRIDE_FILE" ps nakama
+docker compose -p nakama --project-directory "$PROJECT_DIR" \
+  -f "$COMPOSE_FILE" -f "$OVERRIDE_FILE" logs --tail=200 nakama
+```
+
+Confirm the startup log contains `GameFleet service bridge registered` and that Nakama becomes healthy. Compose `ps` alone does not prove GameFleet reachability, grants, player matching, or email login. `up` is a deployment action; review the image digest and production change procedure before running it. The helper intentionally has no `apply` command or remote-deployment path.
+
+This helper does not install PostgreSQL/Nakama or configure the existing application database, player/email module, public TLS routes, registry credentials, GameFleet service grants/history routes, private forwarding, rollout/rollback policy, or production health acceptance. Those remain with Fixed and the GameFleet owner; the rendered template is not evidence that any of them has been installed.
 
 ## Candidate status and validation boundary
 
