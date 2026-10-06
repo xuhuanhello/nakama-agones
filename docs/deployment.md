@@ -1,77 +1,145 @@
-# Deploying your own battle cluster
+# Deploy Nakama and GameFleet service from a blank Linux host
 
-This runbook covers a fresh installation and replacement of an existing fleet provider. For an existing Nakama deployment, follow the [in-place cutover](cutover.md): preserve its endpoint, database connection strings and account data while replacing the active provider. A separate endpoint or database is not required.
+This is the single supported Nakama deployment path: a full Compose stack with PostgreSQL, the complete application Nakama image, an HTTPS gateway, and a private SSH forward to GameFleet's loopback Business listener. The commands prepare and run the Nakama host. They do not install or modify the separate GameFleet platform.
 
-## 1. Nodes and network
+The helper never receives a password argument. It generates local database and Nakama keys without printing them, validates file permissions from metadata, checks a local image and module files, and runs Compose's quiet model validation. It does not SSH, publish an image, start containers, or claim remote health.
 
-Start with one K3s server (control plane) and one Linux amd64 game worker; they may be separate VPSs. One server is not highly available. Three server nodes are needed for an embedded-etcd HA quorum. Reserve CPU/memory for the OS, K3s, Agones and monitoring. Benchmark the intended VPS model: vCPU count, burst allowance and peak network speed do not establish game capacity.
+## Requirements and owner-provided inputs
 
-Use the repeatable [node installation and join runbook](nodes.md). The pinned Linux amd64 baseline is K3s v1.35.8+k3s1 / Agones 1.60.0, also used locally. It creates role labels, protects the control node from game placement, reserves OS/K3s resources and configures log rotation.
+Use a Linux amd64 host with Docker Engine, the Docker Compose plugin, and Python 3.10 or later. Confirm the host has free TCP ports 80/443 and unused Docker subnets for the two bridges. The Nakama plugin ABI in this repository targets `linux/amd64` and the pinned toolchain in [compatibility](compatibility.md).
 
-Join workers with the private control endpoint and a securely supplied K3s join token. Do not commit it or expose it in a public tutorial command. Set each game node's reachable public `node-external-ip` and label eligible nodes `nakama-agones.io/game-node=true`. In Tencent networks this may be a NAT public address: verify return routing and a UDP handshake from outside, not just ICMP ping.
+Before starting, obtain these inputs through the responsible owner systems:
 
-Keep API/kubelet/overlay communication private. Follow K3s's documented port matrix for your CNI. Public game clients need only the chosen UDP hostPort range (example 20000–20999). Do not expose Flannel VXLAN to the internet. Use private/VPN access when nodes do not share a VPC. Client traffic goes directly to the allocated node/UDP port; no paid cloud LoadBalancer is required by this design.
+- A GameFleet service identity, its private `gfsvc_` key, exact application/issuer/region/compatibility values, search and match grants, and History routes.
+- A GameFleet platform SSH account and dedicated public key authorization restricted to forwarding only to `127.0.0.1:17682`. Get the server host key fingerprint through a trusted channel and install that verified key in `known_hosts`.
+- A complete Nakama application image from Fixed's `deploy/account/build.py`. Build it on this Nakama host when using a local image ID, or publish it through your own registry and use the immutable repository digest. The image must contain `/nakama/data/modules/agones.so`; for Fixed account login, it must also contain `/nakama/data/modules/account.so`.
+- A DNS name pointing at the Nakama host. Allow inbound public TCP 80/443 (and UDP 443 only if you want HTTP/3); restrict SSH administration and outbound SSH egress according to your host policy.
 
-## 2. Agones and scoped controller permissions
+The remote platform must already bind its Business listener to its own `127.0.0.1:17682`. This stack does not switch the platform to host networking, publish that management listener, or route it through the public HTTPS gateway.
 
-Against the **explicit intended kubeconfig/context**:
+## Create the host project
+
+Obtain the source and pin the exact revision on the Nakama VPS. The working branch below contains this deployment entry; record the printed commit in your deployment record. For a selected release, checkout its reviewed commit instead.
 
 ```sh
-kubectl --kubeconfig /secure/cluster.yaml apply -f deploy/kubernetes/rbac.yaml
-helm upgrade --install agones https://agones.dev/chart/stable/agones-1.60.0.tgz   --kubeconfig /secure/cluster.yaml --namespace agones-system --create-namespace   --values deploy/agones.production.values.yaml --wait
+sudo git clone --branch codex/self-service-bootstrap https://github.com/xuhuanhello/nakama-agones.git /opt/nakama-source
+cd /opt/nakama-source
+git rev-parse HEAD
+sudo git checkout --detach "$(git rev-parse HEAD)"
 ```
 
-The namespace Role permits only GameServer get/list/create/delete and Secret get/create/update/delete. Use the `agones-control/nakama-agones` service account for Nakama. The namespace is a trust boundary: label filtering prevents accidental adoption, but Kubernetes RBAC itself does not restrict writes by label. No cluster-admin token belongs in the plugin or dashboard.
+Run initialization, validation, and Compose with host administrator privileges. The stack directory and tunnel credential files belong to root; the SSH sidecar retains `cap_drop: ALL` and must be able to read its owner-only files without bypassing permissions:
 
-Production Helm values hard-select `nakama-agones.io/role=control` and tolerate the control taint installed by the node script. Two controller/extensions replicas on one control VPS do not provide host-level HA. GameServer placement uses the separate game-node selector in the environment template.
-
-Allocator and FleetAutoscaler are intentionally unused: the durable multi-room controller owns process scaling. Agones SDK lifecycle/health and Kubernetes scheduling remain active. Do not add another autoscaler that can delete the same occupied processes.
-
-## 3. Nakama, database and secrets
-
-Build/retrieve the independently released runtime and tools images. Pin immutable digests. For a fresh installation, create two databases with separate least-privilege owners: Nakama's database and this plugin's fleet database. For an in-place provider replacement, retain both existing connection strings and databases as described in the cutover runbook. Run the official Nakama migration and the new `fleet-migrate` tool before starting the runtime. Production database transport must follow your TLS/CA policy; take tested backups.
-
-`deploy/production.env.example` lists configuration. Store filled values in a Kubernetes Secret or a private secret manager, never a ConfigMap or Git. Use 32 random bytes encoded as unpadded base64url for the signing key, and at least 32 random characters for the admin token. The deployment's projected service-account token and CA work automatically in-cluster. External Nakama may instead use a private API URL and restricted rotating token/CA files.
-
-For external Nakama, follow [short-lived credential issuance and rotation](credentials.md), including directory mounts and a tested refresh transport. The token issuer helper does not automatically install its scheduler or delivery mechanism.
-
-Expose the Nakama client API and game-agent routes over trusted HTTPS. Restrict `/agones/fleet/v1/admin/*` at the reverse proxy/network as well as its bearer authentication. Configure rate limits and timeouts. Players receive only short-lived, user-specific admission tickets. All per-worker injected environment, including game-specific result credentials, is supplied via Secret references.
-
-The companion Unity lifecycle bridge requires HTTPS for remote control. Ensure the game image trusts its CA. Configuring readiness requires successful transport binding, business initialization and external result persistence, not merely a running Pod.
-
-### Matchmaking latency and warm capacity
-
-Pairing is performed by Nakama's built-in matchmaker. The Go runtime plugin validates region/version on queue admission, then handles the matched callback and reserves a room. Changing the runtime language does not change the native matchmaking interval.
-
-For a two-player game, start with this explicit Nakama configuration and measure queue time separately from process startup and UDP connection time:
-
-```yaml
-matchmaker:
-  interval_sec: 1
-  rev_precision: true
-  rev_threshold: 0
+```sh
+sudo install -d -m 0700 -o root -g root /opt/nakama
+sudo python3 /opt/nakama-source/scripts/nakama_stack.py init --directory /opt/nakama
 ```
 
-Nakama 3.41 defaults to a 15-second matchmaker interval. A 1-second interval reduces the polling wait when a compatible opponent is already queued; it does not guarantee an opponent or immediate room readiness. Retain bidirectional query checks to keep private load-test groups separate from ordinary players. The example client submits equal minimum/maximum counts (2/2), so `max_intervals` is not a delay for expanding player count. See [Nakama configuration](https://heroiclabs.com/docs/nakama/getting-started/configuration/).
+`init` copies the complete Compose project to `/opt/nakama`, generates random database and Nakama keys under `private/` with mode `0400`, and creates empty owner-supplied credential placeholders. It refuses to overwrite any existing file. The generated files are local inputs; the stack is not running yet.
 
-On monthly or otherwise always-on VPSs, use `AGONES_FLEET_MIN_INSTANCES=1` to retain one ready Unity game process even with no players. Extra empty processes may still retire after `AGONES_FLEET_IDLE_SECONDS`. This minimum counts ready processes, including occupied ones; it is not a guarantee of an additional empty process or room at peak load. The controller recreates the minimum after failure when healthy node capacity is available; one host is not HA.
+The socket server key is shared with clients as Nakama's application key. Fixed currently reads it from the `OnlineClient.gameFleetNakamaServerKey` field in the `Game_Online` scene; its checked-in default is `local-server-key`. Read the generated `private/nakama-socket-server-key` locally and synchronize its value with that Unity component before building a client. Do not place the database password, session keys, runtime HTTP key, or console credentials in the client.
 
-These values load at Nakama startup. Back up the configuration, confirm no active allocations, preserve player database/session settings, and recreate only the Nakama service to apply environment changes. Verify the effective matchmaker configuration, then observe the warm process beyond the idle timeout. Joining a new worker node still does not require a Nakama restart.
+## Configure the image, DNS, networks, and service
 
-Process scale-in only removes game Pods. It does not shut down, release, buy or reduce the bill of a VPS. Future pay-as-you-go worker scaling requires a separate node provisioning controller with minimum-node policy and drain-before-release checks; it is not implemented by this plugin.
+Edit `/opt/nakama/.env` using `sudoedit`. The template pins public dependencies to tested repository digests; keep those defaults for the first deployment. If deliberately updating a dependency, pull its release family and record the returned repository digest:
 
-## 4. Game image and rollout
+```sh
+sudo docker pull --platform linux/amd64 postgres:16-alpine
+sudo docker image inspect --format '{{index .RepoDigests 0}}' postgres:16-alpine
+sudo docker pull --platform linux/amd64 caddy:2-alpine
+sudo docker image inspect --format '{{index .RepoDigests 0}}' caddy:2-alpine
+sudo docker pull --platform linux/amd64 alpine:3.21
+sudo docker image inspect --format '{{index .RepoDigests 0}}' alpine:3.21
+```
 
-Build the Unity Linux amd64 Dedicated Server with the companion package and a completed room host adapter. Its entrypoint starts the game; it should read `AGONES_FLEET_GAME_PORT`, capacity and identity from environment. Upload it to your registry. Set `AGONES_GAME_IMAGE` to an immutable digest and use `AGONES_IMAGE_PULL_SECRET` if private.
+For an intentional dependency update, copy these complete outputs into `POSTGRES_IMAGE`, `CADDY_IMAGE`, and `ALPINE_IMAGE`, respectively. Deployment consumes the recorded digest, not a mutable tag. Verify a changed digest in your deployment environment before promotion. Do not copy an image config ID into these dependency fields.
 
-A pool binds deployment ID, image/settings, manual compatibility version and region. To change these, start a new pool/deployment and route compatible clients to it, then drain the old one. Do not alter a live persisted profile and erase state to force it to start. When replacing PlayFlow in place, coordinate the provider/client contract switch through the cutover runbook and keep only one active standalone FleetManager.
+Set `NAKAMA_RUNTIME_IMAGE` to either:
 
-## 5. Operations and scale
+- `sha256:<64-hex-local-image-id>` returned by the Fixed helper when the full image was built on this host; or
+- `registry.example/repository@sha256:<64-hex-digest>` after pulling that exact image onto this host.
 
-Install the included [Fleet console](console.md) for rooms, player seats, instance/node metrics and logs. It uses [SSH-only access](console-access.md); its [versioned API](console-api.md) supports scripts and AI diagnostics. The optional local broker enables graceful instance drain. Headlamp is not required; add it only when general Kubernetes editing is needed. Prometheus/Grafana are a separate option for longer metric history and alerting, not prerequisites for this deployment.
+Set `APPLICATION_REQUIRED_MODULES=account.so` for Fixed account login. Leave it empty only if the application genuinely has no extra required module. `nakama_stack.py validate` checks each filename against the image without network access, and Compose uses `pull_policy: never` for the application so it cannot silently replace a local image. For a registry image, pull the exact digest explicitly before validation.
 
-Record frame p99, input→authoritative-shot p95/p99, ball-stop→ready p95/p99, RTT, simulation queue age, rooms/players/reservations, result/audit backlog, CPU throttling/steal, RSS and actual NIC bytes. Compare 1/2/4/8 rooms per process before increasing process/node limits. Scaling a container does not purchase another VPS or lower an active VPS monthly bill.
+Set `NAKAMA_DOMAIN` to the public DNS name and `GAMEFLEET_SSH_TARGET` to the dedicated `user@host` for the platform tunnel. Keep the default Docker networks only if they do not overlap any existing networks or routed VPN ranges; otherwise choose two non-overlapping IPv4 subnets and distinct static frontend addresses. The default Caddy address is `172.29.240.2` and Nakama is `172.29.240.3`.
 
-New eligible worker nodes become available to the scheduler without restarting Nakama. The pool's `AGONES_FLEET_MAX_INSTANCES` remains its startup-loaded process budget; adding hardware does not raise that value. Still-pending GameServers can be scheduled on new nodes, while expired launch/allocation requests must be retried. See [node scaling limits](nodes.md#what-adding-a-node-changes).
+Copy the owner-issued service key to `/opt/nakama/private/gamefleet-service-key`. Set the seven exact service fields in `/opt/nakama/private/gamefleet-service.env`; its in-container key path must remain `/run/secrets/gamefleet-service-key`. The service URL is exactly `http://127.0.0.1:17682` inside the shared Nakama/tunnel network namespace. Set every identity and profile field to the value provisioned by the GameFleet owner; do not infer values from the image tag.
 
-Before promotion: verify external UDP on each node, real DM match/reconnect/rematch/results, graceful rolling drain, process/node failure isolation, image pull failure, API outage, Nakama restart, token rotation and database restore. No successful local fixture run substitutes for those real-game/production checks.
+Install a dedicated SSH private key at the path configured by `PLATFORM_SSH_KEY_SOURCE` (default `./private/platform-ssh-key`) and a verified host key at `PLATFORM_KNOWN_HOSTS_SOURCE` (default `./private/platform-known-hosts`). The client runs with `BatchMode=yes` and `StrictHostKeyChecking=yes`; it will not ask for a password or accept a new host key automatically. Install both tunnel files as root-owned regular files with mode `0400`; local validation rejects a different owner. Use `sudo install -o root -g root -m 0400` to copy your verified files into the configured paths. The service key and application credentials are also private files. Do not use an unverified `ssh-keyscan` result as the only trust step.
+
+On the platform host, restrict the tunnel user's SSH configuration to local forwarding and this one destination. A representative `sshd_config` Match block is:
+
+```text
+Match User nakama-tunnel
+    AllowTcpForwarding local
+    PermitOpen 127.0.0.1:17682
+    PermitTTY no
+    AllowAgentForwarding no
+    X11Forwarding no
+    GatewayPorts no
+```
+
+The authorized key should also use a forwarding-only restriction, for example `restrict,port-forwarding,permitopen="127.0.0.1:17682"` before the public key. Verify the effective SSH policy on that host and permit inbound SSH only from the Nakama host or its private network. The Nakama sidecar opens only a local `127.0.0.1:17682` listener and reconnects if the SSH process exits.
+
+For Fixed account login, copy the Fixed-owned `account.env` to `/opt/nakama/private/account.env` and set `DM_ACCOUNT_TRUSTED_PROXY_CIDRS` to the exact Caddy address with `/32` (default `172.29.240.2/32`). The Caddyfile removes any client-supplied `X-DM-Client-IP` and replaces it with the direct TLS peer address. Do not trust the whole Docker subnet. If the Caddy IP changes, change the Fixed setting at the same time. The application env file is optional; this generic stack does not define SES or other provider-specific environment fields.
+
+If the Fixed account module uses a credentials file, set `APPLICATION_SECRET_FILE` to its private source path and mount target `APPLICATION_SECRET_TARGET=account_credentials`. Fixed's env file should refer to `/run/secrets/account_credentials`. Keep the file read-only with mode `0400` or `0600`. The generated empty JSON placeholder is only for applications that do not consume an application credential file.
+
+Generated database and Nakama secrets remain in private files. The PostgreSQL container reads its password through `POSTGRES_PASSWORD_FILE`. The Nakama entrypoint validates the safe generated key format and renders its YAML to `/run/nakama-config`, a container tmpfs; it does not put secret values in `.env`, Compose command arguments, or startup logs. Keep backups of `private/` and the database volume under your normal encrypted backup policy. Losing session encryption keys invalidates existing client sessions.
+
+## Validate and start
+
+First validate the local inputs. The command checks all seven GameFleet fields, source-file type/permissions, exact network addresses, the image identity and required module files, and the Compose model. It does not display resolved env values or key contents:
+
+```sh
+sudo python3 /opt/nakama-source/scripts/nakama_stack.py validate --directory /opt/nakama
+sudo python3 /opt/nakama-source/scripts/nakama_stack.py plan --directory /opt/nakama
+```
+
+If using a registry image, pull it by the exact digest before `validate`:
+
+```sh
+sudo docker pull 'registry.example/repository@sha256:<64-hex-digest>'
+```
+
+On the deployment host, resolve Compose without printing the model, pull the pinned public dependencies, build the tunnel sidecar, and then start the stack:
+
+```sh
+sudo docker compose --env-file /opt/nakama/.env --project-directory /opt/nakama \
+  -f /opt/nakama/compose.yaml config --quiet
+sudo docker compose --env-file /opt/nakama/.env --project-directory /opt/nakama \
+  -f /opt/nakama/compose.yaml pull postgres caddy
+sudo docker compose --env-file /opt/nakama/.env --project-directory /opt/nakama \
+  -f /opt/nakama/compose.yaml build --pull gamefleet-tunnel
+sudo docker compose --env-file /opt/nakama/.env --project-directory /opt/nakama \
+  -f /opt/nakama/compose.yaml up -d
+```
+
+This `up` command is the deployment action. The helper has no `apply`, remote SSH, or public-registry push command. Compose starts the local SSH sidecar in Nakama's network namespace; the Nakama entrypoint waits for the local tunnel listener, runs Nakama's database migration, then starts the server.
+
+## Verify actual operation
+
+Check service process state and inspect logs locally:
+
+```sh
+sudo docker compose --env-file /opt/nakama/.env --project-directory /opt/nakama \
+  -f /opt/nakama/compose.yaml ps
+sudo docker compose --env-file /opt/nakama/.env --project-directory /opt/nakama \
+  -f /opt/nakama/compose.yaml logs --tail=200 nakama gamefleet-tunnel caddy postgres
+```
+
+Confirm the TLS certificate for `NAKAMA_DOMAIN`, successful Nakama startup and migration, a healthy tunnel, and the adapter's service/search/History preflight. Test account login, matching, reconnect/resume, and GameFleet grants with real client flows. Compose `ps`, a green TCP tunnel healthcheck, and a Caddy certificate do not prove the service grants, account provider, room lifecycle, or production availability.
+
+The Nakama Console is not proxied publicly. To reach it from an operator workstation, use an SSH local forward to the Nakama host's loopback-only port:
+
+```sh
+ssh -N -L 17351:127.0.0.1:17351 operator@nakama-host
+```
+
+Then open `http://127.0.0.1:17351` locally and use username `admin` and the generated console password from its private file. Do not add a public Compose port mapping for 7350, 7351, 7348, 7349, or 17682.
+
+## Recovery and limits
+
+Back up PostgreSQL and the `private/` key files together. Protect Caddy's data volume so TLS renewal state survives container replacement. Test restore before production use. Do not regenerate the database password independently after PostgreSQL initialization; rotate it inside PostgreSQL and update the private file as one controlled change. Do not regenerate Nakama session keys during a normal image rollout.
+
+This stack is a single-host deployment and is not highly available. It does not install GameFleet, create service identities/grants, build the Fixed application image, provision DNS/firewall policy, or establish a tested backup. Those remain explicit owner steps. For the adapter's request contract and separate authorization scopes, see [service runtime](gamefleet-service-runtime.md); for component and port ownership, see [architecture](architecture.md).

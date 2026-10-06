@@ -1,54 +1,58 @@
-# Nakama 适配架构
+# Nakama GameFleet service architecture
 
-本页是本仓库唯一架构说明。当前游戏采用 `gamefleet-service` 模式；完整参数及路由只维护在 [service runtime](gamefleet-service-runtime.md)，不在此复制。平台内部架构见 [GameFleet](https://github.com/xuhuanhello/selfhosted-gamefleet/blob/codex/production-nakama-admission/docs/architecture.md)。
-
-## 职责与控制权
+The supported deployment path is one Linux host running the Compose stack in the [deployment guide](deployment.md). This repository connects Nakama to GameFleet through the `gamefleet-service` adapter. The GameFleet platform is installed and operated separately.
 
 ```mermaid
 flowchart LR
-    C[已认证客户端] -->|RPC / Matchmaker| N[Nakama]
-    N --> A[本仓库 service 适配]
-    A -->|私有 service API| G[GameFleet 唯一分配账本]
-    G --> H[Unity / 其他游戏 Host]
-    C -->|游戏传输| H
-    N --> DB[(玩家数据库)]
+  P[Player clients] -->|HTTPS / WebSocket :443| C[Caddy gateway]
+  C -->|private Docker network, HTTP :7350| N[Nakama runtime]
+  N -->|internal database network| D[(PostgreSQL)]
+  N -->|shared loopback namespace :17682| T[SSH tunnel sidecar]
+  T -->|key-only SSH local forward| G[GameFleet host 127.0.0.1:17682]
+  N --> A[Fixed application modules, when configured]
+  N -->|host loopback only :17351| O[Nakama Console]
+  G --> H[Game hosts]
 ```
 
-Nakama 提供身份、会话和配对；适配器负责将可信身份和幂等请求映射到平台。GameFleet 负责授权、发布选择、资源预留、票据代次与持久化状态。Host 负责实际房间 prepare、玩家连接与 close。任何一层的“请求成功”都不能伪造下一层的完成确认。
+## Ownership
 
-service 模式不直接管理 Kubernetes、购买机器、持有节点 SSH，也不维护可独立分配房间的第二本账。游戏规则、邮箱/经济系统和结算是应用职责，不应硬编码在公共适配器。
+Nakama authenticates players, runs Matchmaker, and derives participant identity from its authenticated runtime context. The adapter maps those trusted identities and stable request IDs to GameFleet service endpoints. GameFleet owns service grants, profile selection, room allocation, tickets, generations, and the durable allocation ledger. A game host owns prepare, player admission, gameplay, and close evidence.
 
-## 匹配与恢复
+The service credential is separate from the SSH tunnel credential. Nakama reads the owner-issued `gfsvc_` key from a read-only secret file. The SSH sidecar uses a separate key restricted on the GameFleet host to the single `127.0.0.1:17682` destination. Neither key is placed in a container image, `.env`, command argument, or chat.
+
+## Network boundaries
+
+The frontend Docker bridge carries Caddy-to-Nakama HTTP and outbound SSH. PostgreSQL is attached only to a separate `internal: true` bridge shared with Nakama. Caddy is the only public service and publishes TCP 80/443 plus optional HTTP/3 UDP 443. It proxies player APIs and WebSockets to Nakama port 7350. The embedded console is bound to host loopback at `127.0.0.1:17351`; use an operator SSH tunnel to open it remotely.
+
+Nakama API/gRPC ports are not published directly. The GameFleet business listener is not exposed through Caddy or Docker port mapping. A small SSH sidecar shares Nakama's network namespace, listens only on its `127.0.0.1:17682`, and forwards to the platform host's loopback listener. Nakama therefore keeps the adapter's exact loopback URL contract while the service crosses hosts through an authenticated, host-key-verified path.
+
+Restarting or replacing Nakama interrupts that shared-loopback tunnel while the sidecar reconnects. Automatic recovery does not provide seamless failover or a high-availability guarantee.
+
+Caddy removes any incoming `X-DM-Client-IP` value and sets it from the direct TLS peer address. Fixed's optional account module must trust only the Caddy container's exact static IPv4 `/32` (default `172.29.240.2/32`) via `DM_ACCOUNT_TRUSTED_PROXY_CIDRS`. If the Caddy address changes, update the application setting with it. Do not trust the full Docker subnet.
+
+## Request and recovery flow
 
 ```mermaid
 sequenceDiagram
-    participant C as 客户端
-    participant N as Nakama 适配
-    participant G as GameFleet
-    C->>N: Begin search（认证身份、profile、request ID）
-    N->>G: service search
-    G-->>N: 可恢复 search ID
-    N->>N: Matchmaker 配对
-    N->>G: 幂等绑定确切玩家对
+    participant C as Client
+    participant N as Nakama adapter
+    participant S as SSH loopback forward
+    participant G as GameFleet service
+    C->>N: Authenticated search request + stable request ID
+    N->>S: Service search request
+    S->>G: Forward to host loopback 127.0.0.1:17682
+    G-->>N: Mapped search identity
+    N->>N: Matchmaker pairs authenticated players
+    N->>G: Idempotent exact-pair match request
     C->>N: current / assignment / resume
-    N->>G: History 授权与代次检查
-    G-->>C: 当前分配或明确终态（经 Nakama）
+    N->>G: History authorization and generation checks
+    G-->>C: Current assignment or explicit terminal state
 ```
 
-普通匹配信号不等于房间已经准备好。current/status/assignment/resume 的请求必须保持协议规定的 ID 与代次；网络超时不允许换一套身份重新分配。取消先表达意图，房间释放必须由真实生命周期完成。
+Search, pair matching, and History access are separate grants. Startup preflight does not replace per-request authorization. A timeout must retain its original request ID and ledger pointer; it must not silently select another source or allocate a fallback room.
 
-## 身份与版本
+## Runtime image and state
 
-service 使用独立 `gfsvc_` 凭据，普通 caller 使用 `gfbiz_` 凭据，两者不能混用。search grant、match grant 和 History source route 分别授权；启动 preflight 不能替代每次请求的资源/参与者检查。
+The Fixed application image is supplied by its build helper and pinned by either a local Docker image ID or a complete OCI digest. The Nakama repository provides the matching `agones.so` adapter runtime target. When account login is enabled, the Fixed build adds `account.so` and the deployment preflight verifies both files. The Nakama repository accepts additional required module filenames through `APPLICATION_REQUIRED_MODULES`; it does not bake application-specific account fields into the generic Compose stack.
 
-region、compatibility 与 identity issuer 都是精确契约。镜像版本号不能自动改变这些值。发布切换后旧 allocation 的历史身份与终态仍由其原始账本来源校验，不把历史只读权限扩展成新分配权限。
-
-当前适配器 URL 契约限定 loopback HTTP origin。跨主机部署需要受保护、可恢复的转发，并从 Nakama 实际网络 namespace 验证；公网玩家 HTTPS 入口与该私有 API 不是同一个监听器。
-
-## 模式与安装边界
-
-一个 Nakama 运行时只注册一个 FleetManager 和 matched hook。`agones` 旧模式自行编排独立 GameServer；普通 `gamefleet` 绑定 caller；`gamefleet-service` 使用独立 service 身份和授权路由。安装时显式选择，不能同时运行多套控制器管理同一资源。
-
-平台先于此适配部署，授权和发布路由准备好后才能开放匹配。编译需匹配官方 Nakama 的 Go/依赖 ABI，应用所需其他插件须进入同一兼容组合镜像；不能为升级适配器漏掉账号插件。
-
-架构描述、空机流程和历史证据分开：当前代码支持不等于目标机器已经安装；正式游戏的既有成功也不等于新安装可复现。发现遗漏时修改本页或所属协议页，不再新建同内容的阶段架构副本。
+PostgreSQL owns Nakama player and runtime schema. The named Docker volume persists its data. The database password and Nakama server/session/runtime/console keys are generated into host files under `private/`; the Nakama entrypoint renders the secret-bearing YAML only into a container tmpfs before migrations and server startup. Caddy's certificate state persists in a separate named volume. Compose status alone does not establish GameFleet reachability, account login, matchmaking, or production health.

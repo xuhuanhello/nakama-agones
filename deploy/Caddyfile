@@ -1,0 +1,8 @@
+{$NAKAMA_DOMAIN} {
+	encode zstd gzip
+	reverse_proxy nakama:7350 {
+		# Remove any caller-supplied value, then replace it with Caddy's peer IP.
+		header_up -X-DM-Client-IP
+		header_up X-DM-Client-IP {remote_host}
+	}
+}

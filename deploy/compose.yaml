@@ -1,0 +1,186 @@
+name: nakama
+
+services:
+  postgres:
+    image: ${POSTGRES_IMAGE:?Set POSTGRES_IMAGE to a pinned OCI digest in .env}
+    platform: linux/amd64
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: nakama
+      POSTGRES_USER: nakama
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      PGDATA: /var/lib/postgresql/data/pgdata
+    secrets:
+      - postgres_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - database
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nakama -d nakama"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    security_opt:
+      - no-new-privileges:true
+
+  nakama:
+    image: ${NAKAMA_RUNTIME_IMAGE:?Set NAKAMA_RUNTIME_IMAGE to the complete Fixed image digest in .env}
+    platform: linux/amd64
+    pull_policy: never
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "/opt/nakama/nakama-entrypoint.sh"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - path: ${GAMEFLEET_SERVICE_ENV_FILE:-./private/gamefleet-service.env}
+        required: true
+      - path: ${APPLICATION_ENV_FILE:-./private/account.env}
+        required: false
+    environment:
+      NAKAMA_FLEET_BACKEND: gamefleet-service
+      GAMEFLEET_SERVICE_URL: http://127.0.0.1:17682
+      GAMEFLEET_SERVICE_KEY_FILE: /run/secrets/gamefleet-service-key
+      GAMEFLEET_ARCHIVE_KEY_FILE: ${GAMEFLEET_ARCHIVE_KEY_TARGET:-}
+    ports:
+      # The developer console is available to host-local clients only. Do not
+      # publish Nakama HTTP, gRPC, or the GameFleet business listener.
+      - "127.0.0.1:17351:7351/tcp"
+    secrets:
+      - source: postgres_password
+        target: postgres_password
+      - source: nakama_socket_server_key
+        target: nakama_socket_server_key
+      - source: nakama_session_encryption_key
+        target: nakama_session_encryption_key
+      - source: nakama_refresh_encryption_key
+        target: nakama_refresh_encryption_key
+      - source: nakama_runtime_http_key
+        target: nakama_runtime_http_key
+      - source: nakama_console_password
+        target: nakama_console_password
+      - source: nakama_console_signing_key
+        target: nakama_console_signing_key
+      - source: gamefleet_service_key
+        target: gamefleet-service-key
+      - source: gamefleet_archive_key
+        target: gamefleet-archive-key
+      - source: application_credentials
+        target: ${APPLICATION_SECRET_TARGET:-account_credentials}
+    volumes:
+      - type: bind
+        source: ./deploy/nakama-entrypoint.sh
+        target: /opt/nakama/nakama-entrypoint.sh
+        read_only: true
+    tmpfs:
+      - /run/nakama-config:mode=0700,size=1m
+    networks:
+      frontend:
+        ipv4_address: ${NAKAMA_IPV4:-172.29.240.3}
+      database: {}
+    security_opt:
+      - no-new-privileges:true
+
+  gamefleet-tunnel:
+    image: nakama-gamefleet-ssh-tunnel:local
+    platform: linux/amd64
+    build:
+      context: ./deploy/tunnel
+      args:
+        ALPINE_IMAGE: ${ALPINE_IMAGE:?Set ALPINE_IMAGE to a pinned OCI digest in .env}
+    restart: unless-stopped
+    depends_on:
+      nakama:
+        condition: service_started
+    network_mode: service:nakama
+    environment:
+      GAMEFLEET_SSH_TARGET: ${GAMEFLEET_SSH_TARGET:?Set GAMEFLEET_SSH_TARGET in .env}
+      GAMEFLEET_SSH_PORT: ${GAMEFLEET_SSH_PORT:-22}
+    secrets:
+      - platform_ssh_key
+      - platform_known_hosts
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:mode=1777,size=16m
+    healthcheck:
+      test: ["CMD", "nc", "-z", "-w", "1", "127.0.0.1", "17682"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 5s
+
+  caddy:
+    image: ${CADDY_IMAGE:?Set CADDY_IMAGE to a pinned OCI digest in .env}
+    platform: linux/amd64
+    restart: unless-stopped
+    depends_on:
+      nakama:
+        condition: service_started
+    environment:
+      NAKAMA_DOMAIN: ${NAKAMA_DOMAIN:?Set NAKAMA_DOMAIN to the public DNS name in .env}
+    ports:
+      - "80:80/tcp"
+      - "443:443/tcp"
+      - "443:443/udp"
+    volumes:
+      - type: bind
+        source: ./deploy/Caddyfile
+        target: /etc/caddy/Caddyfile
+        read_only: true
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      frontend:
+        ipv4_address: ${CADDY_IPV4:-172.29.240.2}
+    security_opt:
+      - no-new-privileges:true
+
+secrets:
+  postgres_password:
+    file: ${POSTGRES_PASSWORD_SOURCE:-./private/postgres-password}
+  nakama_socket_server_key:
+    file: ${NAKAMA_SOCKET_SERVER_KEY_SOURCE:-./private/nakama-socket-server-key}
+  nakama_session_encryption_key:
+    file: ${NAKAMA_SESSION_KEY_SOURCE:-./private/nakama-session-encryption-key}
+  nakama_refresh_encryption_key:
+    file: ${NAKAMA_REFRESH_KEY_SOURCE:-./private/nakama-refresh-encryption-key}
+  nakama_runtime_http_key:
+    file: ${NAKAMA_RUNTIME_HTTP_KEY_SOURCE:-./private/nakama-runtime-http-key}
+  nakama_console_password:
+    file: ${NAKAMA_CONSOLE_PASSWORD_SOURCE:-./private/nakama-console-password}
+  nakama_console_signing_key:
+    file: ${NAKAMA_CONSOLE_SIGNING_KEY_SOURCE:-./private/nakama-console-signing-key}
+  gamefleet_service_key:
+    file: ${GAMEFLEET_SERVICE_KEY_SOURCE:-./private/gamefleet-service-key}
+  gamefleet_archive_key:
+    file: ${GAMEFLEET_ARCHIVE_KEY_SOURCE:-./private/gamefleet-archive-key.disabled}
+  platform_ssh_key:
+    file: ${PLATFORM_SSH_KEY_SOURCE:-./private/platform-ssh-key}
+  platform_known_hosts:
+    file: ${PLATFORM_KNOWN_HOSTS_SOURCE:-./private/platform-known-hosts}
+  application_credentials:
+    file: ${APPLICATION_SECRET_FILE:-./private/application-credentials.json}
+
+volumes:
+  postgres_data:
+  caddy_data:
+  caddy_config:
+
+networks:
+  frontend:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${FRONTEND_SUBNET:-172.29.240.0/24}
+  database:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: ${DATABASE_SUBNET:-172.29.241.0/24}
