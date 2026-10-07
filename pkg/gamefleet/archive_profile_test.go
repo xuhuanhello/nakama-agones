@@ -13,7 +13,7 @@ func archiveProfileBackend(t *testing.T, primary *bridgeBackend, archive *archiv
 	wrapped := &terminalArchiveBackend{
 		Backend: primary,
 		archive: archive,
-		archiveScope: TerminalArchiveConfig{
+		archiveScope: TerminalArchiveConfig{TLS: fixtureTLS,
 			Region:        "archive-west",
 			Compatibility: "build-before-rollout",
 		},

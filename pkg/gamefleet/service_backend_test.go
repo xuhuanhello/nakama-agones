@@ -7,7 +7,6 @@ import (
 	"errors"
 	"io"
 	"net/http"
-	"net/http/httptest"
 	"reflect"
 	"strings"
 	"sync"
@@ -56,7 +55,7 @@ func (r *serviceBackendRecorder) snapshot() []serviceBackendRequest {
 func serviceBackendClients(t *testing.T, searchURL, historyURL string) (*ServiceSearchClient, *ServiceHistoryClient) {
 	t.Helper()
 	searchConfig := serviceSearchTestConfig(searchURL)
-	historyConfig := ServiceHistoryConfig{
+	historyConfig := ServiceHistoryConfig{TLS: fixtureTLS,
 		URL: historyURL, Key: searchConfig.Key, ServiceID: searchConfig.ServiceID,
 		ApplicationID: searchConfig.ApplicationID, IdentityIssuer: searchConfig.IdentityIssuer,
 		Region: searchConfig.Region, Compatibility: searchConfig.Compatibility,
@@ -126,9 +125,9 @@ func serviceBackendSearchStatusPayload(searchID string) string {
 }
 
 func TestServiceBackendRequiresOneExactServiceIdentityAndProfile(t *testing.T) {
-	first := httptest.NewServer(http.NotFoundHandler())
+	first := newBusinessTestServer(http.NotFoundHandler())
 	defer first.Close()
-	second := httptest.NewServer(http.NotFoundHandler())
+	second := newBusinessTestServer(http.NotFoundHandler())
 	defer second.Close()
 
 	search, history := serviceBackendClients(t, first.URL, first.URL)
@@ -156,7 +155,7 @@ func TestServiceBackendRequiresOneExactServiceIdentityAndProfile(t *testing.T) {
 	}
 	for name, change := range variants {
 		t.Run(name, func(t *testing.T) {
-			cfg := ServiceHistoryConfig{
+			cfg := ServiceHistoryConfig{TLS: fixtureTLS,
 				URL: base.URL, Key: base.Key, ServiceID: base.ServiceID, ApplicationID: base.ApplicationID,
 				IdentityIssuer: base.IdentityIssuer, Region: base.Region, Compatibility: base.Compatibility,
 			}
@@ -175,7 +174,7 @@ func TestServiceBackendRequiresOneExactServiceIdentityAndProfile(t *testing.T) {
 
 func TestServiceBackendKeepsSearchAndHistoryOperationsOnTheirOwnRoutes(t *testing.T) {
 	recorder := &serviceBackendRecorder{}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		raw, _ := io.ReadAll(r.Body)
 		recorder.add(serviceBackendRequest{method: r.Method, path: r.URL.Path, query: r.URL.RawQuery,
 			auth: r.Header.Get("Authorization"), body: raw})
@@ -266,7 +265,7 @@ func TestServiceBackendKeepsSearchAndHistoryOperationsOnTheirOwnRoutes(t *testin
 func TestServiceBackendCancelUsesRuntimeIdentityAndRejectsForgedPayload(t *testing.T) {
 	recorder := &serviceBackendRecorder{}
 	reservation := serviceSearchTestReservation("reserved")
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		raw, _ := io.ReadAll(r.Body)
 		recorder.add(serviceBackendRequest{method: r.Method, path: r.URL.Path, query: r.URL.RawQuery,
 			auth: r.Header.Get("Authorization"), body: raw})
@@ -329,7 +328,7 @@ func TestServiceBridgeUsesMappedSearchForAdmissionAndHistoryForRecovery(t *testi
 	oldSearch := serviceSearchTestPending(serviceBackendTestOld)
 	newSearch := serviceSearchTestPending(serviceBackendTestNew)
 	reservation := serviceSearchTestReservation("completed")
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		raw, _ := io.ReadAll(r.Body)
 		mu.Lock()
 		seen = append(seen, serviceBackendRequest{method: r.Method, path: r.URL.Path, query: r.URL.RawQuery,
@@ -364,7 +363,7 @@ func TestServiceBridgeUsesMappedSearchForAdmissionAndHistoryForRecovery(t *testi
 	}
 	ctx := bridgeCtx(serviceBackendTestUser)
 	searchConfig := serviceSearchTestConfig(server.URL)
-	cfg := Config{Region: searchConfig.Region, Compatibility: searchConfig.Compatibility}
+	cfg := Config{TLS: fixtureTLS, Region: searchConfig.Region, Compatibility: searchConfig.Compatibility}
 	oldAdmission := matchmakerEnvelope(RoomVersion, searchConfig.Compatibility, searchConfig.Region, nil)
 	oldAdmission.GetMatchmakerAdd().StringProperties["gamefleet_search_id"] = serviceBackendTestOld
 	_, err = initializer.before(ctx, nil, nil, nil, oldAdmission)
@@ -455,7 +454,7 @@ func TestServiceBridgeUsesMappedSearchForAdmissionAndHistoryForRecovery(t *testi
 
 func TestServiceBackendCancelRejectsMissingRuntimeIdentity(t *testing.T) {
 	var requests int
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	server := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		requests++
 		serviceBackendTestError(w, http.StatusInternalServerError)
 	}))

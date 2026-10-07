@@ -41,7 +41,6 @@ services:
         required: false
     environment:
       NAKAMA_FLEET_BACKEND: gamefleet-service
-      GAMEFLEET_SERVICE_URL: http://127.0.0.1:17682
       GAMEFLEET_SERVICE_KEY_FILE: /run/secrets/gamefleet-service-key
       GAMEFLEET_ARCHIVE_KEY_FILE: ${GAMEFLEET_ARCHIVE_KEY_TARGET:-}
     ports:
@@ -63,8 +62,20 @@ services:
         target: nakama_console_password
       - source: nakama_console_signing_key
         target: nakama_console_signing_key
+      - source: gamefleet_ca
+        target: gamefleet-ca.crt
+      - source: gamefleet_cert
+        target: gamefleet-client.crt
+      - source: gamefleet_tls_key
+        target: gamefleet-client.key
       - source: gamefleet_service_key
         target: gamefleet-service-key
+      - source: gamefleet_archive_ca
+        target: gamefleet-archive-ca.crt
+      - source: gamefleet_archive_cert
+        target: gamefleet-archive-client.crt
+      - source: gamefleet_archive_tls_key
+        target: gamefleet-archive-client.key
       - source: gamefleet_archive_key
         target: gamefleet-archive-key
       - source: application_credentials
@@ -82,38 +93,6 @@ services:
       database: {}
     security_opt:
       - no-new-privileges:true
-
-  gamefleet-tunnel:
-    image: nakama-gamefleet-ssh-tunnel:local
-    platform: linux/amd64
-    build:
-      context: ./deploy/tunnel
-      args:
-        ALPINE_IMAGE: ${ALPINE_IMAGE:?Set ALPINE_IMAGE to a pinned OCI digest in .env}
-    restart: unless-stopped
-    depends_on:
-      nakama:
-        condition: service_started
-    network_mode: service:nakama
-    environment:
-      GAMEFLEET_SSH_TARGET: ${GAMEFLEET_SSH_TARGET:?Set GAMEFLEET_SSH_TARGET in .env}
-      GAMEFLEET_SSH_PORT: ${GAMEFLEET_SSH_PORT:-22}
-    secrets:
-      - platform_ssh_key
-      - platform_known_hosts
-    read_only: true
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
-    tmpfs:
-      - /tmp:mode=1777,size=16m
-    healthcheck:
-      test: ["CMD", "nc", "-z", "-w", "1", "127.0.0.1", "17682"]
-      interval: 10s
-      timeout: 3s
-      retries: 6
-      start_period: 5s
 
   caddy:
     image: ${CADDY_IMAGE:?Set CADDY_IMAGE to a pinned OCI digest in .env}
@@ -158,12 +137,20 @@ secrets:
     file: ${NAKAMA_CONSOLE_SIGNING_KEY_SOURCE:-./private/nakama-console-signing-key}
   gamefleet_service_key:
     file: ${GAMEFLEET_SERVICE_KEY_SOURCE:-./private/gamefleet-service-key}
+  gamefleet_archive_ca:
+    file: ${GAMEFLEET_ARCHIVE_CA_SOURCE:-./private/gamefleet-archive-ca.disabled}
+  gamefleet_archive_cert:
+    file: ${GAMEFLEET_ARCHIVE_CERT_SOURCE:-./private/gamefleet-archive-cert.disabled}
+  gamefleet_archive_tls_key:
+    file: ${GAMEFLEET_ARCHIVE_TLS_KEY_SOURCE:-./private/gamefleet-archive-tls-key.disabled}
   gamefleet_archive_key:
     file: ${GAMEFLEET_ARCHIVE_KEY_SOURCE:-./private/gamefleet-archive-key.disabled}
-  platform_ssh_key:
-    file: ${PLATFORM_SSH_KEY_SOURCE:-./private/platform-ssh-key}
-  platform_known_hosts:
-    file: ${PLATFORM_KNOWN_HOSTS_SOURCE:-./private/platform-known-hosts}
+  gamefleet_ca:
+    file: ${GAMEFLEET_CA_SOURCE:-./private/gamefleet-ca.crt}
+  gamefleet_cert:
+    file: ${GAMEFLEET_CERT_SOURCE:-./private/gamefleet-client.crt}
+  gamefleet_tls_key:
+    file: ${GAMEFLEET_TLS_KEY_SOURCE:-./private/gamefleet-client.key}
   application_credentials:
     file: ${APPLICATION_SECRET_FILE:-./private/application-credentials.json}
 

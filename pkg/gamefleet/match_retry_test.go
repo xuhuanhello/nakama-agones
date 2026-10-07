@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
-	"net/http/httptest"
 	"reflect"
 	"sync"
 	"sync/atomic"
@@ -39,7 +38,7 @@ func TestMatchSearchesRetries409And429WithFrozenMembersAndOneCommit(t *testing.T
 	var persisted atomic.Int32
 	var mu sync.Mutex
 	var bodies [][]byte
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/business/v1/searches/match" || r.URL.RawQuery != "" {
 			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
 		}
@@ -142,7 +141,7 @@ func TestMatchSearchesRetries409And429WithFrozenMembersAndOneCommit(t *testing.T
 
 func TestMatchSearchesPersistentConflictStopsAtCallerDeadline(t *testing.T) {
 	var calls atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
 		_, _ = io.Copy(io.Discard, r.Body)
 		w.WriteHeader(http.StatusConflict)
@@ -184,7 +183,7 @@ func TestMatchSearchesDoesNotRetryNonTransientStatuses(t *testing.T) {
 	} {
 		t.Run(http.StatusText(tc.responseStatus), func(t *testing.T) {
 			var calls atomic.Int32
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			server := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				calls.Add(1)
 				_, _ = io.Copy(io.Discard, r.Body)
 				w.Header().Set("Content-Type", "application/json")

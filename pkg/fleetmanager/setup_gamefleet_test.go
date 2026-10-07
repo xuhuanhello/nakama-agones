@@ -2,8 +2,10 @@ package fleetmanager
 
 import (
 	"context"
+	"crypto/x509"
 	"database/sql"
 	"encoding/json"
+	"encoding/pem"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -52,7 +54,7 @@ func pilotEnv(t *testing.T, origin string) {
 
 func TestGameFleetModeBypassesLegacyAndRegistersOnlyPlayerHooks(t *testing.T) {
 	var calls atomic.Int64
-	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	s := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
 		if r.URL.Path != "/business/v1/caller" || r.Method != "GET" {
 			t.Errorf("unexpected preflight: %s", r.URL.Path)
@@ -62,11 +64,23 @@ func TestGameFleetModeBypassesLegacyAndRegistersOnlyPlayerHooks(t *testing.T) {
 	}))
 	defer s.Close()
 	pilotEnv(t, s.URL)
+	cert := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: s.TLS.Certificates[0].Certificate[0]})
+	key, err := x509.MarshalPKCS8PrivateKey(s.TLS.Certificates[0].PrivateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for suffix, data := range map[string][]byte{"CA_FILE": cert, "CERT_FILE": cert, "TLS_KEY_FILE": pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: key})} {
+		p := filepath.Join(t.TempDir(), suffix)
+		if err := os.WriteFile(p, data, 0600); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("GAMEFLEET_BUSINESS_"+suffix, p)
+	}
 	i := &pilotInitializer{}
 	logger := &pilotLogger{}
 	// All unimplemented Initializer methods panic via the nil embedded interface.
 	// A successful setup proves no FleetManager/HTTP/admin registration was used.
-	if err := RegisterFromEnv(context.Background(), logger, nil, nil, i); err != nil {
+	if err = RegisterFromEnv(context.Background(), logger, nil, nil, i); err != nil {
 		t.Fatal(err)
 	}
 	if calls.Load() != 1 || i.before == nil || i.matched == nil || i.shutdown == nil || len(i.rpcs) != 8 {
@@ -84,31 +98,44 @@ func TestGameFleetModeBypassesLegacyAndRegistersOnlyPlayerHooks(t *testing.T) {
 }
 
 func TestGameFleetPreflightFailureRegistersNothing(t *testing.T) {
-	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	s := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(403)
 		w.Write([]byte("must-not-leak-secret"))
 	}))
 	defer s.Close()
 	pilotEnv(t, s.URL)
+	cert := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: s.TLS.Certificates[0].Certificate[0]})
+	key, err := x509.MarshalPKCS8PrivateKey(s.TLS.Certificates[0].PrivateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for suffix, data := range map[string][]byte{"CA_FILE": cert, "CERT_FILE": cert, "TLS_KEY_FILE": pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: key})} {
+		p := filepath.Join(t.TempDir(), suffix)
+		if err := os.WriteFile(p, data, 0600); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("GAMEFLEET_BUSINESS_"+suffix, p)
+	}
 	i := &pilotInitializer{}
-	err := RegisterFromEnv(context.Background(), &pilotLogger{}, nil, nil, i)
+	err = RegisterFromEnv(context.Background(), &pilotLogger{}, nil, nil, i)
 	if err == nil || strings.Contains(err.Error(), "must-not-leak-secret") || i.before != nil || i.matched != nil || len(i.rpcs) != 0 || i.shutdown != nil {
 		t.Fatal("preflight did not fail closed", err)
 	}
 }
 
 func TestFleetBackendDefaultAndUnknownModes(t *testing.T) {
+	var err error
 	t.Setenv("AGONES_FLEET_DATABASE_URL", "")
 	t.Setenv("GAMEFLEET_BUSINESS_KEY_FILE", "/does-not-exist")
 	for _, mode := range []string{"", "agones"} {
 		t.Setenv("NAKAMA_FLEET_BACKEND", mode)
-		err := RegisterFromEnv(context.Background(), nil, nil, nil, nil)
+		err = RegisterFromEnv(context.Background(), nil, nil, nil, nil)
 		if err == nil || err.Error() != "AGONES_FLEET_DATABASE_URL is required" {
 			t.Fatalf("legacy mode %q changed: %v", mode, err)
 		}
 	}
 	t.Setenv("NAKAMA_FLEET_BACKEND", "unexpected-secret")
-	err := RegisterFromEnv(context.Background(), nil, nil, nil, nil)
+	err = RegisterFromEnv(context.Background(), nil, nil, nil, nil)
 	if err == nil || err.Error() != "unsupported NAKAMA_FLEET_BACKEND" {
 		t.Fatal("unknown mode did not fail closed", err)
 	}

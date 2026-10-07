@@ -1,12 +1,16 @@
 # GameFleet service runtime
 
+
 `gamefleet-service` is the only supported Nakama/GameFleet integration mode in this repository. It uses a private GameFleet service credential (`gfsvc_`). The [deployment guide](deployment.md) installs the complete single-host Nakama stack; this page maintains the adapter configuration contract and player RPC protocol. See [architecture](architecture.md) for ownership and network boundaries.
 
 The Compose stack copies [`deploy/gamefleet-service.env.example`](../deploy/gamefleet-service.env.example) into its private project directory. The adapter requires all seven `GAMEFLEET_SERVICE_*` values below and never infers identity or profile values from an image tag.
 
 | Setting | What to provide | Where to obtain it |
 | --- | --- | --- |
-| `GAMEFLEET_SERVICE_URL` | `http://127.0.0.1:17682` inside Nakama's network namespace | The deployment stack's SSH sidecar forwards to the GameFleet host's loopback Business listener. Do not publish the listener. |
+| `GAMEFLEET_SERVICE_URL` | Dedicated `https://business-host:17682` origin | Prefer verified private routing; mutual TLS is mandatory. |
+| `GAMEFLEET_SERVICE_CA_FILE` | Read-only CA PEM | Validates the server certificate and hostname. |
+| `GAMEFLEET_SERVICE_CERT_FILE` | Read-only client certificate PEM | Separate TLS machine identity. |
+| `GAMEFLEET_SERVICE_TLS_KEY_FILE` | Private client key PEM | Mode 0400 or 0600; never an environment value. |
 | `GAMEFLEET_SERVICE_KEY_FILE` | Path inside the Nakama container to the key file | Mount the owner-issued service key from the secret manager. It must be a regular, non-symlink file with mode `0400` or `0600`; the adapter reads it at startup. Do not put the key itself in an env file or image. |
 | `GAMEFLEET_SERVICE_ID` | Exact service ID | The owner-created GameFleet history/service identity that also has the intended search permissions. |
 | `GAMEFLEET_SERVICE_APPLICATION_ID` | Exact application ID | The service identity and player profile configured in GameFleet. |
@@ -16,7 +20,7 @@ The Compose stack copies [`deploy/gamefleet-service.env.example`](../deploy/game
 
 Obtain the service ID, key, application, issuer, region, and compatibility from the GameFleet owner and its access-control records. Configure them explicitly. The key must be a valid `gfsvc_` credential and is mounted read-only from a private file; it is not stored in `.env` or the image.
 
-The URL parser accepts only an explicit loopback IP origin with a port. A host's loopback address is not automatically a container's loopback; the Compose sidecar therefore shares Nakama's network namespace. The HTTP client disables proxy use and redirects.
+The URL parser accepts HTTPS origins only. Proxy use and redirects are disabled. Connect/TLS timeouts are three seconds and total requests are bounded to eight seconds. CA and client identity are explicit per endpoint. Certificate rotation requires atomic host-file replacement and recreation of Nakama so its read-only mounts and TLS clients load the new files.
 
 ## Owner grants and request routing
 
@@ -55,4 +59,4 @@ The archive supports only exact participant-bound terminal reservation and searc
 
 ## Installation
 
-Use the complete [blank-host deployment guide](deployment.md). It initializes the Compose directory, sets up the loopback-only SSH tunnel, validates the seven service values and private key permissions, checks the full application image and its required plugin modules, and gives the commands that actually start the stack. The `init`, `validate`, `plan`, and `status` helper commands do not perform deployment. An optional archive reader is configured by its separate `GAMEFLEET_ARCHIVE_*` values and independent service key.
+Use the complete [blank-host deployment guide](deployment.md). It initializes the Compose directory, configures the direct mTLS business endpoint, validates the seven service values and private key permissions, checks the full application image and its required plugin modules, and gives the commands that actually start the stack. The `init`, `validate`, `plan`, and `status` helper commands do not perform deployment. An optional archive reader is configured by its separate `GAMEFLEET_ARCHIVE_*` values and independent service key.

@@ -7,7 +7,7 @@ from pathlib import Path
 def main():
  p=argparse.ArgumentParser(description=__doc__)
  p.add_argument('--entrypoint',type=Path,default=Path(__file__).resolve().parents[1]/'deploy/nakama-entrypoint.sh')
- p.add_argument('--fixed-source',type=Path,required=True,help='Fixed source checkout containing deploy/account/smoke.py')
+ p.add_argument('--fixed-source',type=Path,required=True,help='Fixed source checkout containing Backend/deploy/account/smoke.py')
  p.add_argument('--image',default='fixed-nakama:bootstrap-check')
  p.add_argument('--postgres-image',default='postgres:16-alpine')
  p.add_argument('--client-image',default='python:3.12-slim')
@@ -36,22 +36,31 @@ def main():
    else:raise RuntimeError('database readiness failed')
    scope={'key':'gfsvc_'+secrets.token_urlsafe(32),'service_id':prefix+'-service','application_id':prefix+'-app','identity_issuer':'fixture-issuer','region':'fixture-region','compatibility':'fixture-compatibility'}
    write('service-scope.json',json.dumps(scope));write('service-key',scope['key'])
-   source=ast.parse((a.fixed_source/'deploy/account/smoke.py').read_text())
+   source=ast.parse((a.fixed_source/'Backend/deploy/account/smoke.py').read_text())
    mocks=[n.value for n in ast.walk(source) if isinstance(n,ast.Constant) and isinstance(n.value,str) and "HTTPServer(('127.0.0.1', 17682), Handler).serve_forever()" in n.value]
    if len(mocks)!=1:raise RuntimeError('account service fixture source ambiguous')
-   write('mock.py',mocks[0])
-   env={'NAKAMA_FLEET_BACKEND':'gamefleet-service','GAMEFLEET_SERVICE_URL':'http://127.0.0.1:17682','GAMEFLEET_SERVICE_KEY_FILE':'/fixture/service-key','GAMEFLEET_SERVICE_ID':scope['service_id'],'GAMEFLEET_SERVICE_APPLICATION_ID':scope['application_id'],'GAMEFLEET_SERVICE_IDENTITY_ISSUER':scope['identity_issuer'],'GAMEFLEET_SERVICE_REGION':scope['region'],'GAMEFLEET_SERVICE_COMPATIBILITY':scope['compatibility'],'SES_REGION':'ap-hongkong','SES_FROM_EMAIL':'noreply@example.test','SES_FROM_NAME':'Fixture','SES_REGISTER_TEMPLATE_ID':'1','SES_RESET_TEMPLATE_ID':'2','SES_REGISTER_SUBJECT':'Fixture register','SES_RESET_SUBJECT':'Fixture reset','DM_ACCOUNT_SES_CREDENTIALS_FILE':'/fixture/account-credentials.json'}
+   def openssl(*args):
+    subprocess.run(['openssl',*args],cwd=folder,check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+   openssl('req','-x509','-newkey','rsa:2048','-nodes','-keyout','ca.key','-out','ca.crt','-days','2','-subj','/CN=isolated-business-ca')
+   for role,extensions in [('server','subjectAltName=DNS:business\nextendedKeyUsage=serverAuth\n'),('client','extendedKeyUsage=clientAuth\n')]:
+    write(role+'.ext',extensions)
+    openssl('req','-newkey','rsa:2048','-nodes','-keyout',role+'.key','-out',role+'.csr','-subj','/CN='+role)
+    openssl('x509','-req','-in',role+'.csr','-CA','ca.crt','-CAkey','ca.key','-CAcreateserial','-out',role+'.crt','-days','1','-extfile',role+'.ext')
+   for f in folder.iterdir():f.chmod(0o600)
+   fixture=mocks[0].replace("HTTPServer(('127.0.0.1', 17682), Handler).serve_forever()", "import ssl\nserver=HTTPServer(('0.0.0.0',17682),Handler)\nctx=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)\nctx.load_cert_chain('/fixture/server.crt','/fixture/server.key')\nctx.load_verify_locations('/fixture/ca.crt')\nctx.verify_mode=ssl.CERT_REQUIRED\nserver.socket=ctx.wrap_socket(server.socket,server_side=True)\nserver.serve_forever()")
+   write('mock.py',fixture)
+   env={'NAKAMA_FLEET_BACKEND':'gamefleet-service','GAMEFLEET_SERVICE_URL':'https://business:17682','GAMEFLEET_SERVICE_CA_FILE':'/fixture/ca.crt','GAMEFLEET_SERVICE_CERT_FILE':'/fixture/client.crt','GAMEFLEET_SERVICE_TLS_KEY_FILE':'/fixture/client.key','GAMEFLEET_SERVICE_KEY_FILE':'/fixture/service-key','GAMEFLEET_SERVICE_ID':scope['service_id'],'GAMEFLEET_SERVICE_APPLICATION_ID':scope['application_id'],'GAMEFLEET_SERVICE_IDENTITY_ISSUER':scope['identity_issuer'],'GAMEFLEET_SERVICE_REGION':scope['region'],'GAMEFLEET_SERVICE_COMPATIBILITY':scope['compatibility'],'SES_REGION':'ap-hongkong','SES_FROM_EMAIL':'noreply@example.test','SES_FROM_NAME':'Fixture','SES_REGISTER_TEMPLATE_ID':'1','SES_RESET_TEMPLATE_ID':'2','SES_REGISTER_SUBJECT':'Fixture register','SES_RESET_SUBJECT':'Fixture reset','DM_ACCOUNT_SES_CREDENTIALS_FILE':'/fixture/account-credentials.json'}
    environment=write('nakama.env',''.join(k+'='+v+'\n' for k,v in env.items()))
-   # Keep a stable namespace owner so restarting Nakama does not invalidate mock sockets.
+   # Independent HTTPS business service; Nakama owns its network namespace.
    client=prefix+'-namespace';names.append(client)
-   docker('run','-d','--pull=never','--name',client,'--network',prefix,'-v',str(folder)+':/fixture:ro',a.client_image,'python','/fixture/mock.py')
+   docker('run','-d','--pull=never','--name',client,'--network',prefix,'--network-alias','business','-v',str(folder)+':/fixture:ro',a.client_image,'python','/fixture/mock.py')
    server=prefix+'-nakama';names.append(server)
-   args=['run','-d','--pull=never','--platform','linux/amd64','--name',server,'--network','container:'+client,'--env-file',str(environment),'-v',str(folder)+':/fixture:ro','-v',str(a.entrypoint.resolve())+':/production-entrypoint.sh:ro','--tmpfs','/run/nakama-config:rw,noexec,nosuid,mode=0700']
+   args=['run','-d','--pull=never','--platform','linux/amd64','--name',server,'--network',prefix,'--network-alias','nakama','--env-file',str(environment),'-v',str(folder)+':/fixture:ro','-v',str(a.entrypoint.resolve())+':/production-entrypoint.sh:ro','--tmpfs','/run/nakama-config:rw,noexec,nosuid,mode=0700']
    for name in secret_names:args+=['-v',str(folder/name)+':/run/secrets/'+name+':ro']
    args+=['--entrypoint','/bin/sh',a.image,'/production-entrypoint.sh']
    docker(*args)
    probe='''import sys,json,urllib.request,urllib.error
-v=json.load(sys.stdin);r=urllib.request.Request('http://127.0.0.1:7350'+v['path'],headers=v['headers'],data=json.dumps(v['payload']).encode() if v['payload'] is not None else None)
+v=json.load(sys.stdin);r=urllib.request.Request('http://nakama:7350'+v['path'],headers=v['headers'],data=json.dumps(v['payload']).encode() if v['payload'] is not None else None)
 try:
  with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(r,timeout=3) as s: print(json.dumps([s.status,json.loads(s.read(65536))]))
 except urllib.error.HTTPError as e: print(json.dumps([e.code,json.loads(e.read(65536))]))
@@ -92,7 +101,7 @@ except OSError: print(json.dumps([0,{}]))
    if count<2:raise RuntimeError('service plugin was not loaded on both starts')
    rows=docker('exec',db,'psql','-U','nakama','-d','nakama','-tAc',"SELECT count(*) FROM users WHERE email='unverified@example.test';").decode().strip()
    if rows!='0':raise RuntimeError('unverified account persisted')
-   print(json.dumps({'passed':True,'actual_production_entrypoint':True,'migration_on_both_starts':True,'both_plugins_loaded_on_both_starts':True,'existing_session_and_user_preserved':True,'generated_config_and_secrets_unchanged':True,'unverified_signup_blocked':True,'external_ports':False,'external_network':False,'mail_sent':False,'ssh_tested':False}))
+   print(json.dumps({'passed':True,'actual_production_entrypoint':True,'migration_on_both_starts':True,'both_plugins_loaded_on_both_starts':True,'existing_session_and_user_preserved':True,'generated_config_and_secrets_unchanged':True,'unverified_signup_blocked':True,'external_ports':False,'external_network':False,'mail_sent':False,'direct_mtls_business':True,'shared_namespace':False,'ssh_dependency':False}))
   finally:
    for name in reversed(names):docker('rm','-f','-v',name,check=False)
    if network:docker('network','rm',prefix,check=False)

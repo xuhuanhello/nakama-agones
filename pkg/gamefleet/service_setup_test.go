@@ -28,6 +28,9 @@ func clearServiceEnvironment(t *testing.T) {
 }
 
 func setServiceEnvironment(t *testing.T, cfg ServiceSearchConfig, keyFile string) {
+	t.Setenv("GAMEFLEET_SERVICE_CA_FILE", cfg.TLS.CAFile)
+	t.Setenv("GAMEFLEET_SERVICE_CERT_FILE", cfg.TLS.CertFile)
+	t.Setenv("GAMEFLEET_SERVICE_TLS_KEY_FILE", cfg.TLS.KeyFile)
 	t.Helper()
 	for name, value := range map[string]string{
 		"GAMEFLEET_SERVICE_URL": cfg.URL, "GAMEFLEET_SERVICE_KEY_FILE": keyFile,
@@ -162,7 +165,7 @@ func newServiceSetupServer(t *testing.T, search ServiceSearchConfig, archive *Te
 			f.closedConns.Add(1)
 		}
 	}
-	f.server.Start()
+	startBusinessTestServer(f.server)
 	f.search.URL = f.server.URL
 	if f.archive != nil {
 		copyOfArchive := *f.archive
@@ -466,8 +469,8 @@ func TestRegisterServiceFromEnvRegistersBoundHooksAndClosesAllClients(t *testing
 		t.Fatal("service-backed MatchmakerAdd admission failed", err)
 	}
 	entries := []runtime.MatchmakerEntry{
-		bridgeMatchEntry("player-one", "ticket-one", Config{Region: cfg.Region, Compatibility: cfg.Compatibility}),
-		bridgeMatchEntry("player-two", "ticket-two", Config{Region: cfg.Region, Compatibility: cfg.Compatibility}),
+		bridgeMatchEntry("player-one", "ticket-one", Config{TLS: fixtureTLS, Region: cfg.Region, Compatibility: cfg.Compatibility}),
+		bridgeMatchEntry("player-two", "ticket-two", Config{TLS: fixtureTLS, Region: cfg.Region, Compatibility: cfg.Compatibility}),
 	}
 	if _, err := initializer.matched(ctx, nil, nil, nil, entries); err != nil {
 		t.Fatal("mapped service match callback failed", err)

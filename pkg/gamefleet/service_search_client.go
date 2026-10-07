@@ -7,13 +7,9 @@ import (
 	"errors"
 	"io"
 	"mime"
-	"net"
 	"net/http"
-	"net/netip"
-	"net/url"
 	"regexp"
 	"sort"
-	"strconv"
 	"time"
 )
 
@@ -29,6 +25,7 @@ var serviceSearchIdentityIssuer = regexp.MustCompile(`^[A-Za-z0-9_-]{8,128}$`)
 // ServiceSearchConfig identifies an exact machine service and its player
 // profile. It intentionally has no caller key or deployment placement fields.
 type ServiceSearchConfig struct {
+	TLS            TLSFiles
 	URL            string
 	Key            string
 	ServiceID      string
@@ -56,35 +53,21 @@ type ServiceSearchClient struct {
 	http   *http.Client
 }
 
-// NewServiceSearchClient accepts only a canonical loopback HTTP origin and an
-// exact gfsvc key. Remote callers must use a separately managed tunnel.
+// NewServiceSearchClient requires authenticated HTTPS and an exact gfsvc identity.
 func NewServiceSearchClient(cfg ServiceSearchConfig) (*ServiceSearchClient, error) {
-	u, err := url.Parse(cfg.URL)
-	if err != nil || u == nil || u.Scheme != "http" || u.User != nil || u.RawQuery != "" || u.ForceQuery ||
-		u.Fragment != "" || u.RawFragment != "" || u.RawPath != "" || (u.Path != "" && u.Path != "/") || u.Opaque != "" {
-		return nil, errors.New("service search URL must be an explicit loopback HTTP origin")
-	}
-	ip, err := netip.ParseAddr(u.Hostname())
-	port, portErr := strconv.Atoi(u.Port())
-	if err != nil || !ip.IsLoopback() || ip.Zone() != "" || portErr != nil || port < 1 || port > 65535 ||
-		u.Host != net.JoinHostPort(ip.String(), strconv.Itoa(port)) {
-		return nil, errors.New("service search URL requires a canonical loopback IP and port")
+	base, transport, err := businessTransport(cfg.URL, cfg.TLS)
+	if err != nil {
+		return nil, err
 	}
 	if !validHistoryServiceKey(cfg.Key) || !opaqueID.MatchString(cfg.ServiceID) ||
 		!opaqueID.MatchString(cfg.ApplicationID) || !serviceSearchIdentityIssuer.MatchString(cfg.IdentityIssuer) ||
 		!exactText(cfg.Region, 128) || !exactText(cfg.Compatibility, 128) {
 		return nil, errors.New("invalid service search scope or gfsvc credential")
 	}
-	transport := &http.Transport{
-		Proxy:           nil,
-		DialContext:     (&net.Dialer{Timeout: 3 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
-		MaxConnsPerHost: 16, MaxIdleConns: 16, MaxIdleConnsPerHost: 16,
-		IdleConnTimeout: 30 * time.Second, ResponseHeaderTimeout: 5 * time.Second,
-		MaxResponseHeaderBytes: 16 << 10, DisableCompression: true,
-	}
+
 	return &ServiceSearchClient{
 		config: cfg,
-		base:   "http://" + u.Host,
+		base:   base,
 		http: &http.Client{
 			Transport: transport,
 			Timeout:   8 * time.Second,

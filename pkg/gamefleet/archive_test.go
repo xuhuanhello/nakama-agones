@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/http/httptest"
 	"reflect"
 	"strings"
 	"sync/atomic"
@@ -24,7 +23,7 @@ func terminalArchiveKey() string {
 }
 
 func terminalArchiveConfig(origin string) TerminalArchiveConfig {
-	return TerminalArchiveConfig{
+	return TerminalArchiveConfig{TLS: fixtureTLS,
 		URL: origin, Key: terminalArchiveKey(), ServiceID: terminalArchiveTestServiceID,
 		ApplicationID: "history-app", IdentityIssuer: "issuer-history-01",
 		Region: "eu-west", Compatibility: "dm-compat-v3",
@@ -87,20 +86,20 @@ func rawArchiveResponse(w http.ResponseWriter, body []byte) {
 }
 
 func TestTerminalArchiveConfigRequiresLoopbackOriginAndHistoryKeyClass(t *testing.T) {
-	validOrigin := "http://127.0.0.1:17682"
+	validOrigin := "https://127.0.0.1:17682"
 	if c, err := NewTerminalArchiveClient(terminalArchiveConfig(validOrigin)); err != nil {
 		t.Fatal("valid terminal archive config rejected:", err)
 	} else {
 		c.Close()
 	}
-	if c, err := NewTerminalArchiveClient(terminalArchiveConfig("http://[::1]:17682/")); err != nil {
+	if c, err := NewTerminalArchiveClient(terminalArchiveConfig("https://[::1]:17682/")); err != nil {
 		t.Fatal("canonical IPv6 loopback origin rejected:", err)
 	} else {
 		c.Close()
 	}
 
 	for _, origin := range []string{
-		"", "https://127.0.0.1:17682", "http://localhost:17682", "http://192.0.2.1:17682",
+		"", "http://127.0.0.1:17682", "http://localhost:17682", "http://192.0.2.1:17682",
 		"http://127.0.0.1", "http://127.0.0.1:0", "http://127.0.0.1:99999", "http://127.0.0.1:017682",
 		"http://user:pass@127.0.0.1:17682", "http://127.0.0.1:17682/business", "http://127.0.0.1:17682?x=1",
 		"http://127.0.0.1:17682?", "http://127.0.0.1:17682/#fragment", "http://[::1%25lo0]:17682",
@@ -142,7 +141,7 @@ func TestTerminalArchiveConfigRequiresLoopbackOriginAndHistoryKeyClass(t *testin
 func TestTerminalArchiveScopeAndStatusUseOnlyApprovedRoutes(t *testing.T) {
 	const user = "steam:verified-historical-user"
 	var paths []string
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		paths = append(paths, r.URL.Path)
 		if r.URL.RawQuery != "" || r.Header.Get("Authorization") != "Bearer "+terminalArchiveKey() ||
 			r.Header.Get("Cookie") != "" || r.Header.Get("Origin") != "" || r.Header.Get("Accept") != "application/json" ||
@@ -232,7 +231,7 @@ func TestTerminalArchiveCheckScopeRequiresExactServiceApplicationIssuerAndRead(t
 		{name: "participants are not returned", data: map[string]any{"serviceId": terminalArchiveTestServiceID, "applicationId": "history-app", "identityIssuer": "issuer-history-01", "operations": []string{"read"}, "allowedParticipants": []string{"player-one"}}, want: 502},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { respond(w, tc.data) }))
+			server := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { respond(w, tc.data) }))
 			defer server.Close()
 			c := mustTerminalArchiveClient(t, terminalArchiveConfig(server.URL))
 			err := c.CheckScope(context.Background())
@@ -278,7 +277,7 @@ func TestTerminalArchiveReservationStatusRequiresExactTerminalFacts(t *testing.T
 		t.Run(tc.name, func(t *testing.T) {
 			r := archiveTestReservation("completed")
 			tc.change(&r)
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			server := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				respond(w, ReservationStatus{Reservation: r})
 			}))
 			defer server.Close()
@@ -354,7 +353,7 @@ func TestTerminalArchiveSearchStatusRequiresExactTerminalFacts(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			s := archiveTestSearch("bound")
 			tc.change(&s)
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			server := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				respond(w, SearchStatus{Search: s})
 			}))
 			defer server.Close()
@@ -396,7 +395,7 @@ func TestTerminalArchiveRejectsMalformedEnvelopesUnknownFieldsAndDuplicateProper
 		{name: "search fixture control", data: rawArchiveEnvelope(string(validSearch)), path: "search-valid-control"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { rawArchiveResponse(w, tc.data) }))
+			server := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { rawArchiveResponse(w, tc.data) }))
 			defer server.Close()
 			c := mustTerminalArchiveClient(t, terminalArchiveConfig(server.URL))
 			var callErr error
@@ -423,7 +422,7 @@ func TestTerminalArchiveRejectsMalformedEnvelopesUnknownFieldsAndDuplicateProper
 
 func TestTerminalArchiveRejectsInvalidIDsAndUsersBeforeNetwork(t *testing.T) {
 	var calls atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	server := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		calls.Add(1)
 		respond(w, ReservationStatus{Reservation: archiveTestReservation("completed")})
 	}))
@@ -450,7 +449,7 @@ func TestTerminalArchiveRejectsInvalidIDsAndUsersBeforeNetwork(t *testing.T) {
 
 func TestTerminalArchiveTransportIgnoresProxyAndDoesNotFollowRedirectsOrLeakOversizedBodies(t *testing.T) {
 	var proxyCalls atomic.Int32
-	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	proxy := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		proxyCalls.Add(1)
 		w.WriteHeader(http.StatusBadGateway)
 	}))
@@ -462,7 +461,7 @@ func TestTerminalArchiveTransportIgnoresProxyAndDoesNotFollowRedirectsOrLeakOver
 	t.Setenv("NO_PROXY", "")
 	t.Setenv("no_proxy", "")
 
-	valid := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	valid := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		respond(w, ReservationStatus{Reservation: archiveTestReservation("completed")})
 	}))
 	defer valid.Close()
@@ -475,12 +474,12 @@ func TestTerminalArchiveTransportIgnoresProxyAndDoesNotFollowRedirectsOrLeakOver
 	}
 
 	var redirectedCalls atomic.Int32
-	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	target := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		redirectedCalls.Add(1)
 		respond(w, ReservationStatus{Reservation: archiveTestReservation("completed")})
 	}))
 	defer target.Close()
-	redirect := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	redirect := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, target.URL, http.StatusTemporaryRedirect)
 	}))
 	defer redirect.Close()
@@ -492,7 +491,7 @@ func TestTerminalArchiveTransportIgnoresProxyAndDoesNotFollowRedirectsOrLeakOver
 	}
 
 	const privateBody = "oversized-private-upstream-response"
-	oversized := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	oversized := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, `{"data":{"reservation":{}} ,"requestId":"`+strings.Repeat("x", archiveResponseLimit)+privateBody+`"}`)
 	}))
@@ -504,7 +503,7 @@ func TestTerminalArchiveTransportIgnoresProxyAndDoesNotFollowRedirectsOrLeakOver
 		t.Fatalf("oversize error leaked response or credential: %v", err)
 	}
 
-	failure := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	failure := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
 		w.WriteHeader(http.StatusInternalServerError)
 		_, _ = io.WriteString(w, privateBody)
@@ -519,7 +518,7 @@ func TestTerminalArchiveTransportIgnoresProxyAndDoesNotFollowRedirectsOrLeakOver
 }
 
 func TestTerminalArchiveContextCancellationReturnsSanitizedError(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	server := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = io.WriteString(w, "private transport response")
 	}))
@@ -548,7 +547,7 @@ func TestTerminalArchiveNoCurrentOrMutationMethods(t *testing.T) {
 }
 
 func TestTerminalArchiveInvalidEnvelopeErrorsStayStatusOnly(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	server := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		rawArchiveResponse(w, rawArchiveEnvelope(`{"reservation":{"state":"technical_aborted","failureCode":"private-secret"}}`))
 	}))
 	defer server.Close()
@@ -563,7 +562,7 @@ func TestTerminalArchiveInvalidEnvelopeErrorsStayStatusOnly(t *testing.T) {
 func TestTerminalArchiveOversizedInputIsBounded(t *testing.T) {
 	// Keep one explicit size boundary test alongside response-limit coverage.
 	user := strings.Repeat("u", 257)
-	c, err := NewTerminalArchiveClient(terminalArchiveConfig("http://127.0.0.1:17682"))
+	c, err := NewTerminalArchiveClient(terminalArchiveConfig("https://127.0.0.1:17682"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -574,7 +573,7 @@ func TestTerminalArchiveOversizedInputIsBounded(t *testing.T) {
 
 func TestTerminalArchiveMalformedResponseDoesNotExposeWireBody(t *testing.T) {
 	const wireSecret = "this-body-must-not-escape"
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	server := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		rawArchiveResponse(w, rawArchiveEnvelope(fmt.Sprintf(`{"reservation":{"debug":"%s"}}`, wireSecret)))
 	}))
 	defer server.Close()

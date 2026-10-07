@@ -28,14 +28,16 @@ class NakamaStackTests(unittest.TestCase):
         self.env = self.root / ".env"
         self.service_env = self.root / "private" / "gamefleet-service.env"
         self.service_key = self.root / "private" / "gamefleet-service-key"
-        self.ssh_key = self.root / "private" / "platform-ssh-key"
-        self.known_hosts = self.root / "private" / "platform-known-hosts"
-        for path in (self.service_key, self.ssh_key, self.known_hosts):
+        self.tls_key = self.root / "private" / "gamefleet-client.key"
+        self.tls_cert = self.root / "private" / "gamefleet-client.crt"
+        for path in (self.service_key, self.tls_key, self.tls_cert):
             path.chmod(0o600)
+        ca=self.root / "private" / "gamefleet-ca.crt"
+        ca.chmod(0o600);ca.write_text("synthetic CA");ca.chmod(0o400)
         self.service_key.write_text("gfsvc-test-key\n", encoding="utf-8")
-        self.ssh_key.write_text("synthetic ssh key material\n", encoding="utf-8")
-        self.known_hosts.write_text("gamefleet-admin.example.com ssh-ed25519 synthetic-public-key\n", encoding="utf-8")
-        for path in (self.service_key, self.ssh_key, self.known_hosts):
+        self.tls_key.write_text("synthetic ssh key material\n", encoding="utf-8")
+        self.tls_cert.write_text("gamefleet-admin.example.com ssh-ed25519 synthetic-public-key\n", encoding="utf-8")
+        for path in (self.service_key, self.tls_key, self.tls_cert):
             path.chmod(0o400)
         self._update_env({
             "NAKAMA_DOMAIN": "pool.example.net",
@@ -48,7 +50,7 @@ class NakamaStackTests(unittest.TestCase):
         })
         self._update_service_env({
             "NAKAMA_FLEET_BACKEND": "gamefleet-service",
-            "GAMEFLEET_SERVICE_URL": "http://127.0.0.1:17682",
+            "GAMEFLEET_SERVICE_URL": "https://business.example.net:17682",
             "GAMEFLEET_SERVICE_KEY_FILE": "/run/secrets/gamefleet-service-key",
             "GAMEFLEET_SERVICE_ID": "service-prod-1",
             "GAMEFLEET_SERVICE_APPLICATION_ID": "pool-app",
@@ -86,7 +88,7 @@ class NakamaStackTests(unittest.TestCase):
 
         def synthetic_root_owned(path, *args, **kwargs):
             info = original(path, *args, **kwargs)
-            root_paths = (self.ssh_key.resolve(), self.known_hosts.resolve())
+            root_paths = (self.tls_key.resolve(), self.tls_cert.resolve())
             if path.resolve() in root_paths:
                 fields = {name: getattr(info, name) for name in dir(info) if name.startswith("st_")}
                 fields["st_uid"] = owner_uid
@@ -119,7 +121,7 @@ class NakamaStackTests(unittest.TestCase):
         original = Path.read_text
 
         def guarded(path, *args, **kwargs):
-            if path == self.service_key or path == self.ssh_key:
+            if path == self.service_key or path == self.tls_key:
                 raise AssertionError("private key content must not be read")
             return original(path, *args, **kwargs)
 
@@ -136,13 +138,13 @@ class NakamaStackTests(unittest.TestCase):
             self.validate(check_image=False)
 
     def test_loopback_network_ssh_and_digest_inputs_are_strict(self):
-        for bad_url in ("http://gamefleet.example.net:17682", "https://127.0.0.1:17682",
+        for bad_url in ("http://gamefleet.example.net:17682", "http://127.0.0.1:17682",
                         "http://127.0.0.1:17683", "http://127.0.0.1:17682/path"):
             with self.subTest(url=bad_url):
                 self._update_service_env({"GAMEFLEET_SERVICE_URL": bad_url})
-                with self.assertRaisesRegex(stack.ConfigError, "loopback tunnel"):
+                with self.assertRaisesRegex(stack.ConfigError, "HTTPS business origin"):
                     self.validate(check_image=False)
-        self._update_service_env({"GAMEFLEET_SERVICE_URL": "http://127.0.0.1:17682"})
+        self._update_service_env({"GAMEFLEET_SERVICE_URL": "https://business.example.net:17682"})
 
         self._update_env({"POSTGRES_IMAGE": "postgres:latest"})
         with self.assertRaisesRegex(stack.ConfigError, "immutable OCI sha256 digest"):
@@ -152,9 +154,10 @@ class NakamaStackTests(unittest.TestCase):
         with self.assertRaisesRegex(stack.ConfigError, "must not overlap"):
             self.validate(check_image=False)
 
-    def test_tunnel_host_keys_must_be_root_owned(self):
-        with self.assertRaisesRegex(stack.ConfigError, "owned by UID 0"):
-            self.validate(check_image=False, synthetic_tunnel_uid=501)
+    def test_tls_files_must_be_private(self):
+        self.tls_key.chmod(0o644)
+        with self.assertRaisesRegex(stack.ConfigError, "0400 or 0600"):
+            self.validate(check_image=False)
 
     def test_init_rejects_non_root_without_creating_private_files(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -219,18 +222,14 @@ class NakamaStackTests(unittest.TestCase):
     def test_compose_keeps_private_routes_unpublished_and_replaces_client_ip(self):
         compose = (self.root / "compose.yaml").read_text(encoding="utf-8")
         caddyfile = (self.root / "deploy" / "Caddyfile").read_text(encoding="utf-8")
-        tunnel = (self.root / "deploy" / "tunnel" / "entrypoint.sh").read_text(encoding="utf-8")
         nakama_entrypoint = (self.root / "deploy" / "nakama-entrypoint.sh").read_text(encoding="utf-8")
-        self.assertIn("network_mode: service:nakama", compose)
+        self.assertNotIn("network_mode: service:nakama", compose)
         self.assertIn('"127.0.0.1:17351:7351/tcp"', compose)
         self.assertNotIn('"17682:', compose)
         self.assertNotIn('"7350:', compose)
-        self.assertIn("ssh -F /dev/null -N -T", tunnel)
-        self.assertNotIn("ClearAllForwardings", tunnel)
-        self.assertIn("StrictHostKeyChecking=yes", tunnel)
-        self.assertIn("-L 127.0.0.1:17682:127.0.0.1:17682", tunnel)
-        self.assertIn(f'$2 == "0100007F:{17682:04X}" && $4 == "0A"', nakama_entrypoint)
-        self.assertIn("cap_drop:\n      - ALL", compose)
+        self.assertNotIn("gamefleet-tunnel", compose)
+        self.assertNotIn("wait_for_local_tunnel", nakama_entrypoint)
+        self.assertIn("gamefleet-client.key", compose)
         self.assertNotIn("cap_add:", compose)
         self.assertIn("header_up -X-DM-Client-IP", caddyfile)
         self.assertIn("header_up X-DM-Client-IP {remote_host}", caddyfile)

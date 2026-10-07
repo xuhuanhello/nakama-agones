@@ -39,7 +39,7 @@ func ArchiveConfigFromEnv() (*TerminalArchiveConfig, error) {
 	if err != nil || len(raw) > 4097 {
 		return nil, errors.New("invalid GameFleet archive key file")
 	}
-	return &TerminalArchiveConfig{URL: values[0], Key: strings.TrimSuffix(strings.TrimSuffix(string(raw), "\n"), "\r"),
+	return &TerminalArchiveConfig{TLS: tlsFilesFromEnv("GAMEFLEET_ARCHIVE"), URL: values[0], Key: strings.TrimSuffix(strings.TrimSuffix(string(raw), "\n"), "\r"),
 		ApplicationID: values[2], IdentityIssuer: values[3], Region: values[4], Compatibility: values[5], ServiceID: values[6]}, nil
 }
 

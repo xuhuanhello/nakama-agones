@@ -14,7 +14,7 @@ import (
 // ConfigFromEnv reads a mounted private file; credentials are never bundled in
 // the image or exposed by player RPCs. Configuration errors contain no values.
 func ConfigFromEnv() (Config, error) {
-	cfg := Config{URL: os.Getenv("GAMEFLEET_BUSINESS_URL"), ApplicationID: os.Getenv("GAMEFLEET_APPLICATION_ID"), PlacementID: os.Getenv("GAMEFLEET_PLACEMENT_ID"), RevisionID: os.Getenv("GAMEFLEET_REVISION_ID"), Region: os.Getenv("GAMEFLEET_REGION"), Compatibility: os.Getenv("GAMEFLEET_COMPATIBILITY")}
+	cfg := Config{TLS: tlsFilesFromEnv("GAMEFLEET_BUSINESS"), URL: os.Getenv("GAMEFLEET_BUSINESS_URL"), ApplicationID: os.Getenv("GAMEFLEET_APPLICATION_ID"), PlacementID: os.Getenv("GAMEFLEET_PLACEMENT_ID"), RevisionID: os.Getenv("GAMEFLEET_REVISION_ID"), Region: os.Getenv("GAMEFLEET_REGION"), Compatibility: os.Getenv("GAMEFLEET_COMPATIBILITY")}
 	path := os.Getenv("GAMEFLEET_BUSINESS_KEY_FILE")
 	info, err := os.Lstat(path)
 	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 || info.Size() > 4097 {

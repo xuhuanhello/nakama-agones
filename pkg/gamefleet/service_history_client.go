@@ -12,6 +12,7 @@ import (
 // player profile. Placement and revision are intentionally absent because a
 // history route follows the original caller and placement of each record.
 type ServiceHistoryConfig struct {
+	TLS            TLSFiles
 	URL            string
 	Key            string
 	ServiceID      string
@@ -40,7 +41,7 @@ type ServiceHistoryClient struct {
 // and validates the complete service identity and profile at construction.
 func NewServiceHistoryClient(cfg ServiceHistoryConfig) (*ServiceHistoryClient, error) {
 	transport, err := NewServiceSearchClient(ServiceSearchConfig{
-		URL: cfg.URL, Key: cfg.Key, ServiceID: cfg.ServiceID, ApplicationID: cfg.ApplicationID,
+		TLS: cfg.TLS, URL: cfg.URL, Key: cfg.Key, ServiceID: cfg.ServiceID, ApplicationID: cfg.ApplicationID,
 		IdentityIssuer: cfg.IdentityIssuer, Region: cfg.Region, Compatibility: cfg.Compatibility,
 	})
 	if err != nil {

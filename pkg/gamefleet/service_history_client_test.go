@@ -7,7 +7,6 @@ import (
 	"errors"
 	"io"
 	"net/http"
-	"net/http/httptest"
 	"reflect"
 	"strings"
 	"sync/atomic"
@@ -29,7 +28,7 @@ func historyClientTestKey() string {
 }
 
 func historyClientTestConfig(origin string) ServiceHistoryConfig {
-	return ServiceHistoryConfig{
+	return ServiceHistoryConfig{TLS: fixtureTLS,
 		URL: origin, Key: historyClientTestKey(), ServiceID: historyClientTestService,
 		ApplicationID: historyClientTestApp, IdentityIssuer: historyClientTestIssuer,
 		Region: "us-west", Compatibility: "dm-v1",
@@ -132,7 +131,7 @@ func serviceHistoryCheckBody(t *testing.T, raw []byte, want any) {
 }
 
 func TestServiceHistoryConfigAndScopeRequireExactGfsvcIdentityAndAllOperations(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet || r.URL.Path != "/business/v1/history/service" || r.URL.RawQuery != "" ||
 			r.Header.Get("Authorization") != "Bearer "+historyClientTestKey() || r.Header.Get("Accept") != "application/json" ||
 			r.Header.Get("Cookie") != "" || r.Header.Get("Origin") != "" || r.Header.Get("Content-Type") != "" {
@@ -179,7 +178,7 @@ func TestServiceHistoryConfigAndScopeRequireExactGfsvcIdentityAndAllOperations(t
 		{name: "unknown-operation", service: historyClientTestService, app: historyClientTestApp, issuer: historyClientTestIssuer, operations: []string{"read", "cancel", "assignment", "resume", "reserve"}, status: 502},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			badServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			badServer := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				serviceHistoryRespond(w, http.StatusOK, map[string]any{
 					"serviceId": tc.service, "applicationId": tc.app, "identityIssuer": tc.issuer, "operations": tc.operations,
 				})
@@ -193,7 +192,7 @@ func TestServiceHistoryConfigAndScopeRequireExactGfsvcIdentityAndAllOperations(t
 
 func TestServiceHistoryClientUsesOnlyScopedHistoryRoutesAndCorrectVersions(t *testing.T) {
 	var calls atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
 		if r.URL.RawQuery != "" || r.Header.Get("Authorization") != "Bearer "+historyClientTestKey() ||
 			r.Header.Get("Accept") != "application/json" || r.Header.Get("Cookie") != "" || r.Header.Get("Origin") != "" {
@@ -305,7 +304,7 @@ func TestServiceHistoryCurrentRequiresExplicitNullAndReturnsZeroOnMalformedCurre
 		{name: "terminal-current", data: map[string]any{"current": Current{Reservation: serviceHistoryReservation("completed"), ConnectionGeneration: 1}}, want: 502},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			server := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				serviceHistoryRespond(w, http.StatusOK, tc.data)
 			}))
 			defer server.Close()
@@ -341,7 +340,7 @@ func TestServiceHistoryReservationStatusAcceptsOnlyKnownLifecycleStates(t *testi
 		{name: "unknown-state", state: "server-updating"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			server := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				reservation := serviceHistoryReservation(tc.state)
 				reservation.FailureCode = tc.code
 				serviceHistoryRespond(w, http.StatusOK, ReservationStatus{Reservation: reservation})
@@ -365,7 +364,7 @@ func TestServiceHistoryReservationStatusAcceptsOnlyKnownLifecycleStates(t *testi
 
 func TestServiceHistoryStrictResponsesReturnZeroAndRejectMalformedSearchOrTickets(t *testing.T) {
 	t.Run("reservation-missing-required-bit", func(t *testing.T) {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		server := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			serviceHistoryRespondRaw(w, http.StatusOK, "application/json", []byte(`{"data":{"reservation":{"reservationId":"reservation-history-001","allocationId":"allocation-history-001","roomId":"room-history-001","applicationId":"history-app-0001","placementId":"old-placement-001","revisionId":"old-revision-001","region":"us-west","state":"prepared","createdAt":"2026-09-30T18:00:00Z","updatedAt":"2026-09-30T18:01:00Z"}},"requestId":"history-test"}`))
 		}))
 		defer server.Close()
@@ -378,7 +377,7 @@ func TestServiceHistoryStrictResponsesReturnZeroAndRejectMalformedSearchOrTicket
 	})
 
 	t.Run("reservation-duplicate-field", func(t *testing.T) {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		server := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			serviceHistoryRespondRaw(w, http.StatusOK, "application/json", []byte(`{"data":{"reservation":{"reservationId":"reservation-history-001","allocationId":"allocation-history-001","allocationId":"allocation-other-001","roomId":"room-history-001","applicationId":"history-app-0001","placementId":"old-placement-001","revisionId":"old-revision-001","region":"us-west","state":"prepared","cancellationRequested":false,"createdAt":"2026-09-30T18:00:00Z","updatedAt":"2026-09-30T18:01:00Z"}},"requestId":"history-test"}`))
 		}))
 		defer server.Close()
@@ -398,7 +397,7 @@ func TestServiceHistoryStrictResponsesReturnZeroAndRejectMalformedSearchOrTicket
 		{name: "wrong-region", mutate: func(r *Reservation) { r.Region = "eu-west" }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			server := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				reservation := serviceHistoryReservation("prepared")
 				tc.mutate(&reservation)
 				serviceHistoryRespond(w, http.StatusOK, ReservationStatus{Reservation: reservation})
@@ -414,7 +413,7 @@ func TestServiceHistoryStrictResponsesReturnZeroAndRejectMalformedSearchOrTicket
 	}
 
 	t.Run("wrong-search-compatibility", func(t *testing.T) {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		server := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			search := serviceHistorySearch("pending", historyClientTestSearch)
 			search.Compatibility = "other-release"
 			serviceHistoryRespond(w, http.StatusOK, SearchStatus{Search: search})
@@ -429,7 +428,7 @@ func TestServiceHistoryStrictResponsesReturnZeroAndRejectMalformedSearchOrTicket
 	})
 
 	t.Run("ticket-token-invalid", func(t *testing.T) {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		server := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			assignment := serviceHistoryTicket(0)
 			assignment.Ticket.Token = "private-invalid-token"
 			serviceHistoryRespond(w, http.StatusOK, AssignmentResult{Assignment: assignment, Replay: false})
@@ -444,7 +443,7 @@ func TestServiceHistoryStrictResponsesReturnZeroAndRejectMalformedSearchOrTicket
 	})
 
 	t.Run("assignment-missing-replay", func(t *testing.T) {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		server := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			assignment := serviceHistoryTicket(0)
 			serviceHistoryRespondRaw(w, http.StatusOK, "application/json", []byte(`{"data":{"assignment":{"ticket":{"id":"`+assignment.Ticket.ID+`","state":"issued","token":"`+assignment.Ticket.Token+`","generation":1,"expiresAt":"2026-09-30T19:00:00Z"},"endpoint":{"address":"203.0.113.7","ports":[{"name":"game","protocol":"UDP","port":20000}]}}},"requestId":"history-test"}`))
 		}))
@@ -458,7 +457,7 @@ func TestServiceHistoryStrictResponsesReturnZeroAndRejectMalformedSearchOrTicket
 	})
 
 	t.Run("cancel-search-pending", func(t *testing.T) {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		server := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			serviceHistoryRespond(w, http.StatusOK, SearchResult{Search: serviceHistorySearch("pending", historyClientTestSearch), Replay: true})
 		}))
 		defer server.Close()
@@ -491,7 +490,7 @@ func TestServiceHistorySearchLifecycleValidationUsesHistoryTTLAndExactRoomEviden
 			if tc.edit != nil {
 				tc.edit(&search)
 			}
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			server := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				serviceHistoryRespond(w, http.StatusOK, SearchStatus{Search: search})
 			}))
 			defer server.Close()
@@ -524,7 +523,7 @@ func TestServiceHistoryIssueRequiresExactGenerationStateEndpointAndReplay(t *tes
 		{name: "exact-expired-replay", edit: func(a *Assignment) { a.Ticket.State = "expired"; a.Ticket.Token = ""; a.Endpoint = nil }, replay: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			server := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				assignment := serviceHistoryTicket(0)
 				if tc.edit != nil {
 					tc.edit(&assignment)
@@ -549,7 +548,7 @@ func TestServiceHistoryIssueRequiresExactGenerationStateEndpointAndReplay(t *tes
 func TestServiceHistoryErrorsAreSanitizedAndNeverRetried(t *testing.T) {
 	const privateMarker = "private-upstream-message-and-request-id"
 	var calls atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	server := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		calls.Add(1)
 		serviceHistoryRespondRaw(w, http.StatusForbidden, "application/json", []byte(`{"error":{"code":"history_route_forbidden","message":"`+privateMarker+`"},"requestId":"`+privateMarker+`"}`))
 	}))

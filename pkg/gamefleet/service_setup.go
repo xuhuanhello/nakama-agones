@@ -62,7 +62,7 @@ func ServiceConfigFromEnv() (ServiceSearchConfig, error) {
 		return ServiceSearchConfig{}, errors.New("invalid GAMEFLEET_SERVICE_KEY_FILE credential")
 	}
 	return ServiceSearchConfig{
-		URL: values[0], Key: key, ServiceID: values[2], ApplicationID: values[3],
+		TLS: tlsFilesFromEnv("GAMEFLEET_SERVICE"), URL: values[0], Key: key, ServiceID: values[2], ApplicationID: values[3],
 		IdentityIssuer: values[4], Region: values[5], Compatibility: values[6],
 	}, nil
 }
@@ -90,7 +90,7 @@ func RegisterServiceFromEnv(ctx context.Context, logger runtime.Logger, _ *sql.D
 		return err
 	}
 	history, err := NewServiceHistoryClient(ServiceHistoryConfig{
-		URL: cfg.URL, Key: cfg.Key, ServiceID: cfg.ServiceID, ApplicationID: cfg.ApplicationID,
+		TLS: cfg.TLS, URL: cfg.URL, Key: cfg.Key, ServiceID: cfg.ServiceID, ApplicationID: cfg.ApplicationID,
 		IdentityIssuer: cfg.IdentityIssuer, Region: cfg.Region, Compatibility: cfg.Compatibility,
 	})
 	if err != nil {

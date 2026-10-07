@@ -157,7 +157,7 @@ func (f *bridgeBackend) Cancel(ctx context.Context, allocationID string) (Reserv
 }
 
 func bridgeTestConfig() Config {
-	return Config{Region: "local-west", Compatibility: "build-2026-09"}
+	return Config{TLS: fixtureTLS, Region: "local-west", Compatibility: "build-2026-09"}
 }
 
 func bridgeHooks(t *testing.T, backend Backend) (*bridgeInitializer, Config) {

@@ -7,12 +7,9 @@ import (
 	"errors"
 	"io"
 	"mime"
-	"net"
 	"net/http"
 	"net/netip"
-	"net/url"
 	"regexp"
-	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -24,6 +21,7 @@ var attemptID = regexp.MustCompile(`^[A-Za-z0-9_-]{8,128}$`)
 var playerToken = regexp.MustCompile(`^gft1\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{86}$`)
 
 type Config struct {
+	TLS           TLSFiles
 	URL           string
 	Key           string
 	ApplicationID string
@@ -43,18 +41,11 @@ func exactText(s string, max int) bool {
 	return s != "" && len(s) <= max && utf8.ValidString(s) && strings.TrimSpace(s) == s && !strings.ContainsFunc(s, unicode.IsControl)
 }
 
-// NewClient only permits an explicit loopback origin. Cross-VPS traffic must
-// use a separately managed SSH local forward. Proxy variables and redirects
-// cannot move the machine credential to another destination.
+// NewClient requires authenticated HTTPS. Proxy variables and redirects cannot move credentials.
 func NewClient(cfg Config) (*Client, error) {
-	u, err := url.Parse(cfg.URL)
-	if err != nil || u == nil || u.Scheme != "http" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.RawFragment != "" || u.RawPath != "" || (u.Path != "" && u.Path != "/") || u.Opaque != "" {
-		return nil, errors.New("GAMEFLEET_BUSINESS_URL must be an explicit loopback HTTP origin")
-	}
-	ip, err := netip.ParseAddr(u.Hostname())
-	port, perr := strconv.Atoi(u.Port())
-	if err != nil || !ip.IsLoopback() || ip.Zone() != "" || perr != nil || port < 1 || port > 65535 || u.Host != net.JoinHostPort(ip.String(), strconv.Itoa(port)) {
-		return nil, errors.New("GAMEFLEET_BUSINESS_URL requires a canonical loopback IP and port")
+	base, transport, err := businessTransport(cfg.URL, cfg.TLS)
+	if err != nil {
+		return nil, err
 	}
 	if !opaqueID.MatchString(cfg.ApplicationID) || !opaqueID.MatchString(cfg.PlacementID) || !opaqueID.MatchString(cfg.RevisionID) || !exactText(cfg.Region, 128) || !exactText(cfg.Compatibility, 128) {
 		return nil, errors.New("GameFleet application, placement, revision, region and compatibility are required")
@@ -62,13 +53,8 @@ func NewClient(cfg Config) (*Client, error) {
 	if len(cfg.Key) < 16 || len(cfg.Key) > 4096 || strings.ContainsFunc(cfg.Key, func(r rune) bool { return r < 33 || r > 126 }) {
 		return nil, errors.New("invalid GameFleet business key")
 	}
-	transport := &http.Transport{
-		Proxy: nil, DialContext: (&net.Dialer{Timeout: 3 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
-		MaxConnsPerHost: 16, MaxIdleConns: 16, MaxIdleConnsPerHost: 16,
-		IdleConnTimeout: 30 * time.Second, ResponseHeaderTimeout: 5 * time.Second,
-		MaxResponseHeaderBytes: 16 << 10, DisableCompression: true,
-	}
-	return &Client{config: cfg, base: "http://" + u.Host, http: &http.Client{
+
+	return &Client{config: cfg, base: base, http: &http.Client{
 		Transport: transport, Timeout: 8 * time.Second,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}}, nil

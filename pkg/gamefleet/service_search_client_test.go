@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/http/httptest"
 	"reflect"
 	"strings"
 	"sync"
@@ -30,7 +29,7 @@ func serviceSearchTestKey() string {
 }
 
 func serviceSearchTestConfig(origin string) ServiceSearchConfig {
-	return ServiceSearchConfig{
+	return ServiceSearchConfig{TLS: fixtureTLS,
 		URL: origin, Key: serviceSearchTestKey(), ServiceID: serviceSearchTestID,
 		ApplicationID: serviceSearchTestApp, IdentityIssuer: serviceSearchTestIssuer,
 		Region: "us-west", Compatibility: "dm-v1",
@@ -114,21 +113,21 @@ func serviceSearchAssertError(t *testing.T, err error, status int, code string) 
 }
 
 func TestServiceSearchClientConfigRequiresLoopbackAndExactGfsvcScope(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	server := newBusinessTestServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 	defer server.Close()
 	if c, err := NewServiceSearchClient(serviceSearchTestConfig(server.URL)); err != nil {
 		t.Fatal("valid loopback service search config rejected")
 	} else {
 		c.Close()
 	}
-	if c, err := NewServiceSearchClient(serviceSearchTestConfig("http://[::1]:18683")); err != nil {
+	if c, err := NewServiceSearchClient(serviceSearchTestConfig("https://[::1]:18683")); err != nil {
 		t.Fatal("canonical IPv6 loopback origin rejected")
 	} else {
 		c.Close()
 	}
 
 	for _, origin := range []string{
-		"", "https://127.0.0.1:18683", "http://localhost:18683", "http://192.0.2.10:18683",
+		"", "http://127.0.0.1:18683", "http://localhost:18683", "http://192.0.2.10:18683",
 		"http://127.0.0.1", "http://127.0.0.1:0", "http://127.0.0.1:99999", "http://127.0.0.1:018683",
 		"http://user:pass@127.0.0.1:18683", "http://127.0.0.1:18683/business", "http://127.0.0.1:18683?x=1",
 		"http://127.0.0.1:18683?", "http://127.0.0.1:18683/#fragment", "http://[::1%25lo0]:18683",
@@ -168,7 +167,7 @@ func TestServiceSearchClientConfigRequiresLoopbackAndExactGfsvcScope(t *testing.
 
 func TestServiceSearchCheckScopeUsesExactMetadataAndReadOperation(t *testing.T) {
 	var calls atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
 		if r.Method != http.MethodGet || r.URL.Path != "/business/v1/history/service" || r.URL.RawQuery != "" ||
 			r.Header.Get("Authorization") != "Bearer "+serviceSearchTestKey() || r.Header.Get("Cookie") != "" ||
@@ -209,7 +208,7 @@ func TestServiceSearchCheckScopeUsesExactMetadataAndReadOperation(t *testing.T) 
 		{name: "unknown-operation", service: serviceSearchTestID, app: serviceSearchTestApp, issuer: serviceSearchTestIssuer, operations: []string{"read", "reserve"}, status: 502},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			server := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				serviceSearchRespond(w, http.StatusOK, map[string]any{
 					"serviceId": tc.service, "applicationId": tc.app, "identityIssuer": tc.issuer,
 					"operations": tc.operations,
@@ -227,7 +226,7 @@ func TestServiceSearchBeginAndStatusUseVersionParticipantRegionAndCompatibility(
 	var beginBodies [][]byte
 	var beginBodiesMu sync.Mutex
 	var statusCalls atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.RawQuery != "" || r.Header.Get("Authorization") != "Bearer "+serviceSearchTestKey() ||
 			r.Header.Get("Accept") != "application/json" || r.Header.Get("Content-Type") != "application/json" ||
 			r.Header.Get("Cookie") != "" || r.Header.Get("Origin") != "" {
@@ -304,7 +303,7 @@ func TestServiceSearchMatchSortsPrivateCopyAndRetriesFrozenBodyOnlyForCapacityCo
 	var received [][]byte
 	var receivedMu sync.Mutex
 	var calls atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/business/v1/service-searches/match" || r.URL.RawQuery != "" ||
 			r.Header.Get("Authorization") != "Bearer "+serviceSearchTestKey() || r.Header.Get("Content-Type") != "application/json" ||
 			r.Header.Get("Accept") != "application/json" || r.Header.Get("Cookie") != "" || r.Header.Get("Origin") != "" {
@@ -389,7 +388,7 @@ func TestServiceSearchMatchDoesNotRetryOtherStatusesCodesOrMalformedErrors(t *te
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var calls atomic.Int32
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			server := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				calls.Add(1)
 				contentType := tc.contentType
 				if contentType == "" {
@@ -419,7 +418,7 @@ func TestServiceSearchMatchLostResponseRecoversOriginalReceiptWithSameKey(t *tes
 	var bodies [][]byte
 	var bodiesMu sync.Mutex
 	original := serviceSearchTestReservation("prepared")
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		raw, _ := io.ReadAll(r.Body)
 		bodiesMu.Lock()
 		bodies = append(bodies, append([]byte(nil), raw...))
@@ -465,7 +464,7 @@ func TestServiceSearchMatchLostResponseRecoversOriginalReceiptWithSameKey(t *tes
 
 func TestServiceSearchStrictSuccessValidationAndNoNetworkForInvalidInput(t *testing.T) {
 	var calls atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	server := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		calls.Add(1)
 		serviceSearchRespond(w, http.StatusOK, SearchStatus{Search: serviceSearchTestPending("search-player-0001")})
 	}))
@@ -501,7 +500,7 @@ func TestServiceSearchStrictSuccessValidationAndNoNetworkForInvalidInput(t *test
 		{name: "wrong-content-type", contentType: "text/plain", body: []byte(`{"data":{"search":{"searchId":"search-player-0001","state":"pending","region":"us-west","compatibility":"dm-v1","createdAt":"2026-09-30T17:00:00Z","expiresAt":"2026-09-30T17:02:00Z"}},"requestId":"r"}`)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			bad := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				contentType := tc.contentType
 				if contentType == "" {
 					contentType = "application/json"
@@ -518,7 +517,7 @@ func TestServiceSearchStrictSuccessValidationAndNoNetworkForInvalidInput(t *test
 		})
 	}
 
-	valid := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	valid := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		serviceSearchRespond(w, http.StatusOK, SearchStatus{Search: serviceSearchTestBoundSearch("search-player-0001")})
 	}))
 	defer valid.Close()
@@ -530,7 +529,7 @@ func TestServiceSearchStrictSuccessValidationAndNoNetworkForInvalidInput(t *test
 
 func TestServiceSearchSemanticValidationFailuresReturnZeroValues(t *testing.T) {
 	t.Run("begin", func(t *testing.T) {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		server := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			search := serviceSearchTestPending("search-service-valid-001")
 			search.Region = "wrong-region"
 			serviceSearchRespond(w, http.StatusCreated, SearchResult{Search: search, Replay: false})
@@ -545,7 +544,7 @@ func TestServiceSearchSemanticValidationFailuresReturnZeroValues(t *testing.T) {
 	})
 
 	t.Run("status", func(t *testing.T) {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		server := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			serviceSearchRespond(w, http.StatusOK, SearchStatus{Search: serviceSearchTestPending("search-player-0002")})
 		}))
 		defer server.Close()
@@ -558,7 +557,7 @@ func TestServiceSearchSemanticValidationFailuresReturnZeroValues(t *testing.T) {
 	})
 
 	t.Run("match", func(t *testing.T) {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		server := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			reservation := serviceSearchTestReservation("reserved")
 			reservation.ApplicationID = "wrong-application"
 			serviceSearchRespond(w, http.StatusAccepted, ReservationResult{Reservation: reservation, Replay: false})
@@ -602,7 +601,7 @@ func TestServiceSearchMatchRejectsMalformedReservationAndReplayStatusMismatch(t 
 		}(), Replay: false})},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			server := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				serviceSearchRaw(w, tc.status, "application/json", tc.body)
 			}))
 			defer server.Close()
@@ -625,7 +624,7 @@ func TestServiceSearchMatchRejectsMalformedReservationAndReplayStatusMismatch(t 
 		{{ParticipantID: "player-a", SearchID: "search-player-0001", NakamaTicket: "ticket-a"}, {ParticipantID: "player-b", SearchID: "search-player-0001", NakamaTicket: "ticket-b"}},
 		{{ParticipantID: "player-a", SearchID: "search-player-0001", NakamaTicket: "ticket-a"}, {ParticipantID: "player-b", SearchID: "search-player-0002", NakamaTicket: "ticket-a"}},
 	} {
-		_, err := mustServiceSearchClient(t, serviceSearchTestConfig("http://127.0.0.1:18683")).MatchSearches(context.Background(), "stable-match-request-001", badMembers)
+		_, err := mustServiceSearchClient(t, serviceSearchTestConfig("https://127.0.0.1:18683")).MatchSearches(context.Background(), "stable-match-request-001", badMembers)
 		serviceSearchAssertError(t, err, 422, "")
 	}
 }
@@ -641,7 +640,7 @@ func mustServiceSearchJSON(t *testing.T, value any) []byte {
 
 func TestServiceSearchTransportDisablesProxyAndRedirectsAndBoundsBodies(t *testing.T) {
 	var proxyCalls atomic.Int32
-	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	proxy := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		proxyCalls.Add(1)
 		w.WriteHeader(http.StatusBadGateway)
 	}))
@@ -653,7 +652,7 @@ func TestServiceSearchTransportDisablesProxyAndRedirectsAndBoundsBodies(t *testi
 	t.Setenv("NO_PROXY", "")
 	t.Setenv("no_proxy", "")
 
-	good := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	good := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		serviceSearchRespond(w, http.StatusOK, SearchStatus{Search: serviceSearchTestPending("search-player-0001")})
 	}))
 	defer good.Close()
@@ -666,12 +665,12 @@ func TestServiceSearchTransportDisablesProxyAndRedirectsAndBoundsBodies(t *testi
 	}
 
 	var redirectTargetCalls atomic.Int32
-	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	target := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		redirectTargetCalls.Add(1)
 		serviceSearchRespond(w, http.StatusOK, SearchStatus{Search: serviceSearchTestPending("search-player-0001")})
 	}))
 	defer target.Close()
-	redirect := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	redirect := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, target.URL, http.StatusTemporaryRedirect)
 	}))
 	defer redirect.Close()
@@ -683,7 +682,7 @@ func TestServiceSearchTransportDisablesProxyAndRedirectsAndBoundsBodies(t *testi
 	}
 
 	const marker = "private-upstream-body-marker"
-	oversized := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	oversized := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		serviceSearchRaw(w, http.StatusOK, "application/json", []byte(`{"data":{},"requestId":"`+strings.Repeat("x", serviceSearchBodyLimit)+marker+`"}`))
 	}))
 	defer oversized.Close()
@@ -698,7 +697,7 @@ func TestServiceSearchTransportDisablesProxyAndRedirectsAndBoundsBodies(t *testi
 func TestServiceSearchContextCancellationStopsCapacityRetry(t *testing.T) {
 	var calls atomic.Int32
 	entered := make(chan struct{}, 1)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	server := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		calls.Add(1)
 		serviceSearchRespondError(w, http.StatusConflict, "service_search_match_capacity_unavailable")
 		select {
@@ -746,7 +745,7 @@ func TestServiceSearchErrorEnvelopeMustBeClosedAndSanitized(t *testing.T) {
 		{name: "unicode-key", body: `{"error":{"code":"service_search_match_capacity_unavailable","message":"safe"},"requestId":"err-001","requeſtId":"other"}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			server := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				serviceSearchRaw(w, http.StatusConflict, "application/json", []byte(tc.body))
 			}))
 			defer server.Close()
@@ -779,7 +778,7 @@ func TestServiceSearchClientDoesNotImplementCallerBackend(t *testing.T) {
 
 func TestServiceSearchCapacityRetryDeadlineIsBounded(t *testing.T) {
 	var calls atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	server := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		calls.Add(1)
 		serviceSearchRespondError(w, http.StatusConflict, "service_search_match_capacity_unavailable")
 	}))
@@ -815,7 +814,7 @@ func TestServiceSearchTechnicalAbortReservationValidationIsExact(t *testing.T) {
 		t.Run(tc.state+"/"+tc.failure, func(t *testing.T) {
 			r := serviceSearchTestReservation(tc.state)
 			r.FailureCode = tc.failure
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			server := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				status := http.StatusAccepted
 				serviceSearchRespond(w, status, ReservationResult{Reservation: r, Replay: false})
 			}))
@@ -837,7 +836,7 @@ func TestServiceSearchTechnicalAbortReservationValidationIsExact(t *testing.T) {
 
 func TestServiceSearchNoErrorReportsWireBodies(t *testing.T) {
 	const privateMarker = "never-return-this-response-content"
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	server := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		serviceSearchRaw(w, http.StatusConflict, "application/json", []byte(fmt.Sprintf(
 			`{"error":{"code":"service_search_match_capacity_unavailable","message":"%s"},"requestId":"err-001"}`,
 			privateMarker)))

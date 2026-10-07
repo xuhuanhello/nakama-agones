@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -18,7 +17,7 @@ import (
 )
 
 func clientConfig(origin string) Config {
-	return Config{URL: origin, Key: "gfbiz_" + strings.Repeat("a", 43), ApplicationID: "app-one", PlacementID: "placement-one", RevisionID: "revision-one", Region: "us-west", Compatibility: "dm-v1"}
+	return Config{TLS: fixtureTLS, URL: origin, Key: "gfbiz_" + strings.Repeat("a", 43), ApplicationID: "app-one", PlacementID: "placement-one", RevisionID: "revision-one", Region: "us-west", Compatibility: "dm-v1"}
 }
 func testReservation() Reservation {
 	now := time.Date(2026, 9, 28, 1, 0, 0, 0, time.UTC)
@@ -49,7 +48,7 @@ func statusError(t *testing.T, err error, want int) {
 }
 
 func TestClientRejectsNonLoopbackAndAmbiguousOrigins(t *testing.T) {
-	for _, origin := range []string{"", "https://127.0.0.1:17682", "http://localhost:17682", "http://192.0.2.1:17682", "http://127.0.0.1", "http://127.0.0.1:0", "http://127.0.0.1:99999", "http://127.0.0.1:017682", "http://user:pass@127.0.0.1:17682", "http://127.0.0.1:17682/business", "http://127.0.0.1:17682?x=1", "http://127.0.0.1:17682?", "http://127.0.0.1:17682/#x", "http://[::1%25lo0]:17682", "http://127.0.0.1:17682/%2f"} {
+	for _, origin := range []string{"", "http://127.0.0.1:17682", "http://localhost:17682", "http://192.0.2.1:17682", "http://127.0.0.1", "http://127.0.0.1:0", "http://127.0.0.1:99999", "http://127.0.0.1:017682", "http://user:pass@127.0.0.1:17682", "http://127.0.0.1:17682/business", "http://127.0.0.1:17682?x=1", "http://127.0.0.1:17682?", "http://127.0.0.1:17682/#x", "http://[::1%25lo0]:17682", "http://127.0.0.1:17682/%2f"} {
 		t.Run(origin, func(t *testing.T) {
 			if c, err := NewClient(clientConfig(origin)); err == nil {
 				c.Close()
@@ -57,7 +56,7 @@ func TestClientRejectsNonLoopbackAndAmbiguousOrigins(t *testing.T) {
 			}
 		})
 	}
-	for _, origin := range []string{"http://127.0.0.1:17682", "http://[::1]:17682/"} {
+	for _, origin := range []string{"https://127.0.0.1:17682", "https://[::1]:17682/", "https://business.example.net"} {
 		c, err := NewClient(clientConfig(origin))
 		if err != nil {
 			t.Fatal(err)
@@ -65,7 +64,7 @@ func TestClientRejectsNonLoopbackAndAmbiguousOrigins(t *testing.T) {
 		c.Close()
 	}
 	for _, change := range []func(*Config){func(c *Config) { c.ApplicationID = "../app" }, func(c *Config) { c.PlacementID = "" }, func(c *Config) { c.RevisionID = "bad revision" }, func(c *Config) { c.Region = " west" }, func(c *Config) { c.Compatibility = "v1\n" }, func(c *Config) { c.Key = "secret\nheader" }} {
-		cfg := clientConfig("http://127.0.0.1:17682")
+		cfg := clientConfig("https://127.0.0.1:17682")
 		change(&cfg)
 		if c, err := NewClient(cfg); err == nil {
 			c.Close()
@@ -76,7 +75,7 @@ func TestClientRejectsNonLoopbackAndAmbiguousOrigins(t *testing.T) {
 
 func TestClientHTTPContractAndExactReplay(t *testing.T) {
 	var bodies [][]byte
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer "+clientConfig("").Key || r.URL.RawQuery != "" || r.Header.Get("Cookie") != "" || r.Header.Get("Origin") != "" {
 			t.Error("unexpected credential or ambient authority")
 		}
@@ -170,12 +169,12 @@ func TestClientHTTPContractAndExactReplay(t *testing.T) {
 
 func TestClientRejectsRedirectAndIgnoresProxy(t *testing.T) {
 	var captured atomic.Int64
-	sink := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { captured.Add(1); respond(w, CurrentResult{}) }))
+	sink := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { captured.Add(1); respond(w, CurrentResult{}) }))
 	defer sink.Close()
 	t.Setenv("HTTP_PROXY", sink.URL)
 	t.Setenv("ALL_PROXY", sink.URL)
 	t.Setenv("NO_PROXY", "")
-	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { http.Redirect(w, r, sink.URL, 307) }))
+	origin := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { http.Redirect(w, r, sink.URL, 307) }))
 	defer origin.Close()
 	c := mustClient(t, origin.URL)
 	_, err := c.Current(context.Background(), "player-one")
@@ -214,7 +213,7 @@ func TestClientMalformedResponsesAndScopeChangesFailClosed(t *testing.T) {
 		{name: "bad generation", mutate: func(r CurrentResult) any { r.Current.ConnectionGeneration = MaxGeneration + 1; return r }},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			s := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if test.raw != "" {
 					media := test.media
 					if media == "" {
@@ -236,7 +235,7 @@ func TestClientMalformedResponsesAndScopeChangesFailClosed(t *testing.T) {
 func TestClientScopePreflight(t *testing.T) {
 	for _, field := range []string{"application", "placement", "revision", "region", "permission"} {
 		t.Run(field, func(t *testing.T) {
-			s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			s := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				scope := Scope{CallerID: "caller-one", ApplicationID: "app-one", PlacementID: "placement-one", RevisionID: "revision-one", Region: "us-west", Operations: []string{"read", "reserve", "cancel", "assignment", "resume"}}
 				switch field {
 				case "application":
@@ -263,7 +262,7 @@ func TestClientScopePreflight(t *testing.T) {
 func TestClientErrorsAreSanitizedAndRequestsAreBounded(t *testing.T) {
 	for _, code := range []int{301, 401, 403, 404, 409, 422, 429, 500, 503} {
 		t.Run(fmt.Sprint(code), func(t *testing.T) {
-			s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			s := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.WriteHeader(code)
 				fmt.Fprint(w, "credential-secret ticket-secret arbitrary-error")
 			}))
@@ -279,7 +278,7 @@ func TestClientErrorsAreSanitizedAndRequestsAreBounded(t *testing.T) {
 			}
 		})
 	}
-	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	s := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		io.Copy(io.Discard, r.Body)
 		select {
 		case <-r.Context().Done():
@@ -299,7 +298,7 @@ func TestClientErrorsAreSanitizedAndRequestsAreBounded(t *testing.T) {
 
 func TestClientRejectsInvalidRequestsBeforeHTTP(t *testing.T) {
 	var calls atomic.Int64
-	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls.Add(1); w.WriteHeader(500) }))
+	s := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls.Add(1); w.WriteHeader(500) }))
 	defer s.Close()
 	c := mustClient(t, s.URL)
 	ctx := context.Background()
@@ -336,7 +335,7 @@ func TestClientStatusValidatesAbortedCodeScopeAllocationAndStrictEnvelope(t *tes
 	validAborted := testReservation()
 	validAborted.State = "technical_aborted"
 	validAborted.FailureCode = "host_process_terminated"
-	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	s := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		respond(w, ReservationStatus{Reservation: validAborted})
 	}))
 	out, err := mustClient(t, s.URL).Status(context.Background(), "allocation-one", "player-one")
@@ -365,7 +364,7 @@ func TestClientStatusValidatesAbortedCodeScopeAllocationAndStrictEnvelope(t *tes
 		{name: "replay member", mutate: func(s *ReservationStatus) any { return map[string]any{"reservation": s.Reservation, "replay": false} }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			server := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				reservation := ReservationStatus{Reservation: testReservation()}
 				respond(w, tc.mutate(&reservation))
 			}))
@@ -385,7 +384,7 @@ func TestClientAssignmentReplayShapes(t *testing.T) {
 				a.Ticket.Token = ""
 				a.Endpoint = nil
 			}
-			s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			s := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				respond(w, AssignmentResult{Assignment: a, Replay: true})
 			}))
 			defer s.Close()
@@ -459,7 +458,7 @@ func TestRequiredLifecycleAndReplayFields(t *testing.T) {
 	a.Ticket.Token = ""
 	a.Endpoint = nil
 	for _, replay := range []any{nil, false} {
-		s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			respond(w, map[string]any{"assignment": a, "replay": replay})
 		}))
 		c := mustClient(t, s.URL)

@@ -39,12 +39,15 @@ ROOM_VERSION = "gamefleet.player-room.v1"
 SEARCH_VERSION = "gamefleet.player-search.v1"
 EVIDENCE_PATH = Path(tempfile.gettempdir()) / "gamefleet-runtime-smoke-evidence.json"
 db_password = ""
+TLS_DIR = Path()
 
 GO_FIXTURE = r'''package main
 
 import (
 	"bytes"
 	"encoding/json"
+"crypto/tls"
+"crypto/x509"
 	"fmt"
 	"io"
 	"log"
@@ -396,7 +399,10 @@ func main() {
 		log.Fatal(err)
 	}
 	fmt.Println("p4d_fixture_ready")
-	log.Fatal(http.Serve(listener, mux))
+	cert,err:=tls.LoadX509KeyPair("/fixture-tls/cert.pem","/fixture-tls/key.pem");if err!=nil{log.Fatal(err)}
+ ca,err:=os.ReadFile("/fixture-tls/cert.pem");if err!=nil{log.Fatal(err)}
+ pool:=x509.NewCertPool();pool.AppendCertsFromPEM(ca)
+ log.Fatal(http.Serve(tls.NewListener(listener,&tls.Config{MinVersion:tls.VersionTLS12,Certificates:[]tls.Certificate{cert},ClientAuth:tls.RequireAndVerifyClientCert,ClientCAs:pool}), mux))
 }
 '''
 
@@ -747,6 +753,7 @@ def start_fixture(name: str, image: str, mode: str) -> None:
     docker([
         "run", "--detach", "--pull=never", "--platform", "linux/amd64", "--name", name,
         "--network", "container:" + db_container,
+        "--mount", f"type=bind,src={TLS_DIR},dst=/fixture-tls,readonly",
         "--env", "GF_P4D_FIXTURE_KEY=" + SYNTHETIC_KEY,
         "--env", "GF_P4D_FIXTURE_MODE=" + mode,
         "--env", "GF_P4D_FIXTURE_BACKEND=" + BACKEND,
@@ -759,7 +766,7 @@ def start_nakama(name: str, config_path: Path, key_path: Path) -> None:
     dsn = f"postgres:{db_password}@127.0.0.1:5432/nakama?sslmode=disable"
     env = {
         "NAKAMA_FLEET_BACKEND": BACKEND,
-        "GAMEFLEET_BUSINESS_URL": "http://127.0.0.1:17682",
+        "GAMEFLEET_BUSINESS_URL": "https://127.0.0.1:17682",
         "GAMEFLEET_BUSINESS_KEY_FILE": "/run/secrets/gamefleet-business-key",
         "GAMEFLEET_APPLICATION_ID": APP_ID,
         "GAMEFLEET_PLACEMENT_ID": PLACEMENT_ID,
@@ -773,7 +780,7 @@ def start_nakama(name: str, config_path: Path, key_path: Path) -> None:
         # Independent configuration must bypass both the legacy manager and
         # ordinary caller setup. Neither malformed tripwire may be consulted.
         env.update({
-            "GAMEFLEET_SERVICE_URL": "http://127.0.0.1:17682",
+            "GAMEFLEET_SERVICE_URL": "https://127.0.0.1:17682",
             "GAMEFLEET_SERVICE_KEY_FILE": "/run/secrets/gamefleet-business-key",
             "GAMEFLEET_SERVICE_ID": SERVICE_ID,
             "GAMEFLEET_SERVICE_APPLICATION_ID": APP_ID,
@@ -783,9 +790,12 @@ def start_nakama(name: str, config_path: Path, key_path: Path) -> None:
             "GAMEFLEET_BUSINESS_URL": "not-an-origin",
             "GAMEFLEET_BUSINESS_KEY_FILE": "/ordinary-key-must-not-be-read",
         })
+    for prefix in ("GAMEFLEET_BUSINESS", "GAMEFLEET_SERVICE"):
+        env.update({prefix+"_CA_FILE":"/fixture-tls/cert.pem",prefix+"_CERT_FILE":"/fixture-tls/cert.pem",prefix+"_TLS_KEY_FILE":"/fixture-tls/key.pem"})
     args = [
         "run", "--detach", "--pull=never", "--platform", "linux/amd64", "--name", name,
         "--network", "container:" + db_container,
+        "--mount", f"type=bind,src={TLS_DIR},dst=/fixture-tls,readonly",
         "--mount", f"type=bind,src={config_path},dst=/nakama/data/local.yml,readonly",
         "--mount", f"type=bind,src={key_path},dst=/run/secrets/gamefleet-business-key,readonly",
     ]
@@ -797,7 +807,7 @@ def start_nakama(name: str, config_path: Path, key_path: Path) -> None:
 
 
 def main() -> None:
-    global db_container, db_password, REPO, RUNTIME_IMAGE, EVIDENCE_PATH, BACKEND, SYNTHETIC_KEY
+    global TLS_DIR, db_container, db_password, REPO, RUNTIME_IMAGE, EVIDENCE_PATH, BACKEND, SYNTHETIC_KEY
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", type=Path, default=Path.cwd(), help="Nakama Agones checkout (default: current directory)")
     parser.add_argument("--image", default=RUNTIME_IMAGE, help="already-built linux/amd64 runtime image tag")
@@ -863,6 +873,10 @@ def main() -> None:
         key_path.write_text(SYNTHETIC_KEY, encoding="ascii")
         key_path.chmod(0o400)
         config_path.write_bytes((REPO / "deploy/nakama.local.yml").read_bytes())
+        TLS_DIR = temp_root / "tls"
+        TLS_DIR.mkdir(mode=0o700)
+        subprocess.run(["openssl","req","-x509","-newkey","rsa:2048","-nodes","-keyout",str(TLS_DIR/"key.pem"),"-out",str(TLS_DIR/"cert.pem"),"-days","1","-subj","/CN=runtime-fixture","-addext","subjectAltName=IP:127.0.0.1","-addext","extendedKeyUsage=serverAuth,clientAuth"],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        for file in TLS_DIR.iterdir(): file.chmod(0o600)
         fixture_source.write_text(GO_FIXTURE, encoding="utf-8")
         dockerfile.write_text(
             "FROM scratch\nCOPY gf-p4d-fixture /gf-p4d-fixture\nENTRYPOINT [\"/gf-p4d-fixture\"]\n",

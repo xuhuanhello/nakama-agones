@@ -12,6 +12,7 @@ import shutil
 import stat
 import subprocess
 import sys
+from urllib.parse import urlsplit
 
 
 REPO = Path(__file__).resolve().parent.parent
@@ -44,8 +45,6 @@ CONFIG_FILES = (
     (REPO / "deploy" / "compose.yaml", Path("compose.yaml")),
     (REPO / "deploy" / "Caddyfile", Path("deploy/Caddyfile")),
     (REPO / "deploy" / "nakama-entrypoint.sh", Path("deploy/nakama-entrypoint.sh")),
-    (REPO / "deploy" / "tunnel" / "Dockerfile", Path("deploy/tunnel/Dockerfile")),
-    (REPO / "deploy" / "tunnel" / "entrypoint.sh", Path("deploy/tunnel/entrypoint.sh")),
 )
 GENERATED_SECRETS = {
     "postgres-password": b"",
@@ -59,8 +58,12 @@ GENERATED_SECRETS = {
 EXTERNAL_FILES = {
     "gamefleet-service-key": b"",
     "gamefleet-archive-key.disabled": b"",
-    "platform-ssh-key": b"",
-    "platform-known-hosts": b"",
+    "gamefleet-archive-ca.disabled": b"",
+    "gamefleet-archive-cert.disabled": b"",
+    "gamefleet-archive-tls-key.disabled": b"",
+    "gamefleet-ca.crt": b"",
+    "gamefleet-client.crt": b"",
+    "gamefleet-client.key": b"",
     "application-credentials.json": b"{}\n",
 }
 
@@ -119,7 +122,7 @@ def _copy_if_absent(source: Path, target: Path, mode: int = 0o600) -> None:
 
 def command_init(args: argparse.Namespace) -> int:
     if os.geteuid() != 0:
-        raise ConfigError("run init with sudo so private files and SSH credentials are root-owned for Compose")
+        raise ConfigError("run init with sudo so private files and TLS credentials are root-owned for Compose")
     root: Path = args.directory.expanduser().resolve()
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     private = root / "private"
@@ -142,7 +145,7 @@ def command_init(args: argparse.Namespace) -> int:
 
     print(f"Created a local stack template at {root}")
     print("Generated database and Nakama keys are in private/ with mode 0400; values were not printed.")
-    print("Fill .env, the seven GameFleet service fields, and the owner-provided service/SSH files before validation.")
+    print("Fill .env, the seven GameFleet service fields, and the owner-provided service/TLS files before validation.")
     print("Template generation did not pull images, contact GameFleet, start containers, or deploy anything.")
     return 0
 
@@ -178,10 +181,14 @@ def _private_file(root: Path, env: dict[str, str], name: str, setting: str, *, a
         raise ConfigError(f"{name} file is unavailable") from None
 
 
-def _validate_private_endpoint(url: str, *, port: int) -> None:
-    match = re.fullmatch(r"http://127\.0\.0\.1:([0-9]{1,5})", url)
-    if not match or int(match.group(1)) != port:
-        raise ConfigError(f"GAMEFLEET_SERVICE_URL must be the loopback tunnel origin on port {port}")
+def _validate_private_endpoint(url: str) -> None:
+    try:
+        u = urlsplit(url)
+        valid = u.scheme == "https" and u.hostname and not u.username and not u.password and not u.query and not u.fragment and u.path in ("", "/") and not "?" in url and not "#" in url and not "%" in u.netloc and (u.port is None or 1 <= u.port <= 65535)
+    except ValueError:
+        valid = False
+    if not valid:
+        raise ConfigError("GAMEFLEET_SERVICE_URL must be an HTTPS business origin")
 
 
 def _validate_application_env(root: Path, path_value: str, caddy_ipv4: str) -> None:
@@ -218,14 +225,17 @@ def validate_project(root: Path, *, check_image: bool = True, compose_config: bo
     if not service_env_path.is_absolute():
         service_env_path = root / service_env_path
     service_env = _read_env(service_env_path, allowed={
-        "NAKAMA_FLEET_BACKEND", *SERVICE_KEYS, *ARCHIVE_KEYS,
+        "NAKAMA_FLEET_BACKEND", *SERVICE_KEYS, *ARCHIVE_KEYS, *[p+s for p in ("GAMEFLEET_SERVICE", "GAMEFLEET_ARCHIVE") for s in ("_CA_FILE", "_CERT_FILE", "_TLS_KEY_FILE")],
     })
     if service_env.get("NAKAMA_FLEET_BACKEND") != "gamefleet-service":
         raise ConfigError("NAKAMA_FLEET_BACKEND must be gamefleet-service")
     missing = [key for key in SERVICE_KEYS if not service_env.get(key, "").strip()]
     if missing:
         raise ConfigError("all seven GAMEFLEET_SERVICE settings are required; missing: " + ", ".join(missing))
-    _validate_private_endpoint(service_env["GAMEFLEET_SERVICE_URL"], port=17682)
+    _validate_private_endpoint(service_env["GAMEFLEET_SERVICE_URL"])
+    for suffix, target in (("CA_FILE", "gamefleet-ca.crt"), ("CERT_FILE", "gamefleet-client.crt"), ("TLS_KEY_FILE", "gamefleet-client.key")):
+        if service_env.get("GAMEFLEET_SERVICE_" + suffix) != "/run/secrets/" + target:
+            raise ConfigError("TLS files must use the read-only Compose secret targets")
     if service_env["GAMEFLEET_SERVICE_KEY_FILE"] != "/run/secrets/gamefleet-service-key":
         raise ConfigError("GAMEFLEET_SERVICE_KEY_FILE must use the read-only Compose secret target")
     for key in SERVICE_KEYS[2:]:
@@ -238,18 +248,22 @@ def validate_project(root: Path, *, check_image: bool = True, compose_config: bo
     if archive_enabled and not all(archive_fields):
         raise ConfigError("optional GAMEFLEET_ARCHIVE fields must all be set or all be empty")
     if archive_enabled:
+        _validate_private_endpoint(service_env["GAMEFLEET_ARCHIVE_URL"])
+        for suffix, target, source in (("CA_FILE", "gamefleet-archive-ca.crt", "CA"), ("CERT_FILE", "gamefleet-archive-client.crt", "CERT"), ("TLS_KEY_FILE", "gamefleet-archive-client.key", "TLS_KEY")):
+            if service_env.get("GAMEFLEET_ARCHIVE_" + suffix) != "/run/secrets/" + target:
+                raise ConfigError("archive TLS files must use independent Compose secret targets")
+            _private_file(root, env, "archive TLS material", "GAMEFLEET_ARCHIVE_" + source + "_SOURCE")
         if env.get("GAMEFLEET_ARCHIVE_KEY_TARGET") != "/run/secrets/gamefleet-archive-key":
             raise ConfigError("set GAMEFLEET_ARCHIVE_KEY_TARGET to /run/secrets/gamefleet-archive-key")
         if service_env.get("GAMEFLEET_ARCHIVE_KEY_FILE") not in ("", "/run/secrets/gamefleet-archive-key"):
             raise ConfigError("archive key path must use the read-only Compose secret target")
 
-    required_env = ("NAKAMA_DOMAIN", "NAKAMA_RUNTIME_IMAGE", "POSTGRES_IMAGE", "CADDY_IMAGE", "ALPINE_IMAGE",
-                    "GAMEFLEET_SSH_TARGET", "GAMEFLEET_SSH_PORT", "FRONTEND_SUBNET", "DATABASE_SUBNET",
+    required_env = ("NAKAMA_DOMAIN", "NAKAMA_RUNTIME_IMAGE", "POSTGRES_IMAGE", "CADDY_IMAGE", "FRONTEND_SUBNET", "DATABASE_SUBNET",
                     "CADDY_IPV4", "NAKAMA_IPV4")
     missing_env = [key for key in required_env if not env.get(key, "").strip()]
     if missing_env:
         raise ConfigError("missing .env setting(s): " + ", ".join(missing_env))
-    for name in ("POSTGRES_IMAGE", "CADDY_IMAGE", "ALPINE_IMAGE"):
+    for name in ("POSTGRES_IMAGE", "CADDY_IMAGE"):
         if not IMAGE_DIGEST.fullmatch(env[name]):
             raise ConfigError(f"{name} must use an immutable OCI sha256 digest")
     runtime_image = env["NAKAMA_RUNTIME_IMAGE"]
@@ -258,12 +272,6 @@ def validate_project(root: Path, *, check_image: bool = True, compose_config: bo
     domain = env["NAKAMA_DOMAIN"]
     if _looks_placeholder(domain) or not re.fullmatch(r"(?=.{1,253}\Z)(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)(?:\.(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?))+", domain):
         raise ConfigError("NAKAMA_DOMAIN must be a public DNS name without a scheme or path")
-    ssh_target = env["GAMEFLEET_SSH_TARGET"]
-    if _looks_placeholder(ssh_target) or not re.fullmatch(r"[A-Za-z0-9_.-]+@[A-Za-z0-9.-]+", ssh_target):
-        raise ConfigError("GAMEFLEET_SSH_TARGET must be a user@hostname value with key authentication")
-    ssh_port = env["GAMEFLEET_SSH_PORT"]
-    if not ssh_port.isdigit() or not 1 <= int(ssh_port) <= 65535:
-        raise ConfigError("GAMEFLEET_SSH_PORT must be between 1 and 65535")
     for subnet_key in ("FRONTEND_SUBNET", "DATABASE_SUBNET"):
         try:
             ipaddress.ip_network(env[subnet_key], strict=True)
@@ -296,18 +304,17 @@ def validate_project(root: Path, *, check_image: bool = True, compose_config: bo
         ("Nakama console password", "NAKAMA_CONSOLE_PASSWORD_SOURCE"),
         ("Nakama console signing key", "NAKAMA_CONSOLE_SIGNING_KEY_SOURCE"),
         ("GameFleet service key", "GAMEFLEET_SERVICE_KEY_SOURCE"),
-        ("platform SSH private key", "PLATFORM_SSH_KEY_SOURCE"),
+        ("GameFleet CA", "GAMEFLEET_CA_SOURCE"),
+        ("GameFleet certificate", "GAMEFLEET_CERT_SOURCE"),
+        ("GameFleet TLS key", "GAMEFLEET_TLS_KEY_SOURCE"),
         ("application credential", "APPLICATION_SECRET_FILE"),
     ):
-        _private_file(root, env, name, setting, required_owner_uid=0 if setting == "PLATFORM_SSH_KEY_SOURCE" else None)
+        _private_file(root, env, name, setting)
     archive_source = env.get("GAMEFLEET_ARCHIVE_KEY_SOURCE", "")
     if archive_enabled:
         if not archive_source:
             raise ConfigError("GAMEFLEET_ARCHIVE_KEY_SOURCE is required when the archive reader is enabled")
         _private_file(root, env, "GameFleet archive key", "GAMEFLEET_ARCHIVE_KEY_SOURCE")
-    known_hosts = _private_file(root, env, "platform known_hosts", "PLATFORM_KNOWN_HOSTS_SOURCE", required_owner_uid=0)
-    if known_hosts.stat().st_size == 0:
-        raise ConfigError("platform known_hosts must contain an independently verified host key")
     _validate_application_env(root, env.get("APPLICATION_ENV_FILE", "./private/account.env"), str(caddy_ip))
 
     modules_value = env.get("APPLICATION_REQUIRED_MODULES", "").strip()
@@ -380,8 +387,8 @@ def command_plan(args: argparse.Namespace) -> int:
     mode = "local Docker image ID" if LOCAL_IMAGE_ID.fullmatch(image) else "registry image digest already pulled locally"
     print("Local deployment plan; this command does not pull images, start services, or contact a remote host.")
     print(f"1. Use the supplied immutable application runtime identity ({mode}).")
-    print("2. Build the restricted SSH sidecar image from the pinned Alpine digest.")
-    print("3. Start PostgreSQL, Nakama, the loopback-only GameFleet SSH forward, and Caddy HTTPS gateway.")
+    print("2. Verify direct business endpoint routing, DNS and owner-issued mutual TLS identity.")
+    print("3. Start PostgreSQL, Nakama, and Caddy HTTPS gateway; Nakama uses authenticated direct HTTPS.")
     print("4. Run Nakama migrations against the named persistent PostgreSQL volume.")
     print("5. Review Compose logs and test the public HTTPS endpoint and GameFleet service scopes separately.")
     print("The plan does not prove remote reachability, grants, account login, match allocation, or production health.")

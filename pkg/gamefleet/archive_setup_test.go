@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -23,6 +22,9 @@ func clearArchiveEnvironment(t *testing.T) {
 }
 
 func setArchiveEnvironment(t *testing.T, cfg TerminalArchiveConfig, path string) {
+	t.Setenv("GAMEFLEET_ARCHIVE_CA_FILE", cfg.TLS.CAFile)
+	t.Setenv("GAMEFLEET_ARCHIVE_CERT_FILE", cfg.TLS.CertFile)
+	t.Setenv("GAMEFLEET_ARCHIVE_TLS_KEY_FILE", cfg.TLS.KeyFile)
 	t.Helper()
 	for name, value := range map[string]string{
 		"GAMEFLEET_ARCHIVE_URL": cfg.URL, "GAMEFLEET_ARCHIVE_KEY_FILE": path,
@@ -117,7 +119,7 @@ func setupPrimaryEnvironment(t *testing.T, origin string) {
 		t.Fatal(err)
 	}
 	for name, value := range map[string]string{
-		"GAMEFLEET_BUSINESS_URL": cfg.URL, "GAMEFLEET_BUSINESS_KEY_FILE": path,
+		"GAMEFLEET_BUSINESS_CA_FILE": cfg.TLS.CAFile, "GAMEFLEET_BUSINESS_CERT_FILE": cfg.TLS.CertFile, "GAMEFLEET_BUSINESS_TLS_KEY_FILE": cfg.TLS.KeyFile, "GAMEFLEET_BUSINESS_URL": cfg.URL, "GAMEFLEET_BUSINESS_KEY_FILE": path,
 		"GAMEFLEET_APPLICATION_ID": cfg.ApplicationID, "GAMEFLEET_PLACEMENT_ID": cfg.PlacementID,
 		"GAMEFLEET_REVISION_ID": cfg.RevisionID, "GAMEFLEET_REGION": cfg.Region,
 		"GAMEFLEET_COMPATIBILITY": cfg.Compatibility,
@@ -135,7 +137,7 @@ func TestArchiveStartupPreflightPinsIdentityBeforeHooksAndUsesIndependentCredent
 			archiveCfg.Region, archiveCfg.Compatibility = "us-west", "dm-v1"
 			seen := make([]string, 0)
 			var seenMu sync.Mutex
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			server := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				seenMu.Lock()
 				seen = append(seen, r.URL.Path)
 				seenMu.Unlock()

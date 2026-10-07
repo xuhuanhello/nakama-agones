@@ -8,12 +8,8 @@ import (
 	"errors"
 	"io"
 	"mime"
-	"net"
 	"net/http"
-	"net/netip"
-	"net/url"
 	"regexp"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -30,6 +26,7 @@ var historyIdentityIssuer = regexp.MustCompile(`^[A-Za-z0-9_-]{8,128}$`)
 // read-only client may inspect. Placement and revision are deliberately absent:
 // retained records keep their immutable historical placement and revision.
 type TerminalArchiveConfig struct {
+	TLS            TLSFiles
 	URL            string
 	Key            string
 	ServiceID      string
@@ -61,31 +58,18 @@ func validHistoryServiceKey(key string) bool {
 }
 
 func NewTerminalArchiveClient(cfg TerminalArchiveConfig) (*TerminalArchiveClient, error) {
-	u, err := url.Parse(cfg.URL)
-	if err != nil || u == nil || u.Scheme != "http" || u.User != nil || u.RawQuery != "" || u.ForceQuery ||
-		u.Fragment != "" || u.RawFragment != "" || u.RawPath != "" || (u.Path != "" && u.Path != "/") || u.Opaque != "" {
-		return nil, errors.New("terminal archive URL must be an explicit loopback HTTP origin")
-	}
-	ip, err := netip.ParseAddr(u.Hostname())
-	port, portErr := strconv.Atoi(u.Port())
-	if err != nil || !ip.IsLoopback() || ip.Zone() != "" || portErr != nil || port < 1 || port > 65535 ||
-		u.Host != net.JoinHostPort(ip.String(), strconv.Itoa(port)) {
-		return nil, errors.New("terminal archive URL requires a canonical loopback IP and port")
+	base, transport, err := businessTransport(cfg.URL, cfg.TLS)
+	if err != nil {
+		return nil, err
 	}
 	if !opaqueID.MatchString(cfg.ServiceID) || !opaqueID.MatchString(cfg.ApplicationID) || !historyIdentityIssuer.MatchString(cfg.IdentityIssuer) ||
 		!exactText(cfg.Region, 128) || !exactText(cfg.Compatibility, 128) || !validHistoryServiceKey(cfg.Key) {
 		return nil, errors.New("invalid terminal archive scope or gfsvc credential")
 	}
-	transport := &http.Transport{
-		Proxy:           nil,
-		DialContext:     (&net.Dialer{Timeout: 3 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
-		MaxConnsPerHost: 16, MaxIdleConns: 16, MaxIdleConnsPerHost: 16,
-		IdleConnTimeout: 30 * time.Second, ResponseHeaderTimeout: 5 * time.Second,
-		MaxResponseHeaderBytes: 16 << 10, DisableCompression: true,
-	}
+
 	return &TerminalArchiveClient{
 		config: cfg,
-		base:   "http://" + u.Host,
+		base:   base,
 		http: &http.Client{
 			Transport: transport,
 			Timeout:   8 * time.Second,

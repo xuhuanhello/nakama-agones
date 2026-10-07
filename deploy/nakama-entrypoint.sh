@@ -21,26 +21,7 @@ read_secret() {
 	printf '%s' "$secret_value"
 }
 
-wait_for_local_tunnel() {
-	# 17682 is hex 4512 in /proc/net/tcp. The SSH service shares this network
-	# namespace and starts once this Nakama container is running.
-	attempt=0
-	while [ "$attempt" -lt 120 ]; do
-		# /proc/net/tcp columns are: sl, local_address, rem_address, st, ...
-		# Match local_address and state explicitly so a remote endpoint or a
-		# non-LISTEN socket cannot satisfy this dependency check.
-		if awk '$2 == "0100007F:4512" && $4 == "0A" { found = 1 } END { exit !found }' /proc/net/tcp; then
-			return 0
-		fi
-		attempt=$((attempt + 1))
-		sleep 1
-	done
-	echo "Timed out waiting for the GameFleet loopback SSH forward on port 17682" >&2
-	exit 1
-}
-
-wait_for_local_tunnel
-
+# Plugin initialization performs authenticated HTTPS scope preflight before registering hooks.
 db_password=$(read_secret /run/secrets/postgres_password postgres_password)
 socket_key=$(read_secret /run/secrets/nakama_socket_server_key nakama_socket_server_key)
 session_key=$(read_secret /run/secrets/nakama_session_encryption_key nakama_session_encryption_key)

@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/http/httptest"
 	"reflect"
 	"strings"
 	"sync/atomic"
@@ -30,7 +29,7 @@ func clientBoundSearch() Search {
 func TestClientSearchRoutesPreserveWireIdentityAndBoundCancellation(t *testing.T) {
 	pending, bound := clientPendingSearch(), clientBoundSearch()
 	var paths []string
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		paths = append(paths, r.URL.Path)
 		if r.Method != "POST" || r.Header.Get("Authorization") != "Bearer "+clientConfig("").Key || r.URL.RawQuery != "" {
 			t.Error("search request changed transport or authority")
@@ -83,7 +82,7 @@ func TestClientSearchLostResponsesRequireExplicitExactRetry(t *testing.T) {
 	for _, operation := range []string{"begin", "match"} {
 		t.Run(operation, func(t *testing.T) {
 			var bodies []string
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			server := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				raw, _ := io.ReadAll(r.Body)
 				bodies = append(bodies, string(raw))
 				if len(bodies) == 1 {
@@ -173,7 +172,7 @@ func TestClientSearchStatusValidatesDurableLifecycleFacts(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			s := clientPendingSearch()
 			tc.change(&s)
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { respond(w, SearchStatus{Search: s}) }))
+			server := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { respond(w, SearchStatus{Search: s}) }))
 			defer server.Close()
 			_, err := mustClient(t, server.URL).SearchStatus(context.Background(), clientPendingSearch().ID, "player-one")
 			if tc.valid {
@@ -206,7 +205,7 @@ func TestClientSearchStrictResponseFields(t *testing.T) {
 		{"duplicate envelope", `{"data":{"search":` + good + `,"replay":false},"Data":{"search":` + good + `,"replay":true}}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			server := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
 				fmt.Fprint(w, tc.raw)
 			}))
@@ -220,7 +219,7 @@ func TestClientSearchStrictResponseFields(t *testing.T) {
 	cfg.Compatibility = "版本一"
 	search := clientPendingSearch()
 	search.Compatibility = cfg.Compatibility
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { respond(w, SearchResult{Search: search}) }))
+	server := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { respond(w, SearchResult{Search: search}) }))
 	defer server.Close()
 	cfg.URL = server.URL
 	c, err := NewClient(cfg)
@@ -235,7 +234,7 @@ func TestClientSearchStrictResponseFields(t *testing.T) {
 
 func TestClientSearchInvalidInputsNeverReachTransport(t *testing.T) {
 	var requests atomic.Int64
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { requests.Add(1); w.WriteHeader(500) }))
+	server := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { requests.Add(1); w.WriteHeader(500) }))
 	defer server.Close()
 	c := mustClient(t, server.URL)
 	ctx := context.Background()
@@ -261,7 +260,7 @@ func TestClientSearchInvalidInputsNeverReachTransport(t *testing.T) {
 }
 
 func TestClientSearchCancellationRequiresAuthoritativeTerminalState(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { respond(w, SearchResult{Search: clientPendingSearch()}) }))
+	server := newBusinessTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { respond(w, SearchResult{Search: clientPendingSearch()}) }))
 	defer server.Close()
 	_, err := mustClient(t, server.URL).CancelSearch(context.Background(), "search-player-one", "player-one")
 	statusError(t, err, 502)
