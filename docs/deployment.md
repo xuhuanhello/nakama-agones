@@ -66,6 +66,14 @@ Set `NAKAMA_DOMAIN` to the public DNS name. Keep the default Docker networks onl
 
 Copy the owner-issued service key to `/opt/nakama/private/gamefleet-service-key`. Set the seven exact service fields in `/opt/nakama/private/gamefleet-service.env`; its in-container key path must remain `/run/secrets/gamefleet-service-key`. Set `GAMEFLEET_SERVICE_URL` to the dedicated HTTPS business origin, using its certificate SAN hostname. Set every identity and profile field to the value provisioned by the GameFleet owner; do not infer values from the image tag.
 
+If private DNS is unavailable, pin only the configured business hostname inside the Nakama container:
+
+```sh
+sudo python3 /opt/nakama-source/scripts/nakama_stack.py route --directory /opt/nakama --ip 10.4.0.4
+```
+
+`route` derives the hostname from `GAMEFLEET_SERVICE_URL`, validates the literal unicast address and atomically updates only the two mapping fields in `.env`. Compose applies the mapping with `extra_hosts`; host `/etc/hosts` is not inherited by containers. `validate` rejects partial mappings and hostname mismatches. Use `route --directory /opt/nakama --clear` to return to normal container DNS. Recreate Nakama after either change. This changes routing only: server certificate SAN verification and mutual TLS remain required. Verify reachability from the running container before declaring the deployment ready.
+
 Install the platform-issued CA certificate, client certificate and client private key as root-owned regular files with mode `0400`, at the configured `GAMEFLEET_CA_SOURCE`, `GAMEFLEET_CERT_SOURCE` and `GAMEFLEET_TLS_KEY_SOURCE` paths. Defaults are `private/gamefleet-ca.crt`, `private/gamefleet-client.crt`, and `private/gamefleet-client.key`. The service template maps these to `/run/secrets/gamefleet-ca.crt`, `/run/secrets/gamefleet-client.crt`, and `/run/secrets/gamefleet-client.key`. Never copy the platform CA signing key to Nakama.
 
 For rotation, obtain new leaves from the same trusted authority before expiry, replace the host leaf files atomically, then recreate the Nakama container and verify its authenticated service preflight and player flows. A CA change requires coordinated trust overlap and validation. `init` never generates a substitute for owner-issued service identities. An enabled archive reader has its own three `GAMEFLEET_ARCHIVE_*_SOURCE` files and explicit `_CA_FILE`, `_CERT_FILE`, `_TLS_KEY_FILE` targets; it never inherits the active identity.

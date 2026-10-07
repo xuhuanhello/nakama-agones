@@ -34,6 +34,9 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    # Empty route settings leave normal business DNS untouched.
+    extra_hosts:
+      - "${GAMEFLEET_SERVICE_HOST:-localhost}=${GAMEFLEET_SERVICE_HOST_IP:-127.0.0.1}"
     env_file:
       - path: ${GAMEFLEET_SERVICE_ENV_FILE:-./private/gamefleet-service.env}
         required: true

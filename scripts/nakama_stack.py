@@ -12,6 +12,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 from urllib.parse import urlsplit
 
 
@@ -191,6 +192,72 @@ def _validate_private_endpoint(url: str) -> None:
         raise ConfigError("GAMEFLEET_SERVICE_URL must be an HTTPS business origin")
 
 
+def _route_host(url: str) -> str:
+    _validate_private_endpoint(url)
+    hostname = urlsplit(url).hostname or ""
+    if len(hostname) > 253 or not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?", hostname):
+        raise ConfigError("business route requires a DNS hostname")
+    if any(not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label) for label in hostname.split(".")):
+        raise ConfigError("business route requires a DNS hostname")
+    try:
+        ipaddress.ip_address(hostname)
+    except ValueError:
+        return hostname.lower()
+    raise ConfigError("business route requires a DNS hostname, not an IP URL")
+
+
+def _route_ip(value: str) -> str:
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        raise ConfigError("business route IP must be a literal unicast address") from None
+    if address.is_loopback or address.is_unspecified or address.is_multicast or address.is_link_local or "%" in value:
+        raise ConfigError("business route IP must be a reachable unicast address")
+    return str(address)
+
+
+def _validate_route(env: dict[str, str], url: str) -> None:
+    host, address = env.get("GAMEFLEET_SERVICE_HOST", ""), env.get("GAMEFLEET_SERVICE_HOST_IP", "")
+    if not host and not address:
+        return
+    if not host or not address or host != _route_host(url):
+        raise ConfigError("business route hostname must exactly match GAMEFLEET_SERVICE_URL")
+    _route_ip(address)
+
+
+def command_route(args: argparse.Namespace) -> int:
+    if os.geteuid() != 0:
+        raise ConfigError("run route with sudo to update the root-owned stack settings")
+    root = args.directory.expanduser().resolve(strict=True)
+    path = _private_file(root, {"env": ".env"}, "stack settings", "env")
+    env = _read_env(path)
+    changes = {"GAMEFLEET_SERVICE_HOST": "", "GAMEFLEET_SERVICE_HOST_IP": ""}
+    if not args.clear:
+        service_path = Path(env.get("GAMEFLEET_SERVICE_ENV_FILE", "./private/gamefleet-service.env"))
+        if not service_path.is_absolute():
+            service_path = root / service_path
+        service = _read_env(service_path)
+        changes = {"GAMEFLEET_SERVICE_HOST": _route_host(service.get("GAMEFLEET_SERVICE_URL", "")),
+                   "GAMEFLEET_SERVICE_HOST_IP": _route_ip(args.ip)}
+    # Preserve all unrelated settings/comments and never print their contents.
+    lines = [line for line in path.read_text().splitlines() if line.split("=", 1)[0].strip() not in changes]
+    lines.extend(key + "=" + value for key, value in changes.items())
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", dir=root, prefix=".route-", delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write("\n".join(lines) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, path.stat().st_mode & 0o777)
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+    print("Business hostname mapping updated. Recreate Nakama to apply it; TLS hostname validation is unchanged.")
+    return 0
+
+
 def _validate_application_env(root: Path, path_value: str, caddy_ipv4: str) -> None:
     if not path_value:
         raise ConfigError("APPLICATION_ENV_FILE is required; use an empty/nonsecret optional file if the image has no extra env")
@@ -233,6 +300,7 @@ def validate_project(root: Path, *, check_image: bool = True, compose_config: bo
     if missing:
         raise ConfigError("all seven GAMEFLEET_SERVICE settings are required; missing: " + ", ".join(missing))
     _validate_private_endpoint(service_env["GAMEFLEET_SERVICE_URL"])
+    _validate_route(env, service_env["GAMEFLEET_SERVICE_URL"])
     for suffix, target in (("CA_FILE", "gamefleet-ca.crt"), ("CERT_FILE", "gamefleet-client.crt"), ("TLS_KEY_FILE", "gamefleet-client.key")):
         if service_env.get("GAMEFLEET_SERVICE_" + suffix) != "/run/secrets/" + target:
             raise ConfigError("TLS files must use the read-only Compose secret targets")
@@ -423,6 +491,13 @@ def make_parser() -> argparse.ArgumentParser:
         command.add_argument("--skip-image-check", action="store_true", help="skip the local Docker image and module check")
         command.add_argument("--skip-compose-config", action="store_true", help="skip docker compose config --quiet")
         command.set_defaults(run=runner)
+
+    route = commands.add_parser("route", help="pin the configured business DNS hostname to an explicit IP, or restore DNS")
+    route.add_argument("--directory", type=Path, default=DEFAULT_DIR)
+    choice = route.add_mutually_exclusive_group(required=True)
+    choice.add_argument("--ip")
+    choice.add_argument("--clear", action="store_true")
+    route.set_defaults(run=command_route)
 
     status = commands.add_parser("status", help="count local input files without probing deployment state")
     status.add_argument("--directory", type=Path, default=DEFAULT_DIR)

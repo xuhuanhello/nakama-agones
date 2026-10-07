@@ -98,6 +98,36 @@ class NakamaStackTests(unittest.TestCase):
         with patch.object(Path, "lstat", synthetic_root_owned):
             return stack.validate_project(self.root, compose_config=compose_config, **kwargs)
 
+    def test_route_derives_hostname_and_preserves_unrelated_settings(self):
+        before = stack._read_env(self.env)
+        with patch.object(stack.os, "geteuid", return_value=0), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(stack.main(["route", "--directory", str(self.root), "--ip", "10.4.0.4"]), 0)
+        after = stack._read_env(self.env)
+        self.assertEqual(after["GAMEFLEET_SERVICE_HOST"], "business.example.net")
+        self.assertEqual(after["GAMEFLEET_SERVICE_HOST_IP"], "10.4.0.4")
+        for key, value in before.items():
+            if key not in ("GAMEFLEET_SERVICE_HOST", "GAMEFLEET_SERVICE_HOST_IP"):
+                self.assertEqual(after[key], value)
+        self.validate(check_image=False, compose_config=True)
+        with patch.object(stack.os, "geteuid", return_value=0), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(stack.main(["route", "--directory", str(self.root), "--clear"]), 0)
+        self.validate(check_image=False)
+        self.assertEqual(stack._read_env(self.env)["GAMEFLEET_SERVICE_HOST"], "")
+
+    def test_route_rejects_ambiguous_hosts_and_unusable_ips(self):
+        for value in ("127.0.0.1", "0.0.0.0", "224.0.0.1", "169.254.1.1", "::1", "fe80::1%en0", "host.example.net", "10.4.0.4,other=1.2.3.4"):
+            with self.subTest(ip=value), self.assertRaises(stack.ConfigError):
+                stack._route_ip(value)
+        for value in ("http://business.test", "https://127.0.0.1", "https://a..test", "https://-bad.test", "https://a.test/path"):
+            with self.subTest(url=value), self.assertRaises(stack.ConfigError):
+                stack._route_host(value)
+        self._update_env({"GAMEFLEET_SERVICE_HOST": "other.test", "GAMEFLEET_SERVICE_HOST_IP": "10.4.0.4"})
+        with self.assertRaisesRegex(stack.ConfigError, "exactly match"):
+            self.validate(check_image=False)
+        self._update_env({"GAMEFLEET_SERVICE_HOST": "", "GAMEFLEET_SERVICE_HOST_IP": "10.4.0.4"})
+        with self.assertRaisesRegex(stack.ConfigError, "exactly match"):
+            self.validate(check_image=False)
+
     def test_init_creates_secret_free_template_and_private_random_secrets(self):
         output = io.StringIO()
         error = io.StringIO()
