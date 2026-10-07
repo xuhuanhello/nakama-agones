@@ -20,14 +20,33 @@ The remote platform must expose only `/business/v1/*` on its dedicated mTLS HTTP
 
 ## Create the host project
 
-Obtain the source and pin the exact revision on the Nakama VPS. The working branch below contains this deployment entry; record the printed commit in your deployment record. For a selected release, checkout its reviewed commit instead.
+This repository is private; anonymous cloning on a blank VPS will fail. Export the reviewed commit on an authenticated development machine and deliver a Git bundle over an authenticated channel. Do not install a personal GitHub token on the VPS or require a particular branch.
+
+On the development machine, set `REVIEWED_COMMIT` to the reviewed full commit ID. Use a new output directory:
 
 ```sh
-sudo git clone --branch codex/self-service-bootstrap https://github.com/xuhuanhello/nakama-agones.git /opt/nakama-source
-cd /opt/nakama-source
-git rev-parse HEAD
-sudo git checkout --detach "$(git rev-parse HEAD)"
+REVIEWED_COMMIT=REPLACE_WITH_REVIEWED_FULL_COMMIT_ID
+git cat-file -e "$REVIEWED_COMMIT^{commit}"
+EXPORT_DIR=$(mktemp -d)
+EXPORT_REF="refs/heads/deployment-bundle-$REVIEWED_COMMIT"
+git update-ref "$EXPORT_REF" "$REVIEWED_COMMIT" ""
+git bundle create "$EXPORT_DIR/nakama-source.bundle" "$EXPORT_REF"
+git update-ref -d "$EXPORT_REF" "$REVIEWED_COMMIT"
+printf '%s\n' "$REVIEWED_COMMIT" > "$EXPORT_DIR/reviewed-commit.txt"
+(cd "$EXPORT_DIR" && shasum -a 256 nakama-source.bundle > nakama-source.bundle.sha256)
 ```
+
+Record the commit ID and SHA256 in the deployment record. Transfer those three files securely to the VPS, for example with `scp` using an independently verified host key. Verify the expected checksum against that trusted record; a checksum delivered with a bundle alone does not authenticate its source. In the received directory on the VPS:
+
+```sh
+sha256sum -c nakama-source.bundle.sha256
+REVIEWED_COMMIT=$(cat reviewed-commit.txt)
+sudo git clone --no-checkout ./nakama-source.bundle /opt/nakama-source
+sudo git -C /opt/nakama-source checkout --detach "$REVIEWED_COMMIT"
+test "$(sudo git -C /opt/nakama-source rev-parse HEAD)" = "$REVIEWED_COMMIT"
+```
+
+Use a fresh `/opt/nakama-source`; do not overwrite another checkout. The bundle contains committed source and its reachable history, not uncommitted local changes or development credentials.
 
 Run initialization, validation, and Compose with host administrator privileges. The stack directory and private credential files belong to root:
 
