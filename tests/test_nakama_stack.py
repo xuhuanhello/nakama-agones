@@ -82,6 +82,21 @@ class NakamaStackTests(unittest.TestCase):
         self.service_env.write_text("\n".join(f"{key}={value}" for key, value in values.items()) + "\n", encoding="utf-8")
         self.service_env.chmod(0o600)
 
+    def _root_owned_stat(self, files=()):
+        original_lstat = Path.lstat
+        root_owned_paths = {self.root.resolve(), (self.root / "deploy").resolve()}
+        root_owned_paths.update(Path(path).resolve() for path in files)
+
+        def synthetic_root_owned(path, *args, **kwargs):
+            info = original_lstat(path, *args, **kwargs)
+            if Path(path).resolve() in root_owned_paths:
+                fields = {name: getattr(info, name) for name in dir(info) if name.startswith("st_")}
+                fields["st_uid"] = 0
+                return SimpleNamespace(**fields)
+            return info
+
+        return synthetic_root_owned
+
     def validate(self, **kwargs):
         original = Path.lstat
         compose_config = kwargs.pop("compose_config", False)
@@ -196,6 +211,151 @@ class NakamaStackTests(unittest.TestCase):
             self.assertEqual(stack.main(["validate", "--directory", str(self.root), "--skip-image-check"]), 0)
         self.assertNotIn(contact, stdout.getvalue())
         self.assertNotIn(contact, stderr.getvalue())
+
+    def test_validate_gateway_runs_only_an_isolated_pinned_caddy_container(self):
+        candidate = self.root / "deploy" / "Caddyfile.candidate"
+        candidate.write_text("{$NAKAMA_DOMAIN} {}\n", encoding="utf-8")
+        candidate.chmod(0o600)
+        contact = "ops@acme-check.io"
+        caddy_env = {"ACME_EMAIL": contact, "NAKAMA_DOMAIN": "pool.example.net",
+                     "CADDY_IMAGE": f"docker.io/library/caddy:2.11.4-alpine@{DIGEST}"}
+        observed = {}
+
+        def fake_run(command, **kwargs):
+            observed["command"] = command
+            observed["kwargs"] = kwargs
+            return subprocess.CompletedProcess(command, 0, stdout=f"validated {contact}", stderr=f"contact {contact}")
+
+        output, error = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(error), \
+             patch.object(stack.os, "geteuid", return_value=0), \
+             patch.object(stack, "validate_project", return_value=caddy_env) as validate, \
+             patch.object(stack.Path, "lstat", self._root_owned_stat([candidate])), \
+             patch.object(stack.subprocess, "run", side_effect=fake_run), \
+             patch.dict(os.environ, {"UNRELATED_SYNTHETIC_SECRET": "do-not-pass"}):
+            self.assertEqual(stack.main(["validate-gateway", "--directory", str(self.root), "--caddyfile", str(candidate)]), 0, error.getvalue())
+
+        validate.assert_called_once_with(self.root.resolve(), check_image=False, compose_config=True)
+        command = observed["command"]
+        joined = " ".join(command)
+        for required in ("unix:///var/run/docker.sock", "run", "--rm", "--pull=never", "--network=none",
+                         "--read-only", "--platform", "linux/amd64", "--tmpfs", "--mount", "--env", "NAKAMA_DOMAIN",
+                         "ACME_EMAIL", "--entrypoint", "caddy", caddy_env["CADDY_IMAGE"], "validate", "/etc/caddy/Caddyfile"):
+            self.assertIn(required, command if required != "/etc/caddy/Caddyfile" else joined)
+        self.assertEqual(command.count("--mount"), 1)
+        mount = command[command.index("--mount") + 1]
+        self.assertEqual(mount, f"type=bind,src={candidate.resolve()},dst=/etc/caddy/Caddyfile,readonly")
+        self.assertIn("/data:rw,nosuid,nodev,noexec,size=16m", command)
+        self.assertIn("/config:rw,nosuid,nodev,noexec,size=16m", command)
+        self.assertIn("/tmp:rw,nosuid,nodev,noexec,size=16m", command)
+        self.assertNotIn(contact, command)
+        self.assertNotIn(caddy_env["NAKAMA_DOMAIN"], command)
+        self.assertNotIn("--publish", command)
+        self.assertNotIn("-p", command)
+        run_env = observed["kwargs"]["env"]
+        self.assertEqual(set(run_env), {"PATH", "DOCKER_CONFIG", "NAKAMA_DOMAIN", "ACME_EMAIL"})
+        self.assertEqual(run_env["ACME_EMAIL"], contact)
+        self.assertEqual(run_env["NAKAMA_DOMAIN"], caddy_env["NAKAMA_DOMAIN"])
+        self.assertNotIn("UNRELATED_SYNTHETIC_SECRET", run_env)
+        self.assertNotIn("do-not-pass", run_env.values())
+        self.assertTrue(observed["kwargs"]["capture_output"])
+        self.assertTrue(observed["kwargs"]["text"])
+        self.assertEqual(observed["kwargs"]["timeout"], 30)
+        self.assertIn("isolated pinned-image container", output.getvalue())
+        self.assertNotIn(contact, output.getvalue() + error.getvalue())
+        self.assertNotIn(f"validated {contact}", output.getvalue())
+        self.assertFalse(Path(run_env["DOCKER_CONFIG"]).exists())
+
+    def test_validate_gateway_failure_discards_caddy_diagnostics(self):
+        caddyfile = self.root / "deploy" / "Caddyfile"
+        contact = "ops@acme-check.io"
+        caddy_env = {"ACME_EMAIL": contact, "NAKAMA_DOMAIN": "pool.example.net",
+                     "CADDY_IMAGE": f"docker.io/library/caddy:2.11.4-alpine@{DIGEST}"}
+
+        output, error = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(error), \
+             patch.object(stack.os, "geteuid", return_value=0), \
+             patch.object(stack, "validate_project", return_value=caddy_env), \
+             patch.object(stack.Path, "lstat", self._root_owned_stat([caddyfile])), \
+             patch.object(stack.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, contact, contact)):
+            self.assertEqual(stack.main(["validate-gateway", "--directory", str(self.root)]), 2)
+
+        self.assertIn("Caddy gateway configuration failed isolated validation", error.getvalue())
+        self.assertNotIn(contact, output.getvalue() + error.getvalue())
+        self.assertNotIn("validated", output.getvalue())
+
+    def test_validate_gateway_container_start_failure_is_distinct_and_redacted(self):
+        caddyfile = self.root / "deploy" / "Caddyfile"
+        contact = "ops@acme-check.io"
+        caddy_env = {"ACME_EMAIL": contact, "NAKAMA_DOMAIN": "pool.example.net",
+                     "CADDY_IMAGE": f"docker.io/library/caddy:2.11.4-alpine@{DIGEST}"}
+
+        output, error = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(error), \
+             patch.object(stack.os, "geteuid", return_value=0), \
+             patch.object(stack, "validate_project", return_value=caddy_env), \
+             patch.object(stack.Path, "lstat", self._root_owned_stat([caddyfile])), \
+             patch.object(stack.subprocess, "run", return_value=subprocess.CompletedProcess([], 125, contact, contact)):
+            self.assertEqual(stack.main(["validate-gateway", "--directory", str(self.root)]), 2)
+
+        self.assertIn("validation container could not start", error.getvalue())
+        self.assertNotIn(contact, output.getvalue() + error.getvalue())
+        self.assertNotIn("validated", output.getvalue())
+
+    def test_validate_gateway_timeout_attempts_local_container_cleanup(self):
+        caddyfile = self.root / "deploy" / "Caddyfile"
+        contact = "ops@acme-check.io"
+        caddy_env = {"ACME_EMAIL": contact, "NAKAMA_DOMAIN": "pool.example.net",
+                     "CADDY_IMAGE": f"docker.io/library/caddy:2.11.4-alpine@{DIGEST}"}
+        error = io.StringIO()
+        timed_out = subprocess.TimeoutExpired(["docker"], 30)
+        cleanup_result = subprocess.CompletedProcess(["docker"], 0, "", "")
+        with contextlib.redirect_stderr(error), patch.object(stack.os, "geteuid", return_value=0), \
+             patch.object(stack, "validate_project", return_value=caddy_env), \
+             patch.object(stack.Path, "lstat", self._root_owned_stat([caddyfile])), \
+             patch.object(stack.subprocess, "run", side_effect=[timed_out, cleanup_result]) as run:
+            self.assertEqual(stack.main(["validate-gateway", "--directory", str(self.root)]), 2)
+
+        self.assertIn("gateway validation timed out", error.getvalue())
+        self.assertNotIn(contact, error.getvalue())
+        self.assertEqual(run.call_count, 2)
+        command = run.call_args_list[0].args[0]
+        cleanup = run.call_args_list[1].args[0]
+        cleanup_env = run.call_args_list[1].kwargs["env"]
+        self.assertIn("--network=none", command)
+        self.assertIn("--name", command)
+        self.assertEqual(cleanup[-2:], ["--force", command[command.index("--name") + 1]])
+        self.assertNotIn(contact, command + cleanup)
+        self.assertNotIn(caddy_env["NAKAMA_DOMAIN"], command + cleanup)
+        self.assertEqual(set(cleanup_env), {"PATH", "DOCKER_CONFIG"})
+
+    def test_validate_gateway_rejects_symlink_candidate_before_container_start(self):
+        candidate = self.root / "deploy" / "Caddyfile.symlink"
+        candidate.symlink_to(self.root / "deploy" / "Caddyfile")
+        caddy_env = {"ACME_EMAIL": "ops@acme-check.io", "NAKAMA_DOMAIN": "pool.example.net",
+                     "CADDY_IMAGE": f"docker.io/library/caddy:2.11.4-alpine@{DIGEST}"}
+        error = io.StringIO()
+        with contextlib.redirect_stderr(error), patch.object(stack.os, "geteuid", return_value=0), \
+             patch.object(stack, "validate_project", return_value=caddy_env), \
+             patch.object(stack.subprocess, "run") as run:
+            self.assertEqual(stack.main(["validate-gateway", "--directory", str(self.root), "--caddyfile", str(candidate)]), 2)
+        run.assert_not_called()
+        self.assertIn("Caddyfile", error.getvalue())
+
+    def test_validate_gateway_rejects_group_or_world_writable_candidate(self):
+        candidate = self.root / "deploy" / "Caddyfile.writable"
+        candidate.write_text("{$NAKAMA_DOMAIN} {}\n", encoding="utf-8")
+        candidate.chmod(0o666)
+        caddy_env = {"ACME_EMAIL": "ops@acme-check.io", "NAKAMA_DOMAIN": "pool.example.net",
+                     "CADDY_IMAGE": f"docker.io/library/caddy:2.11.4-alpine@{DIGEST}"}
+        error = io.StringIO()
+        with contextlib.redirect_stderr(error), patch.object(stack.os, "geteuid", return_value=0), \
+             patch.object(stack, "validate_project", return_value=caddy_env), \
+             patch.object(stack.Path, "lstat", self._root_owned_stat([candidate])), \
+             patch.object(stack.subprocess, "run") as run:
+            self.assertEqual(stack.main(["validate-gateway", "--directory", str(self.root), "--caddyfile", str(candidate)]), 2)
+        run.assert_not_called()
+        self.assertIn("not writable by group or others", error.getvalue())
 
     def test_loopback_network_ssh_and_digest_inputs_are_strict(self):
         for bad_url in ("http://gamefleet.example.net:17682", "http://127.0.0.1:17682",

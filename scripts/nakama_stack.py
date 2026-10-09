@@ -459,6 +459,106 @@ def _check_runtime_image(image: str, modules: list[str]) -> None:
         raise ConfigError("runtime image is missing agones.so or a configured required module") from None
 
 
+def _gateway_caddyfile(root: Path, requested: Path | None, requested_root: Path) -> Path:
+    path = Path("deploy/Caddyfile") if requested is None else requested
+    if path.is_absolute():
+        absolute = Path(os.path.abspath(path))
+        roots = (Path(os.path.abspath(requested_root)), root)
+        for candidate_root in roots:
+            try:
+                path = absolute.relative_to(candidate_root)
+                break
+            except ValueError:
+                continue
+        else:
+            raise ConfigError("Caddyfile must be located inside the stack directory")
+    path = root / path
+    try:
+        lexical = Path(os.path.abspath(path))
+        relative = lexical.relative_to(root)
+        if not relative.parts:
+            raise ValueError("Caddyfile path names the stack directory")
+        directory = root
+        directory_info = directory.lstat()
+        if (stat.S_ISLNK(directory_info.st_mode) or not stat.S_ISDIR(directory_info.st_mode)
+                or directory_info.st_uid != 0 or (directory_info.st_mode & 0o022) != 0):
+            raise ValueError("unsafe stack directory")
+        for component in relative.parts[:-1]:
+            directory = directory / component
+            directory_info = directory.lstat()
+            if (stat.S_ISLNK(directory_info.st_mode) or not stat.S_ISDIR(directory_info.st_mode)
+                    or directory_info.st_uid != 0 or (directory_info.st_mode & 0o022) != 0):
+                raise ValueError("unsafe Caddyfile directory")
+        path = directory / relative.parts[-1]
+        info = path.lstat()
+        resolved = path.resolve(strict=True)
+        resolved.relative_to(root)
+    except (OSError, ValueError):
+        raise ConfigError("Caddyfile path must use root-owned, non-symlink directories inside the stack directory") from None
+    if (stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or info.st_uid != 0
+            or (info.st_mode & 0o022) != 0):
+        raise ConfigError("Caddyfile must be a root-owned non-symlink regular file, not writable by group or others")
+    if "," in str(resolved) or any(ord(char) < 0x20 for char in str(resolved)):
+        raise ConfigError("Caddyfile path cannot be represented safely as a Docker bind mount")
+    return resolved
+
+
+def _run_gateway_validation(root: Path, caddyfile: Path, env: dict[str, str]) -> None:
+    image = env["CADDY_IMAGE"]
+    container_name = "nakama-caddy-validate-" + secrets.token_hex(12)
+    docker_env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                  "NAKAMA_DOMAIN": env["NAKAMA_DOMAIN"], "ACME_EMAIL": env["ACME_EMAIL"]}
+    with tempfile.TemporaryDirectory(prefix="nakama-caddy-validate-") as docker_config:
+        docker_env["DOCKER_CONFIG"] = docker_config
+        command = [
+            "docker", "--host", "unix:///var/run/docker.sock", "run",
+            "--rm", "--pull=never", "--network=none", "--read-only", "--platform", "linux/amd64",
+            "--tmpfs", "/data:rw,nosuid,nodev,noexec,size=16m",
+            "--tmpfs", "/config:rw,nosuid,nodev,noexec,size=16m",
+            "--tmpfs", "/tmp:rw,nosuid,nodev,noexec,size=16m",
+            "--name", container_name,
+            "--mount", f"type=bind,src={caddyfile},dst=/etc/caddy/Caddyfile,readonly",
+            "--env", "NAKAMA_DOMAIN", "--env", "ACME_EMAIL",
+            "--entrypoint", "caddy", image,
+            "validate", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile",
+        ]
+        try:
+            result = subprocess.run(command, cwd=root, env=docker_env, capture_output=True, text=True,
+                                    check=False, timeout=30)
+        except subprocess.TimeoutExpired:
+            cleanup = ["docker", "--host", "unix:///var/run/docker.sock", "rm", "--force", container_name]
+            cleanup_env = {"PATH": docker_env["PATH"], "DOCKER_CONFIG": docker_config}
+            try:
+                subprocess.run(cleanup, cwd=root, env=cleanup_env, capture_output=True, text=True,
+                               check=False, timeout=10)
+            except (OSError, subprocess.SubprocessError):
+                pass
+            raise ConfigError("isolated Caddy gateway validation timed out") from None
+        except OSError:
+            raise ConfigError("could not start isolated Caddy validation with the pinned local image") from None
+    if result.returncode == 125:
+        raise ConfigError("isolated Caddy validation container could not start; check local Docker and pinned image availability")
+    if result.returncode in (126, 127):
+        raise ConfigError("pinned Caddy validation executable could not run")
+    if result.returncode != 0:
+        # Caddy diagnostics may contain expanded environment values; never re-emit them.
+        raise ConfigError("Caddy gateway configuration failed isolated validation")
+
+
+def command_validate_gateway(args: argparse.Namespace) -> int:
+    if os.geteuid() != 0:
+        raise ConfigError("run validate-gateway with sudo to inspect root-owned files and use the local Docker daemon")
+    try:
+        root = args.directory.expanduser().resolve(strict=True)
+    except OSError:
+        raise ConfigError("project directory does not exist") from None
+    env = validate_project(root, check_image=False, compose_config=True)
+    caddyfile = _gateway_caddyfile(root, args.caddyfile, args.directory.expanduser())
+    _run_gateway_validation(root, caddyfile, env)
+    print("Caddy gateway configuration validated in an isolated pinned-image container; no application service was started.")
+    return 0
+
+
 def command_validate(args: argparse.Namespace) -> int:
     if os.geteuid() != 0:
         raise ConfigError("run validate with sudo so it can inspect root-owned private files and the Docker image")
@@ -520,6 +620,11 @@ def make_parser() -> argparse.ArgumentParser:
         command.add_argument("--skip-image-check", action="store_true", help="skip the local Docker image and module check")
         command.add_argument("--skip-compose-config", action="store_true", help="skip docker compose config --quiet")
         command.set_defaults(run=runner)
+
+    validate_gateway = commands.add_parser("validate-gateway", help="validate a Caddyfile in an isolated no-network container")
+    validate_gateway.add_argument("--directory", type=Path, default=DEFAULT_DIR)
+    validate_gateway.add_argument("--caddyfile", type=Path, help="validate a candidate Caddyfile under the stack directory")
+    validate_gateway.set_defaults(run=command_validate_gateway)
 
     route = commands.add_parser("route", help="pin the configured business DNS hostname to an explicit IP, or restore DNS")
     route.add_argument("--directory", type=Path, default=DEFAULT_DIR)

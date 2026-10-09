@@ -3,7 +3,7 @@
 
 This is the currently implemented Nakama deployment path: a full Compose stack with PostgreSQL, the complete application Nakama image, an HTTPS gateway, and direct mutually authenticated HTTPS to the dedicated GameFleet Business endpoint. The commands prepare and run the Nakama host. They do not install or modify the separate GameFleet platform.
 
-The helper never receives a password argument. It generates local database and Nakama keys without printing them, validates file permissions from metadata, checks a local image and module files, and runs Compose's quiet model validation. It does not SSH, publish an image, start containers, or claim remote health.
+The helper never receives a password argument. It generates local database and Nakama keys without printing them, validates file permissions from metadata, checks a local image and module files, and runs Compose's quiet model validation. It can run disposable image-check and gateway-validation containers with no network. It does not SSH, publish an image, start application services, or claim remote health.
 
 ## Requirements and owner-provided inputs
 
@@ -139,9 +139,12 @@ sudo docker compose --env-file /opt/nakama/.env --project-directory /opt/nakama 
   -f /opt/nakama/compose.yaml config --quiet
 sudo docker compose --env-file /opt/nakama/.env --project-directory /opt/nakama \
   -f /opt/nakama/compose.yaml pull postgres caddy
+sudo python3 /opt/nakama-source/scripts/nakama_stack.py validate-gateway --directory /opt/nakama
 sudo docker compose --env-file /opt/nakama/.env --project-directory /opt/nakama \
   -f /opt/nakama/compose.yaml up -d
 ```
+
+`validate-gateway` runs after the pinned Caddy image is present and before `up`. It validates the stack and Compose model, then starts one disposable Caddy validation container through the local Docker socket with no network, a read-only root filesystem, temporary `/data`, `/config`, and `/tmp`, and only the Caddyfile bind-mounted read-only. Only `NAKAMA_DOMAIN` and `ACME_EMAIL` are passed into that container; it does not mount production Caddy data or business credentials, open a listener, or start an application service. Caddy diagnostics are suppressed so expanded contact values are not printed. To validate a staged candidate under the stack directory, pass `--caddyfile /opt/nakama/deploy/Caddyfile.next`; the command never edits it. A nonzero result is a validation failure and must stop the deployment sequence.
 
 This `up` command is the deployment action. The helper has no `apply`, remote SSH, or public-registry push command. The Nakama entrypoint runs database migrations and starts the server; plugin initialization performs real authenticated HTTPS search and History scope checks before registering player hooks.
 
@@ -160,14 +163,12 @@ sudo mv -f /opt/nakama/deploy/Caddyfile.next /opt/nakama/deploy/Caddyfile
 sudo python3 /opt/nakama-source-next/scripts/nakama_stack.py validate --directory /opt/nakama
 sudo docker compose --env-file /opt/nakama/.env --project-directory /opt/nakama \
   -f /opt/nakama/compose.yaml config --quiet
-sudo docker compose --env-file /opt/nakama/.env --project-directory /opt/nakama \
-  -f /opt/nakama/compose.yaml run --rm --no-deps --entrypoint caddy caddy \
-  validate --config /etc/caddy/Caddyfile --adapter caddyfile
+sudo python3 /opt/nakama-source-next/scripts/nakama_stack.py validate-gateway --directory /opt/nakama
 sudo docker compose --env-file /opt/nakama/.env --project-directory /opt/nakama \
   -f /opt/nakama/compose.yaml up -d --no-deps --force-recreate caddy
 ```
 
-Stop at any failed validation; do not continue to container recreation. Preserve the backup directory path in the private deployment record. To roll back these configuration changes, restore `.env`, `compose.yaml`, and `Caddyfile` from that directory, run Compose quiet validation and Caddy validation again, then recreate only Caddy with the restored configuration. Check the public HTTPS health endpoint with normal certificate verification after either operation; never use `-k` to make this check pass. This update does not change PostgreSQL or Nakama private keys.
+Stop at any failed validation; do not continue to container recreation. Preserve the backup directory path in the private deployment record. To roll back these configuration changes, restore `.env`, `compose.yaml`, and `Caddyfile` from that directory and use the recorded previous source release to validate its matching configuration. Do not validate a restored configuration against a different release's required-field schema. Run Compose quiet validation and the gateway checks supported by that recorded release, then recreate only Caddy with the restored configuration. Check the public HTTPS health endpoint with normal certificate verification after either operation; never use `-k` to make this check pass. This update does not change PostgreSQL or Nakama private keys.
 
 Because Caddyfile is a read-only single-file bind mount, recreate only the gateway after validation so it reads the new file; this setting does not require a Nakama restart. Keep the Caddy data volume so its existing ACME state and renewal history remain available. The email is contact metadata, not evidence that a certificate notification was delivered or that renewal monitoring is working.
 
