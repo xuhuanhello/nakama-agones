@@ -20,9 +20,18 @@ The remote platform must expose only `/business/v1/*` on its dedicated mTLS HTTP
 
 ## Create the host project
 
-This repository is private; anonymous cloning on a blank VPS will fail. Export the reviewed commit on an authenticated development machine and deliver a Git bundle over an authenticated channel. Do not install a personal GitHub token on the VPS or require a particular branch.
+Obtain the reviewed immutable commit before initializing the host. For a publicly readable repository, clone its HTTPS URL and check out that exact commit; repository visibility is an environment property, not a deployment assumption. For a private repository, or when using an authenticated offline source delivery, export the reviewed commit on a trusted development machine and deliver the Git bundle below over an authenticated channel. Do not install a personal GitHub token on the VPS or require a particular branch. Both paths must verify the full commit ID before running the helper.
 
-On the development machine, set `REVIEWED_COMMIT` to the reviewed full commit ID. Use a new output directory:
+For public HTTPS source delivery, run on the VPS with the reviewed full commit ID:
+
+```sh
+REVIEWED_COMMIT=REPLACE_WITH_REVIEWED_FULL_COMMIT_ID
+sudo git clone --no-checkout https://github.com/xuhuanhello/nakama-agones.git /opt/nakama-source
+sudo git -C /opt/nakama-source checkout --detach "$REVIEWED_COMMIT"
+test "$(sudo git -C /opt/nakama-source rev-parse HEAD)" = "$REVIEWED_COMMIT"
+```
+
+Choose one source-delivery path, not both. For authenticated bundle delivery, on the development machine set `REVIEWED_COMMIT` to the reviewed full commit ID. Use a new output directory:
 
 ```sh
 REVIEWED_COMMIT=REPLACE_WITH_REVIEWED_FULL_COMMIT_ID
@@ -81,7 +90,9 @@ Set `NAKAMA_RUNTIME_IMAGE` to either:
 
 Set `APPLICATION_REQUIRED_MODULES=account.so` for Fixed account login. Leave it empty only if the application genuinely has no extra required module. `nakama_stack.py validate` checks each filename against the image without network access, and Compose uses `pull_policy: never` for the application so it cannot silently replace a local image. For a registry image, pull the exact digest explicitly before validation.
 
-Set `NAKAMA_DOMAIN` to the public DNS name. Keep the default Docker networks only if they do not overlap any existing networks or routed VPN ranges; otherwise choose two non-overlapping IPv4 subnets and distinct static frontend addresses. The default Caddy address is `172.29.240.2` and Nakama is `172.29.240.3`.
+Set `NAKAMA_DOMAIN` to the public DNS name and replace the `ACME_EMAIL` template placeholder with an operator-controlled contact address. Caddy uses this address as ACME account contact metadata. It does not change certificate validation, Caddy's automatic HTTPS behavior, or Nakama's private business mTLS. The certificate authority does not promise expiry notices, so this address is not a substitute for monitoring certificate renewal and service health.
+
+Keep the default Docker networks only if they do not overlap any existing networks or routed VPN ranges; otherwise choose two non-overlapping IPv4 subnets and distinct static frontend addresses. The default Caddy address is `172.29.240.2` and Nakama is `172.29.240.3`.
 
 Copy the owner-issued service key to `/opt/nakama/private/gamefleet-service-key`. Set the seven exact service fields in `/opt/nakama/private/gamefleet-service.env`; its in-container key path must remain `/run/secrets/gamefleet-service-key`. Set `GAMEFLEET_SERVICE_URL` to the dedicated HTTPS business origin, using its certificate SAN hostname. Set every identity and profile field to the value provisioned by the GameFleet owner; do not infer values from the image tag. The console label **Nakama 账号来源标识** maps to `GAMEFLEET_SERVICE_IDENTITY_ISSUER`: choose it during first setup, or copy the existing configured value exactly. See the [field explanation, example and mismatch effects](gamefleet-service-runtime.md#account-identity-source).
 
@@ -108,7 +119,7 @@ The empty HistoryService list allows the identity preflight before caller provis
 
 ## Validate and start
 
-First validate the local inputs. The command checks all seven GameFleet fields, source-file type/permissions, exact network addresses, the image identity and required module files, and the Compose model. It does not display resolved env values or key contents:
+First validate the local inputs. The command checks the ACME contact address, all seven GameFleet fields, source-file type/permissions, exact network addresses, the image identity and required module files, and the Compose model. It does not display resolved env values or key contents:
 
 ```sh
 sudo python3 /opt/nakama-source/scripts/nakama_stack.py validate --directory /opt/nakama
@@ -133,6 +144,32 @@ sudo docker compose --env-file /opt/nakama/.env --project-directory /opt/nakama 
 ```
 
 This `up` command is the deployment action. The helper has no `apply`, remote SSH, or public-registry push command. The Nakama entrypoint runs database migrations and starts the server; plugin initialization performs real authenticated HTTPS search and History scope checks before registering player hooks.
+
+For an existing stack, use a separately verified source checkout for the reviewed release and do not rerun `init` or replace `.env` and `private/`. Set `ACME_EMAIL` in the existing `.env`, then update only the Compose and Caddy configuration files. For example, with the verified checkout at `/opt/nakama-source-next`:
+
+```sh
+CONFIG_BACKUP=$(sudo mktemp -d /opt/nakama-config-backup.XXXXXX)
+sudo chmod 0700 "$CONFIG_BACKUP"
+sudo cp -p /opt/nakama/.env /opt/nakama/compose.yaml "$CONFIG_BACKUP/"
+sudo cp -p /opt/nakama/deploy/Caddyfile "$CONFIG_BACKUP/Caddyfile"
+sudoedit /opt/nakama/.env
+sudo install -m 0644 /opt/nakama-source-next/deploy/compose.yaml /opt/nakama/compose.yaml.next
+sudo mv -f /opt/nakama/compose.yaml.next /opt/nakama/compose.yaml
+sudo install -m 0644 /opt/nakama-source-next/deploy/Caddyfile /opt/nakama/deploy/Caddyfile.next
+sudo mv -f /opt/nakama/deploy/Caddyfile.next /opt/nakama/deploy/Caddyfile
+sudo python3 /opt/nakama-source-next/scripts/nakama_stack.py validate --directory /opt/nakama
+sudo docker compose --env-file /opt/nakama/.env --project-directory /opt/nakama \
+  -f /opt/nakama/compose.yaml config --quiet
+sudo docker compose --env-file /opt/nakama/.env --project-directory /opt/nakama \
+  -f /opt/nakama/compose.yaml run --rm --no-deps --entrypoint caddy caddy \
+  validate --config /etc/caddy/Caddyfile --adapter caddyfile
+sudo docker compose --env-file /opt/nakama/.env --project-directory /opt/nakama \
+  -f /opt/nakama/compose.yaml up -d --no-deps --force-recreate caddy
+```
+
+Stop at any failed validation; do not continue to container recreation. Preserve the backup directory path in the private deployment record. To roll back these configuration changes, restore `.env`, `compose.yaml`, and `Caddyfile` from that directory, run Compose quiet validation and Caddy validation again, then recreate only Caddy with the restored configuration. Check the public HTTPS health endpoint with normal certificate verification after either operation; never use `-k` to make this check pass. This update does not change PostgreSQL or Nakama private keys.
+
+Because Caddyfile is a read-only single-file bind mount, recreate only the gateway after validation so it reads the new file; this setting does not require a Nakama restart. Keep the Caddy data volume so its existing ACME state and renewal history remain available. The email is contact metadata, not evidence that a certificate notification was delivered or that renewal monitoring is working.
 
 ## Verify actual operation
 

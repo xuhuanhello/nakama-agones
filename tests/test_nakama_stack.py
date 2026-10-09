@@ -40,6 +40,7 @@ class NakamaStackTests(unittest.TestCase):
         for path in (self.service_key, self.tls_key, self.tls_cert):
             path.chmod(0o400)
         self._update_env({
+            "ACME_EMAIL": "ops@acme-check.io",
             "NAKAMA_DOMAIN": "pool.example.net",
             "NAKAMA_RUNTIME_IMAGE": RUNTIME,
             "POSTGRES_IMAGE": f"docker.io/library/postgres:17.6-bookworm@{DIGEST}",
@@ -167,6 +168,35 @@ class NakamaStackTests(unittest.TestCase):
         with self.assertRaisesRegex(stack.ConfigError, "0400 or 0600"):
             self.validate(check_image=False)
 
+    def test_acme_email_is_required_validated_and_never_echoed(self):
+        self.assertEqual(stack._read_env(stack.ENV_TEMPLATE)["ACME_EMAIL"], "replace_me@example.invalid")
+        self.validate(check_image=False)
+
+        def set_email(value):
+            lines = self.env.read_text(encoding="utf-8").splitlines()
+            replaced = [f"ACME_EMAIL={value}" if line.startswith("ACME_EMAIL=") else line for line in lines]
+            self.env.write_text("\n".join(replaced) + "\n", encoding="utf-8")
+            self.env.chmod(0o600)
+
+        for value in ("", "replace_me@example.invalid", "bad address", "user@host", "a..b@acme-check.io",
+                      "user@-bad.example", "user@example.net", "user@acme-check.test"):
+            with self.subTest(value=value):
+                set_email(value)
+                with self.assertRaises(stack.ConfigError) as caught:
+                    self.validate(check_image=False)
+                if value:
+                    self.assertNotIn(value, str(caught.exception))
+
+        contact = "ops@acme-check.io"
+        set_email(contact)
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr), \
+             patch.object(stack.os, "geteuid", return_value=0), \
+             patch.object(stack, "validate_project", return_value={"_APPLICATION_REQUIRED_MODULES": ""}):
+            self.assertEqual(stack.main(["validate", "--directory", str(self.root), "--skip-image-check"]), 0)
+        self.assertNotIn(contact, stdout.getvalue())
+        self.assertNotIn(contact, stderr.getvalue())
+
     def test_loopback_network_ssh_and_digest_inputs_are_strict(self):
         for bad_url in ("http://gamefleet.example.net:17682", "http://127.0.0.1:17682",
                         "http://127.0.0.1:17683", "http://127.0.0.1:17682/path"):
@@ -263,6 +293,8 @@ class NakamaStackTests(unittest.TestCase):
         self.assertNotIn("cap_add:", compose)
         self.assertIn("header_up -X-DM-Client-IP", caddyfile)
         self.assertIn("header_up X-DM-Client-IP {remote_host}", caddyfile)
+        self.assertIn("ACME_EMAIL: ${ACME_EMAIL:?", compose)
+        self.assertIn("email {$ACME_EMAIL}", caddyfile)
 
 
 if __name__ == "__main__":

@@ -1,3 +1,7 @@
+{
+	email {$ACME_EMAIL}
+}
+
 {$NAKAMA_DOMAIN} {
 	encode zstd gzip
 	reverse_proxy nakama:7350 {

@@ -24,6 +24,9 @@ IMAGE_DIGEST = re.compile(r"[a-z0-9][a-z0-9._:/-]*@sha256:[a-f0-9]{64}\Z")
 LOCAL_IMAGE_ID = re.compile(r"sha256:[a-f0-9]{64}\Z")
 SAFE_VALUE = re.compile(r"[^\s\x00-\x1f\x7f$`\\'\"]+\Z")
 SAFE_MODULE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\.so\Z")
+EMAIL_LOCAL = re.compile(r"[A-Za-z0-9_%+-]+(?:\.[A-Za-z0-9_%+-]+)*\Z")
+EMAIL_DOMAIN_LABEL = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\Z")
+EMAIL_IDN_TLD = re.compile(r"xn--[A-Za-z0-9-]{2,59}\Z")
 SERVICE_KEYS = (
     "GAMEFLEET_SERVICE_URL",
     "GAMEFLEET_SERVICE_KEY_FILE",
@@ -154,6 +157,31 @@ def command_init(args: argparse.Namespace) -> int:
 def _looks_placeholder(value: str) -> bool:
     lowered = value.lower()
     return any(token in lowered for token in ("example.com", "replace_me", "change_me", "your_", "<", ">"))
+
+
+def _validate_acme_email(value: str) -> None:
+    """Validate a single contact address without echoing its value."""
+    if len(value) > 254 or value.count("@") != 1:
+        raise ConfigError("ACME_EMAIL must be a non-placeholder contact email address")
+    local, domain = value.split("@", 1)
+    labels = domain.split(".")
+    lowered_labels = [label.lower() for label in labels]
+    reserved_tlds = {"example", "invalid", "localhost", "local", "test"}
+    tld = labels[-1] if labels else ""
+    valid_tld = (len(tld) >= 2 and tld.isascii() and tld.isalpha()) or EMAIL_IDN_TLD.fullmatch(tld) is not None
+    valid = (
+        1 <= len(local) <= 64
+        and EMAIL_LOCAL.fullmatch(local) is not None
+        and len(domain) <= 253
+        and len(labels) >= 2
+        and all(EMAIL_DOMAIN_LABEL.fullmatch(label) is not None for label in labels)
+        and valid_tld
+        and tld.lower() not in reserved_tlds
+        and "example" not in lowered_labels
+        and local.lower() not in {"replace_me", "change_me", "your_email"}
+    )
+    if not valid:
+        raise ConfigError("ACME_EMAIL must be a non-placeholder contact email address")
 
 
 def _private_file(root: Path, env: dict[str, str], name: str, setting: str, *, allow_empty: bool = False,
@@ -326,11 +354,12 @@ def validate_project(root: Path, *, check_image: bool = True, compose_config: bo
         if service_env.get("GAMEFLEET_ARCHIVE_KEY_FILE") not in ("", "/run/secrets/gamefleet-archive-key"):
             raise ConfigError("archive key path must use the read-only Compose secret target")
 
-    required_env = ("NAKAMA_DOMAIN", "NAKAMA_RUNTIME_IMAGE", "POSTGRES_IMAGE", "CADDY_IMAGE", "FRONTEND_SUBNET", "DATABASE_SUBNET",
+    required_env = ("ACME_EMAIL", "NAKAMA_DOMAIN", "NAKAMA_RUNTIME_IMAGE", "POSTGRES_IMAGE", "CADDY_IMAGE", "FRONTEND_SUBNET", "DATABASE_SUBNET",
                     "CADDY_IPV4", "NAKAMA_IPV4")
     missing_env = [key for key in required_env if not env.get(key, "").strip()]
     if missing_env:
         raise ConfigError("missing .env setting(s): " + ", ".join(missing_env))
+    _validate_acme_email(env["ACME_EMAIL"])
     for name in ("POSTGRES_IMAGE", "CADDY_IMAGE"):
         if not IMAGE_DIGEST.fullmatch(env[name]):
             raise ConfigError(f"{name} must use an immutable OCI sha256 digest")
@@ -435,7 +464,7 @@ def command_validate(args: argparse.Namespace) -> int:
         raise ConfigError("run validate with sudo so it can inspect root-owned private files and the Docker image")
     env = validate_project(args.directory, check_image=not args.skip_image_check,
                            compose_config=not args.skip_compose_config)
-    print("Local stack configuration is valid: GameFleet service mode, seven service fields, and private-file permissions checked.")
+    print("Local stack configuration is valid: ACME contact address, GameFleet service mode, seven service fields, and private-file permissions checked.")
     print("Compose model passed config --quiet; no resolved environment values were printed.")
     if args.skip_image_check:
         print("Runtime image presence and module files were not checked (--skip-image-check).")
