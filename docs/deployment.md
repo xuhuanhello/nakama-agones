@@ -11,7 +11,7 @@ Use a Linux amd64 host with Docker Engine, the Docker Compose plugin, and Python
 
 Before starting, obtain these inputs through the responsible owner systems:
 
-- A GameFleet service identity, its private `gfsvc_` key, exact application/issuer/region/compatibility values, search and match grants, and History routes.
+- Before the first Nakama start, a GameFleet HistoryService identity, its private gfsvc key, and exact application/issuer/region/compatibility values. Its allowedParticipants may be the explicit empty array when no real Nakama account exists yet. Search/match grants and History routes are added after real accounts and a nonempty business caller exist; do not create placeholder or sentinel participants.
 - A reachable dedicated GameFleet HTTPS business origin, its CA certificate, and an owner-issued client certificate/private key. Verify private routing when available; use public mTLS otherwise.
 - A complete Nakama application image from Fixed's `Backend/deploy/account/build.py`. Build it on this Nakama host when using a local image ID, or publish it through your own registry and use the immutable repository digest. The image must contain `/nakama/data/modules/agones.so`; for Fixed account login, it must also contain `/nakama/data/modules/account.so`.
 - A DNS name pointing at the Nakama host. Allow inbound public TCP 80/443 (and UDP 443 only if you want HTTP/3); restrict SSH administration and permit outbound HTTPS only to required endpoints according to your host policy.
@@ -57,7 +57,7 @@ sudo python3 /opt/nakama-source/scripts/nakama_stack.py init --directory /opt/na
 
 `init` copies the complete Compose project to `/opt/nakama`, generates random database and Nakama keys under `private/` with mode `0400`, and creates empty owner-supplied credential placeholders. It refuses to overwrite any existing file. The generated files are local inputs; the stack is not running yet.
 
-The socket server key is shared with clients as Nakama's application key. Fixed currently reads it from the `OnlineClient.gameFleetNakamaServerKey` field in the `Game_Online` scene; its checked-in default is `local-server-key`. Read the generated `private/nakama-socket-server-key` locally and synchronize its value with that Unity component before building a client. Do not place the database password, session keys, runtime HTTP key, or console credentials in the client.
+The socket server key is shared with clients as Nakama's public application connection key. Read the generated `private/nakama-socket-server-key` locally and put that value, the player HTTPS origin, and region into Fixed's ignored release configuration before `Engineering/scripts/online/release.py build-pair`. The build changes only an isolated Unity project copy and emits matching server/client receipts; do not edit the committed source scene for an environment. Do not place database passwords, session keys, runtime HTTP keys, console credentials, or GameFleet business service keys in the client.
 
 ## Configure the image, DNS, networks, and service
 
@@ -83,7 +83,7 @@ Set `APPLICATION_REQUIRED_MODULES=account.so` for Fixed account login. Leave it 
 
 Set `NAKAMA_DOMAIN` to the public DNS name. Keep the default Docker networks only if they do not overlap any existing networks or routed VPN ranges; otherwise choose two non-overlapping IPv4 subnets and distinct static frontend addresses. The default Caddy address is `172.29.240.2` and Nakama is `172.29.240.3`.
 
-Copy the owner-issued service key to `/opt/nakama/private/gamefleet-service-key`. Set the seven exact service fields in `/opt/nakama/private/gamefleet-service.env`; its in-container key path must remain `/run/secrets/gamefleet-service-key`. Set `GAMEFLEET_SERVICE_URL` to the dedicated HTTPS business origin, using its certificate SAN hostname. Set every identity and profile field to the value provisioned by the GameFleet owner; do not infer values from the image tag.
+Copy the owner-issued service key to `/opt/nakama/private/gamefleet-service-key`. Set the seven exact service fields in `/opt/nakama/private/gamefleet-service.env`; its in-container key path must remain `/run/secrets/gamefleet-service-key`. Set `GAMEFLEET_SERVICE_URL` to the dedicated HTTPS business origin, using its certificate SAN hostname. Set every identity and profile field to the value provisioned by the GameFleet owner; do not infer values from the image tag. The console label **Nakama 账号来源标识** maps to `GAMEFLEET_SERVICE_IDENTITY_ISSUER`: choose it during first setup, or copy the existing configured value exactly. See the [field explanation, example and mismatch effects](gamefleet-service-runtime.md#account-identity-source).
 
 If private DNS is unavailable, pin only the configured business hostname inside the Nakama container:
 
@@ -96,6 +96,15 @@ sudo python3 /opt/nakama-source/scripts/nakama_stack.py route --directory /opt/n
 Install the platform-issued CA certificate, client certificate and client private key as root-owned regular files with mode `0400`, at the configured `GAMEFLEET_CA_SOURCE`, `GAMEFLEET_CERT_SOURCE` and `GAMEFLEET_TLS_KEY_SOURCE` paths. Defaults are `private/gamefleet-ca.crt`, `private/gamefleet-client.crt`, and `private/gamefleet-client.key`. The service template maps these to `/run/secrets/gamefleet-ca.crt`, `/run/secrets/gamefleet-client.crt`, and `/run/secrets/gamefleet-client.key`. Never copy the platform CA signing key to Nakama.
 
 For rotation, obtain new leaves from the same trusted authority before expiry, replace the host leaf files atomically, then recreate the Nakama container and verify its authenticated service preflight and player flows. A CA change requires coordinated trust overlap and validation. `init` never generates a substitute for owner-issued service identities. An enabled archive reader has its own three `GAMEFLEET_ARCHIVE_*_SOURCE` files and explicit `_CA_FILE`, `_CERT_FILE`, `_TLS_KEY_FILE` targets; it never inherits the active identity.
+
+## Cold-start order
+
+1. Bring up the GameFleet platform release that owns the private Business API. Its HTTPS/mTLS endpoint and HistoryService owner routes must be available to the Nakama host. Keep that endpoint on the dedicated private business listener; Nakama does not use the owner console or database listener.
+2. In the owner UI, create a HistoryService with the exact application and issuer and the operations required by the adapter. Its allowedParticipants must be present: use [] only to express no direct participant authority. Do not use null, omit the field, or use a fake participant. Store the one-time gfsvc key in the private key file and configure the exact service ID and profile fields in GAMEFLEET_SERVICE_*.
+3. Install the business API CA and client certificate/key on the Nakama host. Validate the private files and the immutable application image, then run Compose up only after the business endpoint is reachable. During plugin initialization the adapter calls the service metadata preflight for both search and History before it registers player hooks. A preflight error prevents bridge registration; it does not queue work or skip validation.
+4. Once Nakama has started and real accounts have registered, create business caller records with real participant IDs; caller allowedParticipants remains nonempty. Then add the explicit trusted-issuer grant for the intended source and the independent History route, search grant, and match grant needed by the features in use. A trusted-issuer grant alone does not grant those routes or operations. Caller owner/epoch, app/issuer, placement/revision, expiry, revocation, participant identity, and operation scopes remain enforced on each request. Add an exact archive grant separately only when terminal archive reads are required.
+
+The empty HistoryService list allows the identity preflight before caller provisioning; it never authorizes all players. Player operations stay unavailable until the real caller and every required explicit grant exist. This is the cold-start dependency order for the implemented adapter, not evidence that a particular production game session has passed acceptance.
 
 ## Validate and start
 
