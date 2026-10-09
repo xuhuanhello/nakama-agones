@@ -451,7 +451,9 @@ class NakamaStackTests(unittest.TestCase):
         self.assertNotIn("wait_for_local_tunnel", nakama_entrypoint)
         self.assertIn("gamefleet-client.key", compose)
         self.assertNotIn("cap_add:", compose)
-        self.assertIn("header_up -X-DM-Client-IP", caddyfile)
+        # reverse_proxy applies its Delete operations after Set; a same-block
+        # delete would remove the trusted replacement value.
+        self.assertNotIn("header_up -X-DM-Client-IP", caddyfile)
         self.assertIn("header_up X-DM-Client-IP {remote_host}", caddyfile)
         self.assertIn("ACME_EMAIL: ${ACME_EMAIL:?", compose)
         self.assertIn("email {$ACME_EMAIL}", caddyfile)
