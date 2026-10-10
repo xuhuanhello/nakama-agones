@@ -17,6 +17,10 @@ type serviceBackend struct {
 
 var _ Backend = (*serviceBackend)(nil)
 
+// Machine authentication is a permanent service configuration failure, not
+// an expired player session or a retryable network interruption.
+var errServiceAuthenticationUnavailable = errors.New("gamefleet service authentication unavailable")
+
 func newServiceBackend(search *ServiceSearchClient, history *ServiceHistoryClient) (*serviceBackend, error) {
 	if search == nil || history == nil || history.transport == nil || search.config != history.transport.config {
 		return nil, errors.New("GameFleet service clients must use one exact scope and credential")
@@ -30,10 +34,16 @@ func servicePlayerError(err error) error {
 	}
 	var history *ServiceHistoryError
 	if errors.As(err, &history) {
+		if history.Status == 401 {
+			return errServiceAuthenticationUnavailable
+		}
 		return &Error{Status: history.Status}
 	}
 	var search *ServiceSearchError
 	if errors.As(err, &search) {
+		if search.Status == 401 {
+			return errServiceAuthenticationUnavailable
+		}
 		return &Error{Status: search.Status}
 	}
 	return &Error{Status: 503}

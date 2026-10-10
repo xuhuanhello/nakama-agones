@@ -342,6 +342,11 @@ func playerError(err error) error {
 	if err == nil {
 		return nil
 	}
+	if errors.Is(err, errServiceAuthenticationUnavailable) {
+		// FailedPrecondition maps to HTTP 400, so the player SDK will not retry
+		// this condition or attempt to refresh an otherwise valid user session.
+		return runtime.NewError("gamefleet_service_authentication_unavailable", 9)
+	}
 	var upstream *Error
 	if errors.As(err, &upstream) {
 		switch upstream.Status {

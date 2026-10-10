@@ -22,6 +22,14 @@ Obtain the service ID, key, application, issuer, region, and compatibility from 
 
 The URL parser accepts HTTPS origins only. Proxy use and redirects are disabled. Connect/TLS timeouts are three seconds and total requests are bounded to eight seconds. CA and client identity are explicit per endpoint. Certificate rotation requires atomic host-file replacement and recreation of Nakama so its read-only mounts and TLS clients load the new files.
 
+## Service credential lifetime and failure handling
+
+The service identity and each issued Key have separate expiry timestamps. The console defaults to 24 hours; this is suitable for a short acceptance session, not an unattended deployment. Explicitly choose an identity lifetime that covers the intended operating period (at most 8760 hours), record both UTC expiry times, and arrange rotation before either expires. Issuing another Key cannot extend its service identity. An expired service cannot issue a replacement Key; create a replacement identity with the same intended scope and explicitly bind its required grants. Retain expired records for audit. Do not edit stored expiry timestamps or weaken authentication to restore availability.
+
+During runtime, a Business API 401 using the machine service credential becomes `gamefleet_service_authentication_unavailable`, gRPC FailedPrecondition (9), HTTP 400. This is a terminal service configuration condition; it is not an expired player session or a transient network failure. A paired player client must display an administrator-action message, preserve the player's session and exact search/allocation pointers, and avoid automatic retries or user-session refresh for this condition. Service scope denials, capacity conflicts, rate limits and transient network failures retain their separate handling. Startup still fails closed if service authentication or required scope preflight fails.
+
+Nakama reads the service identity and credential at startup. Install a rotated credential by atomic replacement of its restricted host file, validate the complete stack, then recreate only the Nakama container with `docker compose up -d --no-deps --force-recreate nakama` from the stack directory. A simple container restart may retain the old inode of a read-only bind mount. Preserve restricted configuration/database backups before an image update. Recreating Nakama disconnects its lobby/Matchmaker sockets; it does not require restarting PostgreSQL, the HTTPS gateway or game processes. Verify the exact service scope and paired player login after the update; a public health response alone is insufficient.
+
 ## Account identity source
 
 控制台里的 **Nakama 账号来源标识** 对应 API 字段 `identityIssuer` 和部署配置 `GAMEFLEET_SERVICE_IDENTITY_ISSUER`。它是部署者为一组 Nakama 账号选择的固定名称，用来说明玩家 ID 来自哪套账号系统；平台结合应用和此标识识别玩家，并核对服务、调用方与各项授权。Nakama 不会自动生成这个值。
